@@ -2,5 +2,5 @@ streamlit
 langchain
 langchain-core
 openai
-pymupdf
+PyMuPDF
 pypdf
