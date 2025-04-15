@@ -1,6 +1,7 @@
 streamlit
 langchain
 langchain-core
+langchain-openai
 openai
 PyMuPDF
 pypdf
