@@ -9,7 +9,7 @@ st.title("🔍 Fence Detection in Engineering Drawings")
 
 openai_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 
-llm_text = ChatOpenAI(model="gpt-4", temperature=0, openai_api_key=openai_key)
+llm_text = ChatOpenAI(model="gpt-3.5-turbo", temperature=0, openai_api_key=openai_key)
 llm_vision = ChatOpenAI(model="gpt-4-turbo", temperature=0, openai_api_key=openai_key)
 
 uploaded_pdf = st.file_uploader("Upload Engineering PDF", type=["pdf"])
