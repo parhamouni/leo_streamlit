@@ -17,7 +17,12 @@ def extract_snippet(text):
 
 def is_positive_response(response: str) -> bool:
     response = response.strip().lower()
-    return response.startswith("yes") or "includes a fence" in response or "shows a fence" in response
+
+    starts_yes = response.startswith("yes")
+    contradiction = "not related" in response or "not a fence" in response or "no fence" in response
+
+    return starts_yes and not contradiction
+
 
 def retry_with_backoff(func, *args, retries=5, base_delay=2, **kwargs):
     for attempt in range(retries):
