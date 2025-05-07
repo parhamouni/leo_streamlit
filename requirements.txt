@@ -7,6 +7,7 @@ PyMuPDF
 pypdf
 numpy
 opencv-python-headless
-pytesseract
+paddleocr
+paddlepaddle
 Pillow
 pandas
