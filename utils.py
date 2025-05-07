@@ -57,6 +57,49 @@ def detect_text_with_tesseract(image):
     
     return text_elements
 
+
+from paddleocr import PaddleOCR
+
+# Load once globally
+ocr_engine = PaddleOCR(use_angle_cls=True, lang='en')
+
+def detect_text_with_paddleocr(image):
+    """
+    Detect text using PaddleOCR and return bounding boxes.
+    
+    Args:
+        image: Numpy array (BGR)
+        
+    Returns:
+        List of dictionaries with text and bbox info
+    """
+    # Convert to RGB if needed
+    if len(image.shape) == 3:
+        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    else:
+        img_rgb = image
+
+    result = ocr_engine.ocr(img_rgb, cls=True)
+
+    text_elements = []
+    for line in result:
+        for word_info in line:
+            bbox = word_info[0]
+            text = word_info[1][0]
+            conf = word_info[1][1]
+            if conf > 0.3 and text.strip():
+                x_coords = [point[0] for point in bbox]
+                y_coords = [point[1] for point in bbox]
+                x, y, w, h = min(x_coords), min(y_coords), max(x_coords) - min(x_coords), max(y_coords) - min(y_coords)
+
+                text_elements.append({
+                    "text": text,
+                    "conf": conf,
+                    "bbox": (int(x), int(y), int(w), int(h))
+                })
+    return text_elements
+
+
 def visualize_with_bounding_boxes(image_bytes):
     """
     Create a visualization showing all OCR-detected text elements
@@ -86,7 +129,7 @@ def visualize_with_bounding_boxes(image_bytes):
         font = ImageFont.load_default()
     
     # Detect text with Tesseract OCR
-    text_elements = detect_text_with_tesseract(img)
+    text_elements = detect_text_with_paddleocr(img)
     print(f"Detected {len(text_elements)} text elements")
     
     # Use a fixed set of high-contrast colors for better visibility
