@@ -66,6 +66,13 @@ st.markdown("""
         color: #fd7e14;
         font-weight: bold;
     }
+    .debug-box {
+        background-color: #f8f9fa;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        padding: 10px;
+        margin: 10px 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -73,8 +80,8 @@ st.markdown("<div class='main-header'>🔍 Fence Indicator Detector for Engineer
 
 st.markdown("""
 <div class='info-box'>
-This tool detects and highlights <b>indicators</b> that refer to fence-related items in engineering drawings.
-It identifies circled numbers that correspond to fence items in the legend.
+This tool detects and highlights fence-related elements in engineering drawings.
+It uses OCR to detect text and an AI to identify which elements are related to fences.
 </div>
 """, unsafe_allow_html=True)
 
@@ -118,7 +125,7 @@ selected_label = st.radio("Select model for analysis:",
                         index=list(model_options.values()).index(st.session_state.selected_model))
 st.session_state.selected_model = model_options[selected_label]
 
-# Enable vision analysis
+# Enable vision analysis (required for OCR)
 process_images = st.toggle("🖼️ Enable image analysis (required for indicator detection)", value=True)
 
 # Set up the selected models
@@ -148,9 +155,9 @@ if uploaded_pdf and llm_text:
         col_results1, col_results2 = st.columns(2)
         
         with col_results1:
-            st.markdown("""<div class="fence-header"><h4>✅ Pages with Fence Indicators</h4></div>""", unsafe_allow_html=True)
+            st.markdown("""<div class="fence-header"><h4>✅ Pages with Fence Elements</h4></div>""", unsafe_allow_html=True)
         with col_results2:
-            st.markdown("""<div class="non-fence-header"><h4>❌ Pages without Fence Indicators</h4></div>""", unsafe_allow_html=True)
+            st.markdown("""<div class="non-fence-header"><h4>❌ Pages without Fence Elements</h4></div>""", unsafe_allow_html=True)
         
         # Progress bar for processing
         progress_bar = st.progress(0)
@@ -178,7 +185,7 @@ if uploaded_pdf and llm_text:
                 }
                 
                 # Analyze page
-                result = analyze_page(page, llm_text, llm_vision, FENCE_KEYWORDS)
+                result = analyze_page(page, llm_vision, FENCE_KEYWORDS)
                 
                 # Sort into appropriate category
                 if result['fence_found']:
@@ -201,17 +208,29 @@ if uploaded_pdf and llm_text:
             with col_results1.expander(f"Page {result['page_number']}"):
                 # Show highlighted image if available, otherwise original
                 if result['highlighted_image'] is not None:
-                    col_orig, col_high = st.columns(2)
-                    with col_orig:
-                        st.image(result['image'], caption="Original Image", use_column_width=True)
-                    with col_high:
-                        st.image(result['highlighted_image'], caption="Highlighted Fence Indicators", use_column_width=True)
+                    st.image(result['highlighted_image'], caption="OCR Text Detection with Fence Analysis", use_column_width=True)
                 else:
                     st.image(result['image'], caption="Page Image")
                 
-                st.markdown(f"✅ **Fence Indicators Detected**")
+                st.markdown(f"✅ **Fence Elements Detected**")
                 
-                # Show legend items
+                # Display OCR detection results
+                if "ocr_text_elements" in result:
+                    ocr_count = len(result["ocr_text_elements"])
+                    st.write(f"OCR detected {ocr_count} text elements")
+                
+                # Show detected fence references from text
+                if result.get("text_references"):
+                    st.markdown("### 📝 Text References to Fences")
+                    for ref in result["text_references"]:
+                        st.markdown(f"- \"{ref['text']}\"")
+                
+                # Show LLM analysis
+                if result.get("llm_analysis"):
+                    st.markdown("### 🔍 AI Analysis")
+                    st.markdown(f"""<div class="debug-box">{result["llm_analysis"]}</div>""", unsafe_allow_html=True)
+                
+                # Show legend items (if in the old format)
                 if result.get('legend_items', []):
                     st.markdown("### 📋 Fence Items in Legend")
                     for item in result['legend_items']:
@@ -224,7 +243,7 @@ if uploaded_pdf and llm_text:
                     
                     st.divider()
                 
-                # Show detected indicators
+                # Show detected indicators (if in the old format)
                 if result.get('fence_indicators', []):
                     st.markdown("### 📍 Detected Fence Indicators")
                     
@@ -249,23 +268,27 @@ if uploaded_pdf and llm_text:
                         df = pd.DataFrame(table_data)
                         st.markdown(df.to_html(escape=False), unsafe_allow_html=True)
                 
-                # Text references if available
-                if result.get('text_references', []):
-                    st.markdown("### 📝 Fence Text References")
-                    for ref in result['text_references']:
-                        st.markdown(f"- \"{ref['text']}\"")
-                
                 # Download link for highlighted image
                 if result.get('highlighted_image'):
                     highlighted_b64 = base64.b64encode(result['highlighted_image']).decode()
-                    download_link = f'<a href="data:image/png;base64,{highlighted_b64}" download="fence_indicators_page_{result["page_number"]}.png" class="download-button">⬇️ Download Highlighted Image</a>'
+                    download_link = f'<a href="data:image/png;base64,{highlighted_b64}" download="fence_analysis_page_{result["page_number"]}.png" class="download-button">⬇️ Download Analysis Image</a>'
                     st.markdown(download_link, unsafe_allow_html=True)
         
         # Display non-fence pages
         for result in non_fence_pages:
             with col_results2.expander(f"Page {result['page_number']}"):
                 st.image(result['image'], caption="Page Image", width=300)
-                st.markdown("❌ **No fence indicators detected**")
+                st.markdown("❌ **No fence elements detected**")
+                
+                # Show OCR analysis for debugging
+                if st.checkbox(f"Show OCR analysis for page {result['page_number']}", key=f"show_ocr_{result['page_number']}", value=False):
+                    if "ocr_text_elements" in result:
+                        ocr_count = len(result["ocr_text_elements"])
+                        st.write(f"OCR detected {ocr_count} text elements")
+                    
+                    if result.get("llm_analysis"):
+                        st.markdown("### 🔍 AI Analysis")
+                        st.markdown(f"""<div class="debug-box">{result["llm_analysis"]}</div>""", unsafe_allow_html=True)
         
         # Summary statistics
         st.markdown("---")
@@ -273,12 +296,12 @@ if uploaded_pdf and llm_text:
         
         col_stats1, col_stats2 = st.columns(2)
         with col_stats1:
-            st.metric("Pages with Fence Indicators", len(fence_pages))
+            st.metric("Pages with Fence Elements", len(fence_pages))
         with col_stats2:
-            st.metric("Pages without Fence Indicators", len(non_fence_pages))
+            st.metric("Pages without Fence Elements", len(non_fence_pages))
             
-        # Count indicators by type
-        if fence_pages:
+        # Count indicators by type (old format support)
+        if fence_pages and any('fence_indicators' in page for page in fence_pages):
             st.markdown("### 📋 Fence Indicator Summary")
             
             # Count indicators by item number
