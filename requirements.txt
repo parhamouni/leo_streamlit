@@ -1,9 +1,9 @@
 streamlit
-easyocr>=1.7.1
-torch>=2.2.0,<2.4
 Pillow
 PyMuPDF
 pandas
+requests
 langchain
 langchain-openai
-setuptools
+azure-cognitiveservices-vision-computervision
+msrest
