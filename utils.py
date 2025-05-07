@@ -8,7 +8,8 @@ from PIL import Image, ImageDraw, ImageFont
 import easyocr
 
 # Load EasyOCR model globally
-ocr_engine = easyocr.Reader(['en'], gpu=False)
+ocr_engine = easyocr.Reader(['en'], gpu=False, verbose=False)
+
 
 def detect_text_with_easyocr(image_bytes):
     """

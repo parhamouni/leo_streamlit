@@ -5,6 +5,8 @@ import os
 import fitz  # PyMuPDF
 import base64
 import pandas as pd
+from utils import ocr_engine  # this triggers model loading early
+
 
 st.set_page_config(page_title="Fence Indicator Detector", layout="wide")
 
