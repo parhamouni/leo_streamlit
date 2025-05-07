@@ -1,5 +1,6 @@
 streamlit
 easyocr
+torch==2.0.1
 Pillow
 PyMuPDF
 pandas
