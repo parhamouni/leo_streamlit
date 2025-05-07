@@ -1,146 +1,102 @@
 """
-OCR and Fence Detection Utility using EasyOCR (Streamlit Cloud Compatible)
+Full OCR + Fence Detector utils using OCR.Space + optional LLM vision.
 """
 
 import io
-import numpy as np
+import requests
 from PIL import Image, ImageDraw, ImageFont
-import easyocr
+import base64
 
-# Load EasyOCR model globally
-ocr_engine = easyocr.Reader(['en'], gpu=False, verbose=False)
+def call_ocr_space(image_bytes: bytes, api_key: str) -> dict:
+    files = {'file': ('page.png', image_bytes)}
+    data = {'apikey': api_key, 'language': 'eng', 'isOverlayRequired': True}
+    resp = requests.post('https://api.ocr.space/parse/image', files=files, data=data)
+    resp.raise_for_status()
+    return resp.json()
 
-
-def detect_text_with_easyocr(image_bytes):
+def detect_text_with_boxes(image_bytes: bytes, ocr_api_key: str) -> list[dict]:
     """
-    Perform OCR on an image using EasyOCR.
-
-    Args:
-        image_bytes: Raw image bytes
-
-    Returns:
-        List of OCR text elements with 'text', 'conf', and 'bbox'
+    Returns list of words with bounding boxes:
+    { WordText, Confidence, Left, Top, Width, Height }
     """
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    np_image = np.array(image)
+    result = call_ocr_space(image_bytes, ocr_api_key)
+    if result.get("IsErroredOnProcessing", True):
+        msg = result.get("ErrorMessage", ["Unknown error"])[0]
+        raise RuntimeError(f"OCR.Space error: {msg}")
+    words = []
+    for pr in result.get("ParsedResults", []):
+        overlay = pr.get("TextOverlay", {})
+        for line in overlay.get("Lines", []):
+            for w in line.get("Words", []):
+                words.append({
+                    "text": w["WordText"],
+                    "conf": float(w.get("Confidence", 0)),
+                    "bbox": (int(w["Left"]), int(w["Top"]),
+                             int(w["Width"]), int(w["Height"]))
+                })
+    return words
 
-    results = ocr_engine.readtext(np_image)
-    text_elements = []
-
-    for bbox, text, conf in results:
-        if conf > 0.3 and text.strip():
-            x_coords = [pt[0] for pt in bbox]
-            y_coords = [pt[1] for pt in bbox]
-            x = int(min(x_coords))
-            y = int(min(y_coords))
-            w = int(max(x_coords) - x)
-            h = int(max(y_coords) - y)
-            text_elements.append({
-                "text": text.strip(),
-                "conf": conf,
-                "bbox": (x, y, w, h)
-            })
-
-    return text_elements
-
-def visualize_with_bounding_boxes(image_bytes, text_elements):
-    """
-    Draw bounding boxes around OCR-detected text elements.
-
-    Args:
-        image_bytes: Original image as bytes
-        text_elements: List of text elements with bbox
-
-    Returns:
-        Annotated image as bytes
-    """
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    draw = ImageDraw.Draw(image)
-
+def visualize_with_bounding_boxes(image_bytes: bytes, words: list[dict]) -> bytes:
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    # Load font
     try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 14)
+        font = ImageFont.truetype("DejaVuSans.ttf", 12)
     except:
         font = ImageFont.load_default()
+    # Draw
+    for w in words:
+        x, y, w_, h_ = w["bbox"]
+        draw.rectangle([x, y, x+w_, y+h_], outline=(255,0,0), width=2)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
-    # Group text by Y proximity to identify lines
-    y_tolerance = 10
-    lines = {}
-    for i, element in enumerate(text_elements):
-        _, y, _, _ = element["bbox"]
-        line_key = None
-        for key in lines:
-            if abs(key - y) < y_tolerance:
-                line_key = key
-                break
-        if line_key is None:
-            line_key = y
-            lines[line_key] = []
-        lines[line_key].append(i)
-
-    # Assign colors per line
-    colors = [
-        (255, 0, 0), (0, 255, 0), (0, 0, 255),
-        (255, 255, 0), (255, 0, 255), (0, 255, 255),
-        (255, 128, 0), (128, 0, 255), (0, 128, 255), (255, 0, 128)
-    ]
-    line_colors = {k: colors[i % len(colors)] for i, k in enumerate(sorted(lines))}
-
-    for i, element in enumerate(text_elements):
-        x, y, w, h = element["bbox"]
-        line_key = next(k for k in lines if i in lines[k])
-        color = line_colors[line_key]
-        draw.rectangle([x, y, x + w, y + h], outline=color, width=2)
-
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
-
-def analyze_page(page, llm_vision, FENCE_KEYWORDS):
+def analyze_page(page: dict, llm_vision, FENCE_KEYWORDS: list[str]) -> dict:
     """
-    Analyze a page for fence-related content using OCR and optionally LLM.
-
-    Args:
-        page: Dictionary with image_bytes and page_number
-        llm_vision: Optional LLM for image captioning/vision analysis
-        FENCE_KEYWORDS: List of fence-related keywords to look for in text
-
-    Returns:
-        Dictionary with detection and analysis results
+    page: { page_number, image_bytes }
+    llm_vision: ChatOpenAI vision-capable—or None
     """
     image_bytes = page["image_bytes"]
-    text_elements = detect_text_with_easyocr(image_bytes)
-
-    # Create image visualization
-    highlighted_image = visualize_with_bounding_boxes(image_bytes, text_elements)
-
-    # Keyword filtering from OCR text
-    matched_texts = [
-        {"text": el["text"]}
-        for el in text_elements
-        if any(k.lower() in el["text"].lower() for k in FENCE_KEYWORDS)
+    ocr_key = page.get("ocr_api_key")
+    # 1. OCR + boxes
+    words = detect_text_with_boxes(image_bytes, ocr_key)
+    highlighted = visualize_with_bounding_boxes(image_bytes, words)
+    # 2. Keyword filter
+    matches = [
+        {"text": w["text"], "bbox": w["bbox"]}
+        for w in words
+        if any(k.lower() in w["text"].lower() for k in FENCE_KEYWORDS)
     ]
-
-    fence_found = bool(matched_texts)
-
-    # Optional: LLM-based image captioning
+    fence_found = bool(matches)
+    # 3. Optional LLM vision analysis
     llm_analysis = ""
     if llm_vision and fence_found:
         try:
-            prompt = "Describe any signs of fences, barriers, or enclosures in this engineering drawing."
-            image = Image.open(io.BytesIO(image_bytes))
-            response = llm_vision.invoke(prompt=prompt, image=image)
-            llm_analysis = response.content if hasattr(response, "content") else str(response)
+            prompt = (
+                "This is an engineering drawing page. Extract any references to fences, barriers, gates, "
+                "or enclosures, and describe their context."
+            )
+            img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            resp = llm_vision.invoke(prompt=prompt, image=img)
+            llm_analysis = getattr(resp, "content", str(resp))
         except Exception as e:
-            llm_analysis = f"LLM analysis failed: {e}"
-
+            llm_analysis = f"LLM vision error: {e}"
+    else:
+        llm_analysis = "No fence references found or vision disabled."
+    # 4. Legend/items/indicators placeholders (no PDF legend parsing here; dummy empty)
+    legend_items = []
+    fence_indicators = []
     return {
         "page_number": page["page_number"],
         "fence_found": fence_found,
         "text_found": True,
         "vision_found": bool(llm_vision),
-        "text_references": matched_texts,
-        "ocr_text_elements": text_elements,
+        "text_references": matches,
+        "ocr_text_elements": words,
         "image": image_bytes,
-        "highlighted_image": highlighted_image,
-        "llm_analysis": llm_analysis or "OCR + keyword detection used for fence-related text."
+        "highlighted_image": highlighted,
+        "llm_analysis": llm_analysis,
+        "legend_items": legend_items,
+        "fence_indicators": fence_indicators
     }
