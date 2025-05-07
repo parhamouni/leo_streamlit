@@ -1,9 +1,7 @@
 streamlit
-paddleocr
-paddlepaddle==2.6.2
+easyocr
 Pillow
 PyMuPDF
 pandas
 langchain
 langchain-openai
-setuptools

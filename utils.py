@@ -1,18 +1,18 @@
 """
-OCR and Fence Detection Utility using PaddleOCR (Streamlit Cloud Compatible)
+OCR and Fence Detection Utility using EasyOCR (Streamlit Cloud Compatible)
 """
 
-import numpy as np
 import io
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from paddleocr import PaddleOCR
+import easyocr
 
-# Load PaddleOCR once
-ocr_engine = PaddleOCR(use_angle_cls=True, lang='en')
+# Load EasyOCR model globally
+ocr_engine = easyocr.Reader(['en'], gpu=False)
 
-def detect_text_with_paddleocr(image_bytes):
+def detect_text_with_easyocr(image_bytes):
     """
-    Perform OCR on an image using PaddleOCR.
+    Perform OCR on an image using EasyOCR.
 
     Args:
         image_bytes: Raw image bytes
@@ -23,23 +23,22 @@ def detect_text_with_paddleocr(image_bytes):
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     np_image = np.array(image)
 
-    results = ocr_engine.ocr(np_image, cls=True)
+    results = ocr_engine.readtext(np_image)
     text_elements = []
 
-    for line in results:
-        for word_info in line:
-            bbox = word_info[0]
-            text = word_info[1][0]
-            conf = word_info[1][1]
-            if conf > 0.3 and text.strip():
-                x_coords = [point[0] for point in bbox]
-                y_coords = [point[1] for point in bbox]
-                x, y, w, h = min(x_coords), min(y_coords), max(x_coords) - min(x_coords), max(y_coords) - min(y_coords)
-                text_elements.append({
-                    "text": text.strip(),
-                    "conf": conf,
-                    "bbox": (int(x), int(y), int(w), int(h))
-                })
+    for bbox, text, conf in results:
+        if conf > 0.3 and text.strip():
+            x_coords = [pt[0] for pt in bbox]
+            y_coords = [pt[1] for pt in bbox]
+            x = int(min(x_coords))
+            y = int(min(y_coords))
+            w = int(max(x_coords) - x)
+            h = int(max(y_coords) - y)
+            text_elements.append({
+                "text": text.strip(),
+                "conf": conf,
+                "bbox": (x, y, w, h)
+            })
 
     return text_elements
 
@@ -108,7 +107,7 @@ def analyze_page(page, llm_vision, FENCE_KEYWORDS):
         Dictionary with detection and analysis results
     """
     image_bytes = page["image_bytes"]
-    text_elements = detect_text_with_paddleocr(image_bytes)
+    text_elements = detect_text_with_easyocr(image_bytes)
 
     # Create image visualization
     highlighted_image = visualize_with_bounding_boxes(image_bytes, text_elements)
@@ -122,7 +121,7 @@ def analyze_page(page, llm_vision, FENCE_KEYWORDS):
 
     fence_found = bool(matched_texts)
 
-    # Optional: LLM-based analysis
+    # Optional: LLM-based image captioning
     llm_analysis = ""
     if llm_vision and fence_found:
         try:
