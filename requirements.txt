@@ -1,8 +1,9 @@
 streamlit
-easyocr
-torch==2.0.1
+easyocr>=1.7.1
+torch>=2.2.0,<2.4
 Pillow
 PyMuPDF
 pandas
 langchain
 langchain-openai
+setuptools
