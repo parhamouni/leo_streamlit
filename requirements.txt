@@ -11,3 +11,4 @@ paddleocr
 paddlepaddle
 Pillow
 pandas
+setuptools
