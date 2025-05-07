@@ -6,7 +6,7 @@ openai
 PyMuPDF
 pypdf
 numpy
-opencv-python-headless
+opencv-python-headless==4.8.0.74
 paddleocr
 paddlepaddle
 Pillow
