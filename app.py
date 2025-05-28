@@ -117,66 +117,85 @@ def generate_combined_highlighted_pdf(original_pdf_bytes, fence_pages_results_li
     if not fence_pages_results_list or not original_pdf_bytes:
         return None, "No fence pages to include or original PDF missing."
     
-    # --- Parameters for more visible PDF highlights ---
-    HIGHLIGHT_COLOR_PDF = (0, 0.9, 0)  # Brighter Green (RGB for PyMuPDF: 0.0-1.0 range)
-    HIGHLIGHT_WIDTH_PDF = 2.0          # Increased border width
+    HIGHLIGHT_COLOR_PDF = (0, 0.9, 0)
+    HIGHLIGHT_WIDTH_PDF = 2.0
 
     output_pdf_doc = fitz.open() 
+    input_pdf_doc_for_combine = None
+
     try:
         input_pdf_doc_for_combine = fitz.open(stream=io.BytesIO(original_pdf_bytes), filetype="pdf")
     except Exception as e:
+        if output_pdf_doc: output_pdf_doc.close()
+        print(f"Error opening original PDF for highlighting: {e}")
         return None, f"Error opening original PDF for highlighting: {e}"
 
     sorted_fence_pages = sorted(fence_pages_results_list, key=lambda x: x.get('page_index_in_original_doc', float('inf')))
-
     for res_data in sorted_fence_pages:
         page_idx_original = res_data.get('page_index_in_original_doc')
         if page_idx_original is None:
-            print(f"Warning: Skipping page in combined PDF due to missing 'page_index_in_original_doc': {res_data.get('page_number')}")
+            print(f"Warning: Skipping page due to missing 'page_index_in_original_doc': {res_data.get('page_number')}")
             continue
-        
         try:
             output_pdf_doc.insert_pdf(input_pdf_doc_for_combine, from_page=page_idx_original, to_page=page_idx_original)
-            page_in_output_pdf = output_pdf_doc.load_page(len(output_pdf_doc) - 1) 
-            
+            page_in_output_pdf = output_pdf_doc.load_page(len(output_pdf_doc) - 1)
             if res_data.get('highlight_fence_text_app', True) and 'fence_text_boxes_details' in res_data and res_data['fence_text_boxes_details']:
                 derotation_matrix = page_in_output_pdf.derotation_matrix
                 for box in res_data['fence_text_boxes_details']:
                     rotated_rect = fitz.Rect(box['x0'], box['y0'], box['x1'], box['y1'])
-                    
                     if page_in_output_pdf.rotation != 0:
                         unrotated_rect = rotated_rect * derotation_matrix
-                        unrotated_rect.normalize() 
+                        unrotated_rect.normalize()
                     else:
-                        unrotated_rect = rotated_rect 
-                    
-                    try:
-                        page_in_output_pdf.draw_rect(
-                            unrotated_rect, 
-                            color=HIGHLIGHT_COLOR_PDF,    # Use defined color
-                            width=HIGHLIGHT_WIDTH_PDF,    # Use defined width
-                            overlay=True             
-                        )
-                    except Exception as e_draw:
-                        print(f"Error drawing rectangle on page {page_idx_original} for combined PDF: {e_draw}")
-                        pass # Or handle more robustly if needed
+                        unrotated_rect = rotated_rect
+                    if not unrotated_rect.is_empty and unrotated_rect.is_valid:
+                        try:
+                            page_in_output_pdf.draw_rect(
+                                unrotated_rect,
+                                color=HIGHLIGHT_COLOR_PDF,
+                                width=HIGHLIGHT_WIDTH_PDF,
+                                overlay=True
+                            )
+                        except Exception as e_draw:
+                            print(f"Error drawing rect on page {page_idx_original} (coords: {unrotated_rect}): {e_draw}")
+                    else:
+                        print(f"Warning: Skipping invalid/empty rect for page {page_idx_original}: {unrotated_rect}")
         except Exception as e_page_insert:
             print(f"Error processing page {page_idx_original} for combined PDF: {e_page_insert}")
 
+
+    pdf_bytes = None
+    final_pdf_name = "error_generating_pdf.pdf" 
+
     if len(output_pdf_doc) == 0:
+        print("No pages were successfully added to the highlighted PDF.")
+    else:
+        try:
+            # REMOVED linear=True
+            pdf_bytes = output_pdf_doc.tobytes(garbage=2, deflate=True) 
+            base_name, ext = os.path.splitext(uploaded_pdf_name_base)
+            final_pdf_name = f"{base_name}_fence_highlights{ext}"
+            print(f"Successfully generated PDF bytes for {final_pdf_name}")
+        except fitz.mupdf.FzError as fzea: # Catching base FzError as FzErrorArgument might be a subclass
+            print(f"PyMuPDF FzError during tobytes(): {fzea}. Error code might provide more clues if it's not about linearisation again.")
+            pdf_bytes = None 
+            final_pdf_name = f"error_saving_fz_{uploaded_pdf_name_base}.pdf"
+        except Exception as e_save:
+            print(f"Generic error during PDF tobytes() on Streamlit Cloud: {e_save}")
+            pdf_bytes = None
+            final_pdf_name = f"error_saving_generic_{uploaded_pdf_name_base}.pdf"
+
+    if input_pdf_doc_for_combine:
         input_pdf_doc_for_combine.close()
+    if output_pdf_doc:
         output_pdf_doc.close()
-        return None, "No pages were successfully added to the highlighted PDF."
-
-    pdf_bytes = output_pdf_doc.tobytes(garbage=3, deflate=True, linear=True)
-    output_pdf_doc.close()
-    input_pdf_doc_for_combine.close()
     
-    base_name, ext = os.path.splitext(uploaded_pdf_name_base)
-    final_pdf_name = f"{base_name}_fence_highlights{ext}"
-    return pdf_bytes, final_pdf_name
-
-
+    if pdf_bytes:
+        return pdf_bytes, final_pdf_name
+    else:
+        return None, final_pdf_name
+    
+    
 st.markdown("<div class='section-header'><h2>📄 Upload Engineering Drawings</h2></div>", unsafe_allow_html=True)
 uploaded_pdf_file_obj = st.file_uploader("Upload Engineering PDF Document", type=["pdf"], key="pdf_uploader_main_auto")
 
