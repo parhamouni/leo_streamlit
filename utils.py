@@ -108,7 +108,7 @@ Start your answer with 'Yes' or 'No'. Then, briefly explain your reasoning. Text
 
 @time_it
 def get_fence_related_text_boxes(page_bytes, llm, fence_keywords_from_app, selected_llm_model_name="gpt-3.5-turbo"):
-    print(f"TIMER LOG: (get_fence_related_text_boxes) Starting REFINED TWO-PASS - v5 (Improved Recall).")
+    print(f"TIMER LOG: (get_fence_related_text_boxes) Starting REFINED TWO-PASS - v6 (Prioritize Num/Tag in Pass1 Prompt).")
     overall_gfrtb_start_time = time.time()
     
     page_width, page_height = 0, 0
@@ -118,44 +118,42 @@ def get_fence_related_text_boxes(page_bytes, llm, fence_keywords_from_app, selec
     try:
         with pdfplumber.open(BytesIO(page_bytes)) as pdf:
             if not pdf.pages: return [], 0, 0
-            page = pdf.pages[0]
-            page_width, page_height = page.width, page.height
+            page_obj = pdf.pages[0] # Renamed to avoid conflict with 'page' arg name in analyze_page
+            page_width, page_height = page_obj.width, page_obj.height
             if not page_width or not page_height: return [], 0, 0
 
             try:
-                words = page.extract_words(use_text_flow=True, split_at_punctuation=False, 
+                words = page_obj.extract_words(use_text_flow=True, split_at_punctuation=False, 
                                            x_tolerance=1.5, y_tolerance=1.5, keep_blank_chars=False)
             except Exception as e:
-                 print(f"TIMER LOG: (get_fence_related_text_boxes) Error during page.extract_words: {type(e).__name__}: {e}")
+                 print(f"TIMER LOG: (get_fence_related_text_boxes) Error during page_obj.extract_words: {type(e).__name__}: {e}")
 
             extracted_lines = []
             try:
-                extracted_lines = page.extract_text_lines(layout=True, use_text_flow=True, strip=True, return_chars=False)
+                extracted_lines = page_obj.extract_text_lines(layout=True, use_text_flow=True, strip=True, return_chars=False)
             except Exception as e_lines:
-                print(f"TIMER LOG: (get_fence_related_text_boxes) Error during page.extract_text_lines: {type(e_lines).__name__}: {e_lines}")
+                print(f"TIMER LOG: (get_fence_related_text_boxes) Error during page_obj.extract_text_lines: {type(e_lines).__name__}: {e_lines}")
 
             # --- PASS 1: Legend and Description Identification using Text Lines ---
             print(f"TIMER LOG: (get_fence_related_text_boxes) Starting Pass 1: Legend/Description Identification.")
             candidate_legend_lines_for_llm1 = []
             if extracted_lines:
-                for line_idx, line_obj in enumerate(extracted_lines):
-                    line_text = line_obj.get('text', '').strip()
+                for line_idx, line_obj_data in enumerate(extracted_lines): # Renamed line_obj to line_obj_data
+                    line_text = line_obj_data.get('text', '').strip()
                     if not line_text: continue
                     line_text_lower = line_text.lower()
                     
                     has_fence_keyword = any(kw in line_text_lower for kw in fence_keywords_from_app)
-                    # Relaxed condition: if it has a fence keyword, it's a strong candidate.
-                    # Also consider typical drawing terms or identifier-like starts.
                     is_candidate = has_fence_keyword or \
                                    any(term in line_text_lower for term in ["detail", "type", "schedule", "item", "legend", "notes", "spec", "assy", "section", "elevation", "matl", "constr", "view", "plan", "typical", "standard", "description", "callout"]) or \
                                    bool(re.match(r"^\s*\(?([A-Za-z0-9]+(?:[\.\-][A-Za-z0-9]+)*)\)?[\s:.)\-]", line_text))
 
-                    if is_candidate and (1 < len(line_text.split()) < 80) and len(line_text) < 500: # Slightly increased length limits
-                        if all(k in line_obj for k in ['x0', 'top', 'x1', 'bottom']):
+                    if is_candidate and (1 < len(line_text.split()) < 80) and len(line_text) < 500:
+                        if all(k in line_obj_data for k in ['x0', 'top', 'x1', 'bottom']):
                             candidate_legend_lines_for_llm1.append({
                                 "id": f"line_{line_idx}", "text": line_text,
-                                "x0": round(line_obj['x0'], 2), "y0": round(line_obj['top'], 2),
-                                "x1": round(line_obj['x1'], 2), "y1": round(line_obj['bottom'], 2)
+                                "x0": round(line_obj_data['x0'], 2), "y0": round(line_obj_data['top'], 2),
+                                "x1": round(line_obj_data['x1'], 2), "y1": round(line_obj_data['bottom'], 2)
                             })
             print(f"TIMER LOG: (get_fence_related_text_boxes) Pre-filtering lines for Pass 1. Found {len(candidate_legend_lines_for_llm1)} candidates.")
 
@@ -170,9 +168,13 @@ You are provided with a JSON list of TEXT LINES from a drawing page (width {page
 Fence-related keywords: {', '.join(fence_keywords_from_app)}.
 Your task is to:
 1.  Identify lines representing **Fence Legend Items, Fence Specifications, or important Fence-related Notes/Descriptions**. Be inclusive.
-2.  For each, determine its **`core_identifier_text`**. This could be a formal tag (e.g., "F1", "TYPE A"), a note number (e.g., "NOTE 3"), or if it's a descriptive text without a tag, use a short, unique summary like "FENCE_HEIGHT_SPEC" or "GATE_MATERIAL_NOTE". If truly no identifier, use "N/A_DESC".
-Output ONLY a single valid JSON object: {{"identified_fences": [{{"id": "line_id_from_input", "full_text": "original_text_of_line", "core_identifier_text": "extracted_or_generated_id", "type": "legend_item|specification|note"}}]}}.
-The "type" field should categorize the identified text.
+2.  For each, determine its **`core_identifier_text`**. 
+    - **Priority 1:** If the line starts with a clear tag (e.g., "F1.", "TYPE A -", "1.", "(2)", "NOTE 3:"), extract that tag precisely as the `core_identifier_text` (e.g., "F1", "TYPE A", "1", "2", "NOTE 3"). Remove trailing punctuation like periods or colons from the extracted tag.
+    - **Priority 2:** If no such prefix tag, but it's a descriptive text clearly about a specific fence component or type, use a short, unique summary as the `core_identifier_text` (e.g., "FENCE_HEIGHT_SPEC", "GATE_MATERIAL_NOTE").
+    - **Priority 3:** If neither applies or it's too generic, use "N/A_DESC".
+3.  Also provide a **`type`** for the item: "legend_item" (for formal legend entries), "specification" (for detailed specs), "note" (for general notes), or "description" (for other descriptive text about fences).
+
+Output ONLY a single valid JSON object: {{"identified_fences": [{{"id": "line_id_from_input", "full_text": "original_text_of_line", "core_identifier_text": "extracted_or_generated_id", "type": "item_type"}}]}}.
 If no relevant items found, return {{"identified_fences": []}}. Adhere strictly to JSON.
 Input Text Lines:
 {lines_json_str_pass1}"""
@@ -192,7 +194,7 @@ Input Text Lines:
                         if first_brace != -1 and last_brace > first_brace: clean_resp_pass1 = clean_resp_pass1[first_brace : last_brace+1]
                     
                     parsed_data_pass1 = json.loads(clean_resp_pass1)
-                    identified_legends_from_pass1_llm_output = parsed_data_pass1.get("identified_fences", []) # Changed key based on new prompt
+                    identified_legends_from_pass1_llm_output = parsed_data_pass1.get("identified_fences", [])
                     print(f"TIMER LOG: (get_fence_related_text_boxes) Pass 1 Parsing. Found {len(identified_legends_from_pass1_llm_output)} fence items from LLM.")
 
                     if identified_legends_from_pass1_llm_output:
@@ -211,13 +213,16 @@ Input Text Lines:
                                 continue
 
                             item_text_to_use = legend_data_llm.get("full_text", original_line_obj_from_map.get("text","")) 
-                            core_id = legend_data_llm.get("core_identifier_text")
-                            item_type = legend_data_llm.get("type", "unknown") # Get the type from LLM
+                            core_id_from_llm = legend_data_llm.get("core_identifier_text")
+                            item_type = legend_data_llm.get("type", "unknown") 
 
-                            if core_id and isinstance(core_id, str) and core_id.strip() and core_id != "N/A_DESC":
-                                id_match = re.match(r"([A-Za-z0-9_]+)", core_id.strip()) # Allow underscore in core_id
-                                if id_match: confirmed_legend_core_ids.add(id_match.group(1))
-                                else: confirmed_legend_core_ids.add(core_id.strip().rstrip(".:"))
+                            # Standardize core_id: uppercase and strip trailing unwanted chars
+                            core_id_processed = ""
+                            if core_id_from_llm and isinstance(core_id_from_llm, str) and core_id_from_llm.strip() and core_id_from_llm != "N/A_DESC":
+                                core_id_processed = core_id_from_llm.strip().upper()
+                                # Remove common trailing punctuation if LLM didn't
+                                core_id_processed = re.sub(r"[.:\s]+$", "", core_id_processed) 
+                                confirmed_legend_core_ids.add(core_id_processed)
                             
                             if all(original_line_obj_from_map.get(k) is not None for k in ['text', 'x0', 'y0', 'x1', 'y1']):
                                 final_highlight_boxes_list.append({
@@ -225,13 +230,12 @@ Input Text Lines:
                                     'text': item_text_to_use, 
                                     'x0': original_line_obj_from_map['x0'], 'y0': original_line_obj_from_map['y0'],
                                     'x1': original_line_obj_from_map['x1'], 'y1': original_line_obj_from_map['y1'],
-                                    'type_from_llm': item_type, # Store LLM-defined type
-                                    'tag_from_llm': core_id
+                                    'type_from_llm': item_type, 
+                                    'tag_from_llm': core_id_processed if core_id_processed else core_id_from_llm # Use processed or original if N/A_DESC etc.
                                 })
-                                # Prepare context for Pass 2, using the new structure
                                 processed_legends_for_pass2_prompt_context.append({
                                     "id": original_line_id,
-                                    "core_identifier_text": core_id,
+                                    "core_identifier_text": core_id_processed if core_id_processed else core_id_from_llm,
                                     "full_text": item_text_to_use,
                                     "type": item_type
                                 })
@@ -249,35 +253,40 @@ Input Text Lines:
                 pass2_logic_start_time = time.time()
                 
                 candidate_indicator_words_for_llm2 = []
-                for idx, word_obj in enumerate(words):
-                    text_val = word_obj['text'].strip()
+                for idx, word_obj_data in enumerate(words): # Renamed word_obj to word_obj_data
+                    text_val = word_obj_data['text'].strip()
                     if not text_val: continue
-                    # Match potential identifiers, allowing hyphens, dots, and ensuring it's somewhat standalone
+                    
+                    # Extract potential identifier, convert to uppercase for matching
+                    # Allow for internal hyphens/dots, but the core match is alphanumeric sequences
                     core_word_text_match = re.match(r"^\s*\(?\s*([A-Za-z0-9]+(?:[\.\-_][A-Za-z0-9]+)*)\s*\)?\.?\s*$", text_val)
-                    core_word_text = core_word_text_match.group(1) if core_word_text_match else text_val
+                    raw_core_word_text = core_word_text_match.group(1) if core_word_text_match else text_val
+                    core_word_text_for_match = raw_core_word_text.upper()
+                    core_word_text_for_match = re.sub(r"[.:\s]+$", "", core_word_text_for_match) # Clean it like we clean LLM's core_id
 
-                    if core_word_text in confirmed_legend_core_ids:
-                        # Relaxed length constraint for indicators, up to 10 chars, LLM will help filter.
-                        if 0 < len(text_val) <= 15: # Increased from 5 to 15
-                            is_already_legend_part = False
-                            for leg_box_dict in final_highlight_boxes_list: 
-                                if leg_box_dict.get('tag_from_llm') == core_word_text or \
-                                   leg_box_dict.get('text','').strip() == text_val : # If it's the core ID of a legend or the exact text
-                                    lx0, ly0, lx1, ly1 = leg_box_dict.get('x0'), leg_box_dict.get('y0'), leg_box_dict.get('x1'), leg_box_dict.get('y1')
+                    if core_word_text_for_match in confirmed_legend_core_ids:
+                        if 0 < len(text_val) <= 15: 
+                            is_already_part_of_identified_item = False
+                            for identified_item_box in final_highlight_boxes_list: 
+                                # Check if this word is essentially the same as an already identified item's tag or part of its text
+                                if identified_item_box.get('tag_from_llm', '').upper() == core_word_text_for_match or \
+                                   text_val.upper() in identified_item_box.get('text','').upper() :
+                                    
+                                    lx0, ly0, lx1, ly1 = identified_item_box.get('x0'), identified_item_box.get('y0'), identified_item_box.get('x1'), identified_item_box.get('y1')
                                     if all(v is not None for v in [lx0, ly0, lx1, ly1]):
-                                        word_center_x = (word_obj['x0'] + word_obj['x1']) / 2
-                                        word_center_y = (word_obj['top'] + word_obj['bottom']) / 2
-                                        # Check if word is spatially within or very close to an already identified legend item box
-                                        # to avoid re-highlighting parts of a legend item as an indicator.
-                                        if (lx0 - 5) <= word_center_x <= (lx1 + 5) and \
-                                           (ly0 - 5) <= word_center_y <= (ly1 + 5):
-                                            is_already_legend_part = True
+                                        word_center_x = (word_obj_data['x0'] + word_obj_data['x1']) / 2
+                                        word_center_y = (word_obj_data['top'] + word_obj_data['bottom']) / 2
+                                        # Check for significant spatial overlap or containment
+                                        if (lx0 - 2) <= word_center_x <= (lx1 + 2) and \
+                                           (ly0 - 2) <= word_center_y <= (ly1 + 2):
+                                            is_already_part_of_identified_item = True
                                             break
-                            if not is_already_legend_part:
+                            if not is_already_part_of_identified_item:
                                 candidate_indicator_words_for_llm2.append({
-                                    "id": f"word_{idx}", "text": text_val, "core_text_matched": core_word_text,
-                                    "x0": round(word_obj['x0'], 2), "y0": round(word_obj['top'], 2),
-                                    "x1": round(word_obj['x1'], 2), "y1": round(word_obj['bottom'], 2)
+                                    "id": f"word_{idx}", "text": text_val, # Keep original case for display
+                                    "core_text_matched": core_word_text_for_match, # The matched uppercase ID
+                                    "x0": round(word_obj_data['x0'], 2), "y0": round(word_obj_data['top'], 2),
+                                    "x1": round(word_obj_data['x1'], 2), "y1": round(word_obj_data['bottom'], 2)
                                 })
                 
                 print(f"TIMER LOG: (get_fence_related_text_boxes) Pass 2: Found {len(candidate_indicator_words_for_llm2)} candidate indicators for LLM.")
@@ -285,7 +294,7 @@ Input Text Lines:
                 if candidate_indicator_words_for_llm2:
                     indicators_json_str_pass2 = json.dumps(candidate_indicator_words_for_llm2, separators=(',',':'))
                     pass1_legend_context_for_pass2_prompt = []
-                    for leg_detail in processed_legends_for_pass2_prompt_context: # Use the stored context from pass 1
+                    for leg_detail in processed_legends_for_pass2_prompt_context:
                         leg_text_snippet = leg_detail.get("full_text", "")[:70] 
                         if len(leg_detail.get("full_text", "")) > 70: leg_text_snippet += "..."
                         pass1_legend_context_for_pass2_prompt.append({
@@ -302,16 +311,16 @@ Context: These Fence-related items (legends, specs, notes) and their core identi
 Now, you are given a new JSON list of CANDIDATE INDICATOR text elements. Their 'core_text_matched' value matches one of the `core_identifier_text` values from the context above.
 Your task is to determine if each candidate is TRULY acting as a standalone graphical callout/indicator on the drawing.
 A true indicator is usually:
-- Short (typically a few characters, like "F1", "1", "A", "NOTE3").
-- Spatially distinct from large text blocks (like legends or detailed notes).
+- Short (typically a few characters, like "F1", "1", "A", "NOTE 3").
+- Spatially distinct from large text blocks (like legends or detailed notes whose full text was provided in context).
 - Appears to label a specific part of the drawing, often near lines or symbols.
-- It is NOT part of a longer sentence, dimension string, title block text, or already part of the main text of a legend/specification item identified above.
+- It is NOT part of a longer sentence, dimension string, title block text, or clearly part of the main body of a legend/specification item already detailed in the context.
 
 Input Candidate Indicators (each with 'id', 'text', 'core_text_matched', and coordinates):
 {indicators_json_str_pass2}
 
 Output ONLY a single valid JSON object with one key: "confirmed_indicators".
-Value is a list of objects, each with "id" (from input candidate), "matched_legend_identifier" (the 'core_text_matched' value), and "text_content" (the 'text' value from input candidate).
+Value is a list of objects, each with "id" (from input candidate), "matched_legend_identifier" (the 'core_text_matched' value from candidate input), and "text_content" (the original 'text' value from candidate input).
 Example: {{"confirmed_indicators": [{{"id": "word_102", "matched_legend_identifier": "F1", "text_content": "F1"}}]}}
 If none are confirmed as true indicators, return {{"confirmed_indicators": []}}. Strictly JSON.
 """
@@ -346,11 +355,11 @@ If none are confirmed as true indicators, return {{"confirmed_indicators": []}}.
                             if original_box_data and all(original_box_data.get(k) is not None for k in ['text','x0','y0','x1','y1']):
                                 final_highlight_boxes_list.append({
                                     'id': el_id, 
-                                    'text': original_box_data['text'], 
+                                    'text': original_box_data['text'], # Use original case text from candidate
                                     'x0': original_box_data['x0'], 'y0': original_box_data['y0'],
                                     'x1': original_box_data['x1'], 'y1': original_box_data['y1'],
                                     'type_from_llm': "indicator", 
-                                    'tag_from_llm': ind_data.get("matched_legend_identifier")
+                                    'tag_from_llm': ind_data.get("matched_legend_identifier") # This was core_text_matched (uppercase)
                                 })
                             else:
                                 print(f"TIMER LOG: (get_fence_related_text_boxes) Warning: Original candidate word for ID '{el_id}' not found or missing data for highlighting indicator.")
