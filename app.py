@@ -1,6 +1,7 @@
 # app.py
 import streamlit as st
-from utils import analyze_page, get_fence_related_text_boxes, UnrecoverableRateLimitError 
+# Ensure UnrecoverableRateLimitError and time_it are correctly imported from utils
+from utils import analyze_page, get_fence_related_text_boxes, UnrecoverableRateLimitError, time_it 
 from langchain_openai import ChatOpenAI
 import os
 import fitz  # PyMuPDF
@@ -18,7 +19,18 @@ DISPLAY_IMAGE_DPI = 96
 VISION_IMAGE_DPI = 72  
 
 st.set_page_config(page_title="Fence Detector", layout="wide")
-st.markdown("""<style> /* Your CSS */ </style>""", unsafe_allow_html=True) 
+st.markdown("""
+<style>
+    .main-header {font-size: 2.5rem; margin-bottom: 1rem; color: #1E3A8A;}
+    .section-header {background-color: #f0f2f6; padding: 10px; border-radius: 5px; margin-top: 1rem; margin-bottom: 1rem;}
+    .stExpander {border-left: 5px solid #ccc; margin-bottom: 10px;}
+    .download-button {margin-top: 10px; display: inline-block; margin-right: 10px; padding: 8px 12px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px; font-size: 0.9rem;}
+    .download-button:hover {background-color: #0056b3; color: white; text-decoration: none;}
+    .stDownloadButton>button { background-color: #28a745; color:white; border: none; padding: 10px 24px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; transition-duration: 0.4s; cursor: pointer; border-radius: 5px; }
+    .stDownloadButton>button:hover { background-color: #218838; color: white; }
+    .centered-button { display: flex; justify-content: center; margin-top: 10px; margin-bottom: 10px; }
+</style>
+""", unsafe_allow_html=True)
 st.markdown("<h1 class='main-header'>🔍 Fence Detection in Engineering Drawings</h1>", unsafe_allow_html=True)
 
 def get_session_id():
@@ -26,7 +38,7 @@ def get_session_id():
         st.session_state.session_id = str(uuid.uuid4())[:8]
     return st.session_state.session_id
 
-def initialize_session_state(session_id_val): # Renamed arg to avoid conflict
+def initialize_session_state(session_id_val):
     print(f"SESSION {session_id_val} LOG: Initializing/checking session state.")
     default_state = {
         'session_id': session_id_val, 
@@ -42,14 +54,12 @@ def initialize_session_state(session_id_val): # Renamed arg to avoid conflict
             st.session_state[key] = list(value) if isinstance(value, list) else \
                                     dict(value) if isinstance(value, dict) else \
                                     value
-        elif key == 'session_id' and st.session_state.session_id != session_id_val : # If session_id exists but is different (e.g. from a previous browser session using same st.session_state)
+        elif key == 'session_id' and st.session_state.session_id != session_id_val :
              st.session_state.session_id = session_id_val
-
 
 current_session_id = get_session_id() 
 initialize_session_state(current_session_id) 
 
-# --- Sidebar (Keep as is) ---
 with st.sidebar:
     st.header("⚙️ Configuration")
     openai_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
@@ -66,16 +76,15 @@ with st.sidebar:
     if current_model_val not in model_options.values(): current_model_val = list(model_options.values())[0]
     st.session_state.selected_model_for_analysis = current_model_val
     default_model_idx = list(model_options.values()).index(current_model_val)
-    selected_label = st.radio("Select LLM for Analysis & Highlighting:", list(model_options.keys()), 
-                              key="model_selector_radio", index=default_model_idx)
+    selected_label = st.radio("Select LLM:", list(model_options.keys()), key="model_selector_radio", index=default_model_idx) # Shortened label
     st.session_state.selected_model_for_analysis = model_options[selected_label]
-    st.info(f"Using: **{st.session_state.selected_model_for_analysis}** for analysis.")
-    process_images_vision = st.toggle("🖼️ Enable visual analysis (GPT-4 Vision)", value=False, key="vision_toggle")
+    st.info(f"Using: **{st.session_state.selected_model_for_analysis}**.") # Shortened
+    process_images_vision = st.toggle("🖼️ Enable visual analysis", value=False, key="vision_toggle") # Shortened
     vision_model_name_option = "gpt-4-turbo" 
-    highlight_fence_text_app = st.toggle("🔍 Highlight fence-related text & indicators", value=True, key="highlight_toggle")
+    highlight_fence_text_app = st.toggle("🔍 Highlight text & indicators", value=True, key="highlight_toggle") # Shortened
     st.subheader("Fence Keywords")
     if 'fence_keywords_app' not in st.session_state: st.session_state.fence_keywords_app = ['fence']
-    custom_keywords_str = st.text_area("Add custom keywords:", "\n".join(st.session_state.fence_keywords_app), height=150, key="kw_text_area")
+    custom_keywords_str = st.text_area("Custom keywords (one per line):", "\n".join(st.session_state.fence_keywords_app), height=150, key="kw_text_area") # Shortened
     if st.button("Update Keywords", key="update_kw_btn"):
         st.session_state.fence_keywords_app = [k.strip().lower() for k in custom_keywords_str.split("\n") if k.strip()]
         st.rerun()
@@ -85,32 +94,33 @@ llm_analysis_instance, llm_vision_instance = None, None
 if openai_key:
     try:
         print(f"SESSION {current_session_id} LOG: Initializing LLM instances.")
-        llm_analysis_instance = ChatOpenAI(model=st.session_state.selected_model_for_analysis, temperature=0, openai_api_key=openai_key, timeout=180, max_retries=2) # max_retries for client
+        llm_analysis_instance = ChatOpenAI(model=st.session_state.selected_model_for_analysis, temperature=0, openai_api_key=openai_key, timeout=180, max_retries=2)
         if process_images_vision: llm_vision_instance = ChatOpenAI(model=vision_model_name_option, temperature=0, openai_api_key=openai_key, timeout=180, max_retries=2)
         print(f"SESSION {current_session_id} LOG: LLM instances initialized.")
     except Exception as e: st.error(f"LLM Init Error: {e}"); openai_key = None; print(f"SESSION {current_session_id} ERROR: LLM Init Error: {e}")
 
-
-# --- Helper Functions (Keep as is, ensure session_id is passed for logging where useful) ---
 def get_image_download_link_html(img_bytes, filename, text):
     b64 = base64.b64encode(img_bytes).decode()
     return f'<a href="data:image/png;base64,{b64}" download="{filename}" class="download-button">{text}</a>'
 
-@st.cache_data(ttl=3600, show_spinner=False, max_entries=50) # Added max_entries
+@time_it # Apply decorator for timing this function
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=100)
 def _generate_display_images_for_page_cached(page_idx, original_pdf_doc_bytes_tuple, fence_text_boxes_details_tuple,
                                             ui_color, ui_width, display_dpi, session_id_for_log="N/A_CACHE"):
     original_pdf_doc_bytes = bytes(original_pdf_doc_bytes_tuple)
     fence_text_boxes_details = [dict(item_tuple) for item_tuple in fence_text_boxes_details_tuple]
     original_image_bytes, highlighted_image_bytes = None, None
-    print(f"SESSION {session_id_for_log} CACHE_DEBUG: Call to _generate_display_images_for_page_cached for Page {page_idx}. Num boxes in tuple: {len(fence_text_boxes_details_tuple)}")
+    
+    func_call_id = str(uuid.uuid4())[:4] 
+    print(f"SESSION {session_id_for_log} CACHE_CALL ({func_call_id}): _generate_display_images_for_page_cached for Page {page_idx}. Num boxes: {len(fence_text_boxes_details)}")
+    render_start_time = time.time()
     try:
-        with fitz.open(stream=io.BytesIO(original_pdf_doc_bytes), filetype="pdf") as doc: # doc for original
-            page = doc.load_page(page_idx)
-            pix_orig = page.get_pixmap(dpi=display_dpi); original_image_bytes = pix_orig.tobytes("png"); del pix_orig
-
+        with fitz.open(stream=io.BytesIO(original_pdf_doc_bytes), filetype="pdf") as doc_orig:
+            page_orig = doc_orig.load_page(page_idx)
+            pix_orig = page_orig.get_pixmap(dpi=display_dpi); original_image_bytes = pix_orig.tobytes("png"); del pix_orig
             if fence_text_boxes_details:
-                with fitz.open(stream=io.BytesIO(original_pdf_doc_bytes), filetype="pdf") as temp_doc_hl: # doc for highlighted
-                    page_hl = temp_doc_hl.load_page(page_idx)
+                with fitz.open(stream=io.BytesIO(original_pdf_doc_bytes), filetype="pdf") as doc_hl:
+                    page_hl = doc_hl.load_page(page_idx)
                     derot_matrix = page_hl.derotation_matrix
                     for box_detail in fence_text_boxes_details:
                         rot_rect = fitz.Rect(box_detail['x0'], box_detail['y0'], box_detail['x1'], box_detail['y1'])
@@ -119,10 +129,12 @@ def _generate_display_images_for_page_cached(page_idx, original_pdf_doc_bytes_tu
                         if not final_rect.is_empty and final_rect.is_valid:
                             page_hl.draw_rect(final_rect, color=ui_color, width=ui_width, overlay=True)
                     pix_hl = page_hl.get_pixmap(dpi=display_dpi); highlighted_image_bytes = pix_hl.tobytes("png"); del pix_hl
-    except Exception as e: print(f"SESSION {session_id_for_log} ERROR in _generate_display_images_for_page_cached for page {page_idx}: {e}")
+    except Exception as e: print(f"SESSION {session_id_for_log} ERROR ({func_call_id}) in _generate_display_images_for_page_cached for page {page_idx}: {e}")
+    render_duration = time.time() - render_start_time
+    print(f"SESSION {session_id_for_log} CACHE_CALL_RENDER_TIME ({func_call_id}): Page {page_idx} took {render_duration:.4f}s for PyMuPDF rendering.")
     return original_image_bytes, highlighted_image_bytes
 
-def generate_display_images_for_page_wrapper(page_result_data, original_pdf_doc_bytes, session_id): # Pass session_id
+def generate_display_images_for_page_wrapper(page_result_data, original_pdf_doc_bytes, session_id):
     page_idx = page_result_data.get('page_index_in_original_doc')
     if page_idx is None or original_pdf_doc_bytes is None: return None, None
     boxes_details = page_result_data.get('fence_text_boxes_details', [])
@@ -131,7 +143,6 @@ def generate_display_images_for_page_wrapper(page_result_data, original_pdf_doc_
 
 def generate_combined_highlighted_pdf(original_pdf_bytes, fence_pages_results_list, uploaded_pdf_name_base, session_id):
     print(f"SESSION {session_id} LOG: Generating combined highlighted PDF.")
-    # (This function's internal logic remains the same as previous)
     if not fence_pages_results_list or not original_pdf_bytes: return None, "No data for PDF."
     output_doc = fitz.open(); input_doc = None
     try: input_doc = fitz.open(stream=io.BytesIO(original_pdf_bytes), filetype="pdf")
@@ -167,50 +178,31 @@ def generate_combined_highlighted_pdf(original_pdf_bytes, fence_pages_results_li
 
 # --- Main App Flow ---
 st.markdown("<div class='section-header'><h2>📄 Upload Engineering Drawings</h2></div>", unsafe_allow_html=True)
-uploaded_pdf_file_obj = st.file_uploader("Upload PDF Document", type=["pdf"], key="pdf_uploader_main") # Unique key
+uploaded_pdf_file_obj = st.file_uploader("Upload PDF Document", type=["pdf"], key="pdf_uploader_main")
 
 if uploaded_pdf_file_obj:
     print(f"SESSION {current_session_id} LOG: PDF uploaded: {uploaded_pdf_file_obj.name}")
     current_file_id = f"{uploaded_pdf_file_obj.name}_{uploaded_pdf_file_obj.size}"
     if st.session_state.last_uploaded_file_id != current_file_id:
         print(f"SESSION {current_session_id} LOG: New file detected. Resetting state for {current_file_id}.")
-        keys_to_reset = ['fence_pages', 'non_fence_pages', 'total_pages_processed_count', 
-                         'doc_total_pages', 'processing_complete', 'analysis_halted_due_to_error',
-                         'run_analysis_triggered', 'highlighted_pdf_bytes_for_download']
-        # Preserve session_id, selected_model_for_analysis, fence_keywords_app
         current_selected_model = st.session_state.selected_model_for_analysis
         current_keywords = st.session_state.fence_keywords_app
-        
-        initialize_session_state(current_session_id) # Reset to defaults
-
-        st.session_state.selected_model_for_analysis = current_selected_model # Restore
-        st.session_state.fence_keywords_app = current_keywords # Restore
-
+        initialize_session_state(current_session_id)
+        st.session_state.selected_model_for_analysis = current_selected_model
+        st.session_state.fence_keywords_app = current_keywords
         st.session_state.uploaded_pdf_name = uploaded_pdf_file_obj.name
         st.session_state.original_pdf_bytes = uploaded_pdf_file_obj.getvalue()
         st.session_state.last_uploaded_file_id = current_file_id
         _generate_display_images_for_page_cached.clear() 
         print(f"SESSION {current_session_id} LOG: Cleared display image cache.")
         st.rerun() 
-
-    if openai_key and llm_analysis_instance and \
-       not st.session_state.run_analysis_triggered and \
-       not st.session_state.processing_complete and \
-       not st.session_state.analysis_halted_due_to_error:
+    if openai_key and llm_analysis_instance and not st.session_state.run_analysis_triggered and not st.session_state.processing_complete and not st.session_state.analysis_halted_due_to_error:
         print(f"SESSION {current_session_id} LOG: Triggering analysis.")
         st.session_state.run_analysis_triggered = True
+elif not openai_key and not uploaded_pdf_file_obj: st.info("Upload PDF and set API key in sidebar.")
+elif not openai_key and uploaded_pdf_file_obj: st.warning("OpenAI API Key needed for analysis.")
 
-elif not openai_key and not uploaded_pdf_file_obj: 
-    st.info("Upload a PDF and ensure OpenAI API Key is set in the sidebar to begin.")
-elif not openai_key and uploaded_pdf_file_obj:
-     st.warning("OpenAI API Key needed in sidebar for analysis.")
-
-if st.session_state.run_analysis_triggered and \
-   st.session_state.original_pdf_bytes and \
-   llm_analysis_instance and \
-   not st.session_state.analysis_halted_due_to_error and \
-   not st.session_state.processing_complete:
-    
+if st.session_state.run_analysis_triggered and st.session_state.original_pdf_bytes and llm_analysis_instance and not st.session_state.analysis_halted_due_to_error and not st.session_state.processing_complete:
     print(f"SESSION {current_session_id} LOG: Starting PDF processing loop.")
     doc_proc_loop = None
     try:
@@ -223,68 +215,57 @@ if st.session_state.run_analysis_triggered and \
         print(f"SESSION {current_session_id} ERROR: Failed to open PDF for processing: {e}")
         st.stop() 
     
-    # ... (UI setup: hr, title, columns, progress_bar, status_txt_area - same as before) ...
-    st.markdown("<hr>", unsafe_allow_html=True); 
-    st.markdown("<h2>📊 Analysis Results (Live)</h2>", unsafe_allow_html=True)
+    st.markdown("<hr>", unsafe_allow_html=True); st.markdown("<h2>📊 Analysis Results (Live)</h2>", unsafe_allow_html=True)
     summary_placeholder = st.empty(); col_f, col_nf = st.columns(2)
     with col_f: st.subheader("✅ Fence-Related Pages")
     with col_nf: st.subheader("❌ Non-Fence Pages")
     prog_bar = st.progress(0); status_txt_area = st.empty()
 
-    # --- Main Processing Loop ---
-    try: # Wrap the entire loop to ensure doc_proc_loop is closed
+    try:
         for i in range(st.session_state.doc_total_pages):
             curr_pg_num = i + 1; st.session_state.total_pages_processed_count = curr_pg_num
             prog_bar.progress(curr_pg_num / st.session_state.doc_total_pages)
             status_txt_area.text(f"Processing Page {curr_pg_num}/{st.session_state.doc_total_pages}...")
             print(f"SESSION {current_session_id} LOG: Processing page {curr_pg_num}.")
-            
             page_obj = doc_proc_loop.load_page(i); text_content = page_obj.get_text("text")
             page_data_an = {"page_number": curr_pg_num, "text": text_content}
             if process_images_vision:
-                print(f"SESSION {current_session_id} LOG: Page {curr_pg_num} - Generating image for vision.")
+                print(f"SESSION {current_session_id} LOG: Page {curr_pg_num} - Generating image for vision (DPI: {VISION_IMAGE_DPI}).")
                 pix_vis = page_obj.get_pixmap(alpha=False, dpi=VISION_IMAGE_DPI) 
                 img_b_vis = pix_vis.tobytes("png"); del pix_vis 
                 page_data_an["image_b64"] = base64.b64encode(img_b_vis).decode("utf-8")
-            
             analysis_res_core = {}; fatal_err_page = False
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
                     analysis_res_core = analyze_page(page_data_an, llm_analysis_instance, llm_vision_instance if process_images_vision else None, FENCE_KEYWORDS_APP)
             except UnrecoverableRateLimitError as urle:
                 msg = f"🛑 API Rate Limit Pg {curr_pg_num}: {urle}. Analysis halted."; status_txt_area.error(msg); st.error(msg)
-                st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; break
+                st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; print(f"SESSION {current_session_id} ERROR: {msg}"); break
             except Exception as e_core: st.error(f"Core analysis error pg {curr_pg_num}: {e_core}"); analysis_res_core = {"fence_found": False}; print(f"SESSION {current_session_id} ERROR: Core analysis pg {curr_pg_num}: {e_core}")
-            
             analysis_result = {**analysis_res_core, 'page_number': curr_pg_num, 'page_index_in_original_doc': i, 'fence_text_boxes_details': [], 'highlight_fence_text_app_setting': highlight_fence_text_app}
-
             if not fatal_err_page and highlight_fence_text_app and analysis_result.get('text_found'):
-                status_txt_area.text(f"Page {curr_pg_num}: Highlighting text locations (text match found)...")
+                status_txt_area.text(f"Page {curr_pg_num}: Highlighting (text match found)...") # Shortened
                 single_pg_bytes_io = io.BytesIO(); temp_doc_single = None
                 try: 
                     temp_doc_single = fitz.open()
                     temp_doc_single.insert_pdf(doc_proc_loop, from_page=i, to_page=i); temp_doc_single.save(single_pg_bytes_io)
                 finally: 
                     if temp_doc_single: temp_doc_single.close()
-                
                 try:
                     with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):
                         boxes,_,_ = get_fence_related_text_boxes(single_pg_bytes_io.getvalue(), llm_analysis_instance, FENCE_KEYWORDS_APP, st.session_state.selected_model_for_analysis)
                         if boxes: analysis_result['fence_text_boxes_details'] = boxes
                 except UnrecoverableRateLimitError as urle_hl:
                     msg = f"🛑 API Rate Limit Highlight Pg {curr_pg_num}: {urle_hl}. Halted."; status_txt_area.error(msg); st.error(msg)
-                    st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; break
+                    st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; print(f"SESSION {current_session_id} ERROR: {msg}"); break
                 except Exception as e_hl: st.warning(f"Highlight error pg {curr_pg_num}: {e_hl}"); print(f"SESSION {current_session_id} WARNING: Highlight error pg {curr_pg_num}: {e_hl}")
             elif not fatal_err_page and highlight_fence_text_app and analysis_result.get('fence_found'):
-                 status_txt_area.text(f"Page {curr_pg_num}: Fence found (e.g. by vision), but no text match for detailed highlighting.")
+                 status_txt_area.text(f"Page {curr_pg_num}: Fence found (e.g. vision), no text match for detailed highlighting.")
             if fatal_err_page: break
             
-            # ... (Target column append, expander display logic - keep as is from previous full version) ...
-            # Ensure current_session_id is passed to generate_display_images_for_page_wrapper
-            # The display logic within the live loop should be identical to display_page_result_expander's content
             target_col = col_f if analysis_result.get('fence_found') else col_nf
             (st.session_state.fence_pages if analysis_result.get('fence_found') else st.session_state.non_fence_pages).append(analysis_result)
-            with target_col:
+            with target_col: # Display Logic (copied from display_page_result_expander for consistency)
                 exp_title = f"Page {analysis_result['page_number']}"
                 if analysis_result.get('fence_found'):
                     reasons = []; 
@@ -292,11 +273,19 @@ if st.session_state.run_analysis_triggered and \
                     if analysis_result.get('vision_found'): reasons.append("Image")
                     if analysis_result.get('fence_text_boxes_details') and highlight_fence_text_app: reasons.append("Highlights")
                     if reasons: exp_title += f" ({' & '.join(reasons)} Match)"
-                with st.expander(exp_title, expanded=True):
+                with st.expander(exp_title, expanded=True): # Keep expanded True for live update
                     img_col, det_col = st.columns([2,1])
-                    print(f"SESSION {current_session_id} DEBUG LIVE DISPLAY Page {analysis_result['page_number']}: fence_found: {analysis_result.get('fence_found')}, Highlight toggle: {highlight_fence_text_app}, Num boxes: {len(analysis_result.get('fence_text_boxes_details', []))}") # Debug print
+                    print(f"SESSION {current_session_id} DEBUG LIVE DISPLAY Page {analysis_result['page_number']}: "
+                          f"fence_found: {analysis_result.get('fence_found')}, Highlight toggle: {highlight_fence_text_app}, "
+                          f"Num boxes: {len(analysis_result.get('fence_text_boxes_details', []))}")
                     if analysis_result.get('fence_text_boxes_details'): print(f"SESSION {current_session_id} DEBUG LIVE: First box detail: {analysis_result['fence_text_boxes_details'][0] if analysis_result.get('fence_text_boxes_details') else 'No boxes'}")
-                    with st.spinner(f"Loading image for page {analysis_result['page_number']}..."): orig_b, hl_b = generate_display_images_for_page_wrapper(analysis_result, st.session_state.original_pdf_bytes, current_session_id)
+                    
+                    wrapper_call_start_time = time.time()
+                    with st.spinner(f"Rendering image for page {analysis_result['page_number']}..."): # Spinner during image gen
+                         orig_b, hl_b = generate_display_images_for_page_wrapper(analysis_result, st.session_state.original_pdf_bytes, current_session_id)
+                    wrapper_call_duration = time.time() - wrapper_call_start_time
+                    print(f"SESSION {current_session_id} PERF_LOG: generate_display_images_for_page_wrapper Page {curr_pg_num} took {wrapper_call_duration:.4f}s.")
+
                     with img_col:
                         disp_img_ui = hl_b if hl_b else orig_b
                         if disp_img_ui: st.image(disp_img_ui, caption=f"Page {analysis_result['page_number']}{' (Highlighted)' if hl_b else ''}")
@@ -304,15 +293,14 @@ if st.session_state.run_analysis_triggered and \
                         if hl_b: dl_links_html_live.append(get_image_download_link_html(hl_b, f"page_{analysis_result['page_number']}_hl.png", "DL HL Img"))
                         if orig_b: dl_links_html_live.append(get_image_download_link_html(orig_b, f"page_{analysis_result['page_number']}_orig.png", "DL Orig Img"))
                         if dl_links_html_live: st.markdown(" ".join(dl_links_html_live), unsafe_allow_html=True)
-                    with det_col: # Text details display
+                    with det_col:
                         st.markdown("##### Analysis Details")
-                        # (Copied from display_page_result_expander for consistency)
                         if analysis_result.get('fence_found'):
                             pts = []
-                            if analysis_result.get('text_found'): pts.append("✔️ Text indicates fences.")
-                            if analysis_result.get('vision_found'): pts.append("✔️ Image shows fences.")
-                            if analysis_result.get('fence_text_boxes_details') and highlight_fence_text_app : pts.append("✔️ Highlights ready.")
-                            if not pts: pts.append("Fence flagged.")
+                            if analysis_result.get('text_found'): pts.append("✔️ Text")
+                            if analysis_result.get('vision_found'): pts.append("✔️ Image")
+                            if analysis_result.get('fence_text_boxes_details') and highlight_fence_text_app : pts.append("✔️ Highlights")
+                            if not pts: pts.append("Fence flagged")
                             st.markdown("\n".join(f"- {s}" for s in pts))
                         else: st.markdown("No strong fence indicators.")
                         if analysis_result.get('text_response'):
@@ -331,19 +319,15 @@ if st.session_state.run_analysis_triggered and \
                                 display_text_live = f"- `{txt_live}` (Type: {type_llm_live}, Tag: {tag_live})"
                                 if display_text_live not in disp_set_live: st.markdown(display_text_live); disp_set_live.add(display_text_live); count_live+=1
                                 if count_live >=15 and len(details_list) > 17: st.markdown(f"- ...& {len(details_list)-count_live} more."); break
-
-
             summary_placeholder.markdown(f"### Summary (Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages})\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}")
-            time.sleep(0.1) # Reduced inter-page delay further
-    finally: # Ensure doc_proc_loop is closed if loop finishes or breaks
+            time.sleep(0.05) # Reduced inter-page delay
+    finally: 
         if doc_proc_loop:
             doc_proc_loop.close()
             print(f"SESSION {current_session_id} LOG: Closed main processing PDF document in finally block.")
         doc_proc_loop = None 
     
     st.session_state.processing_complete = True 
-    # ... (Rest of post-processing summary and download button logic - keep as is) ...
-    # (Identical to previous full app.py from here down for this block)
     if not st.session_state.analysis_halted_due_to_error:
         prog_bar.empty(); status_txt_area.success("All pages processed!")
         if st.session_state.fence_pages and st.session_state.original_pdf_bytes:
@@ -356,13 +340,10 @@ if st.session_state.run_analysis_triggered and \
     if st.session_state.get('highlighted_pdf_bytes_for_download') and not st.session_state.analysis_halted_due_to_error:
         st.download_button("⬇️ Download Highlighted Fence Pages (PDF)", st.session_state.highlighted_pdf_bytes_for_download, st.session_state.highlighted_pdf_filename_for_download, "application/pdf", key="dl_combined_pdf_main")
 
-
 elif st.session_state.processing_complete: 
     print(f"SESSION {current_session_id} LOG: Displaying previously processed results (rerun).")
-    # (Display results on rerun - ensure current_session_id is passed to wrappers)
-    # This part should be identical to your last version, just passing session_id
     st.markdown("<hr>", unsafe_allow_html=True); st.markdown("<h2>📊 Analysis Results</h2>", unsafe_allow_html=True)
-    final_summary_text_rerun = f"### Final Summary ({'Halted Previously' if st.session_state.analysis_halted_due_to_error else 'Completed'})\n- Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages}\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}" # Corrected key for non_fence_pages
+    final_summary_text_rerun = f"### Final Summary ({'Halted Previously' if st.session_state.analysis_halted_due_to_error else 'Completed'})\n- Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages}\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}"
     st.markdown(final_summary_text_rerun)
     if st.session_state.get('highlighted_pdf_bytes_for_download') and not st.session_state.analysis_halted_due_to_error:
          st.download_button("⬇️ Download Highlighted Fence Pages (PDF)", st.session_state.highlighted_pdf_bytes_for_download, st.session_state.highlighted_pdf_filename_for_download, "application/pdf", key="dl_combined_pdf_rerun")
@@ -376,7 +357,7 @@ elif st.session_state.processing_complete:
             with target_column_res:
                 exp_title_res = f"Page {res_data_item['page_number']}"
                 if res_data_item.get('fence_found'):
-                    reasons_res = []
+                    reasons_res = []; 
                     if res_data_item.get('text_found'): reasons_res.append("Text")
                     if res_data_item.get('vision_found'): reasons_res.append("Image")
                     if res_data_item.get('fence_text_boxes_details') and res_data_item.get('highlight_fence_text_app_setting', True): reasons_res.append("Highlights")
@@ -385,22 +366,21 @@ elif st.session_state.processing_complete:
                     img_col_r, det_col_r = st.columns([2,1])
                     with st.spinner(f"Loading image page {res_data_item['page_number']}..."):
                         orig_b_r, hl_b_r = generate_display_images_for_page_wrapper(res_data_item, st.session_state.original_pdf_bytes, session_id_for_display)
-                    with img_col_r:
+                    with img_col_r: # Image display logic copied and adapted
                         disp_img_r = hl_b_r if hl_b_r else orig_b_r
                         if disp_img_r: st.image(disp_img_r, caption=f"Page {res_data_item['page_number']}{' (HL)' if hl_b_r else ''}")
                         dl_links_html_rerun = []
                         if hl_b_r: dl_links_html_rerun.append(get_image_download_link_html(hl_b_r, f"page_{res_data_item['page_number']}_hl.png", "DL HL Img"))
                         if orig_b_r: dl_links_html_rerun.append(get_image_download_link_html(orig_b_r, f"page_{res_data_item['page_number']}_orig.png", "DL Orig Img"))
                         if dl_links_html_rerun: st.markdown(" ".join(dl_links_html_rerun), unsafe_allow_html=True)
-                    with det_col_r: # Text details for rerun display
+                    with det_col_r: # Text details display logic copied and adapted
                         st.markdown("##### Analysis Details")
-                        # (This logic should be identical to the live loop's detail display)
                         if res_data_item.get('fence_found'):
                             pts_r = [] 
-                            if res_data_item.get('text_found'): pts_r.append("✔️ Text indicates fences.")
-                            if res_data_item.get('vision_found'): pts_r.append("✔️ Image shows fences.")
-                            if res_data_item.get('fence_text_boxes_details') and res_data_item.get('highlight_fence_text_app_setting',True) : pts_r.append("✔️ Highlights ready.")
-                            if not pts_r: pts_r.append("Fence flagged.")
+                            if res_data_item.get('text_found'): pts_r.append("✔️ Text")
+                            if res_data_item.get('vision_found'): pts_r.append("✔️ Image")
+                            if res_data_item.get('fence_text_boxes_details') and res_data_item.get('highlight_fence_text_app_setting',True) : pts_r.append("✔️ Highlights")
+                            if not pts_r: pts_r.append("Fence flagged")
                             st.markdown("\n".join(f"- {s}" for s in pts_r))
                         else: st.markdown("No strong fence indicators.")
                         if res_data_item.get('text_response'):
@@ -421,11 +401,8 @@ elif st.session_state.processing_complete:
     display_page_result_expander(st.session_state.fence_pages, col_f_res, current_session_id)
     display_page_result_expander(st.session_state.non_fence_pages, col_nf_res, current_session_id)
 
-elif not st.session_state.original_pdf_bytes : 
-    st.info("Upload PDF and ensure API key is set in sidebar.")
-elif not (openai_key and llm_analysis_instance): 
-    st.error("OpenAI models not initialized. Check API key.")
-elif st.session_state.analysis_halted_due_to_error: 
-    st.error("Analysis was halted due to an error (e.g., API rate limit). Please upload the file again or try a different one.")
+elif not st.session_state.original_pdf_bytes : st.info("Upload PDF and ensure API key is set in sidebar.")
+elif not (openai_key and llm_analysis_instance): st.error("OpenAI models not initialized. Check API key.")
+elif st.session_state.analysis_halted_due_to_error: st.error("Analysis was halted. Upload file again or try a different one.")
 
 st.markdown("---"); st.markdown("<p style='text-align: center; color: grey;'>Fence Detector App</p>", unsafe_allow_html=True)
