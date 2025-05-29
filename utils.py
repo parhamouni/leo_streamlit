@@ -1,4 +1,4 @@
-# utils.py
+# utils.py (Version 10)
 
 import time
 import functools
@@ -7,7 +7,7 @@ import base64
 import re
 import random 
 from langchain_core.messages import HumanMessage
-from openai import RateLimitError, APIError, APITimeoutError # Make sure these are imported
+from openai import RateLimitError, APIError, APITimeoutError
 import pdfplumber
 from io import BytesIO
 import json
@@ -17,12 +17,10 @@ class UnrecoverableRateLimitError(Exception):
     pass
 
 # --- Timing Decorator ---
-# DEFINITION MUST COME BEFORE FIRST USE
 def time_it(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         func_name = f"{func.__module__}.{func.__name__}"
-        # For production, consider using the logging module instead of print
         # print(f"TIMER LOG: ---> Entering {func_name}") 
         start_time = time.time()
         result = func(*args, **kwargs)
@@ -34,7 +32,7 @@ def time_it(func):
 
 # --- Core Functions ---
 
-@time_it # Now 'time_it' is defined
+@time_it
 def extract_snippet(text, fence_keywords):
     for kw in fence_keywords:
         match = re.search(rf".{{0,50}}\b{re.escape(kw)}\b.{{0,50}}", text, re.IGNORECASE)
@@ -62,7 +60,7 @@ def retry_with_backoff(llm_invoke_method, messages_list, retries=5, base_delay=2
         except (APIError, APITimeoutError) as apie:
             if attempt == retries - 1:
                 print(f"TIMER LOG: Max retries for '{func_name}' (APIError/Timeout). Last error: {apie}")
-                raise # Re-raise original or a custom one summarizing this
+                raise 
             delay = base_delay * (2 ** attempt) + random.uniform(0,1)
             print(f"TIMER LOG: API Error/Timeout for '{func_name}'. Retry {attempt+1}/{retries} in {delay:.2f}s. Error: {apie}")
             time.sleep(delay)
@@ -137,7 +135,7 @@ Start your answer with 'Yes' or 'No'. Then, briefly explain your reasoning. Text
 
 @time_it
 def get_fence_related_text_boxes(page_bytes, llm, fence_keywords_from_app, selected_llm_model_name="gpt-3.5-turbo"):
-    print(f"TIMER LOG: (get_fence_related_text_boxes) Starting REFINED TWO-PASS - v9 (Stricter Numerical Indicator Filtering in Pass 2).")
+    print(f"TIMER LOG: (get_fence_related_text_boxes) Starting REFINED TWO-PASS - v10 (Noise Reduction for Sparse Pages).")
     overall_gfrtb_start_time = time.time()
     
     page_width, page_height = 0, 0
@@ -163,52 +161,92 @@ def get_fence_related_text_boxes(page_bytes, llm, fence_keywords_from_app, selec
             except Exception as e_lines:
                 print(f"TIMER LOG: (get_fence_related_text_boxes) Error during page_obj.extract_text_lines: {type(e_lines).__name__}: {e_lines}")
 
-            # --- PASS 1 Logic (Identical to V8) ---
             print(f"TIMER LOG: (get_fence_related_text_boxes) Starting Pass 1: Legend/Description Identification.")
             candidate_legend_lines_for_llm1 = []
             if extracted_lines:
                 for line_idx, line_obj_data in enumerate(extracted_lines):
                     line_text = line_obj_data.get('text', '').strip()
                     if not line_text: continue
+                    
+                    # --- Stricter Pre-filtering for Pass 1 Candidates (V10) ---
+                    if len(line_text) < 5: # Ignore very short fragments (e.g., "ft.", "mm", single characters)
+                        continue
+                    num_words = len(line_text.split())
+                    # If less than 2 words, it must look like a code (e.g. "F1:", "1.", "NTS") to be considered
+                    # Allow single word if it's a very strong fence keyword AND looks like a title/label (e.g. all caps)
+                    is_short_code_like = bool(re.match(r"^[A-Z0-9]{1,6}([:\.\-\s]*)$", line_text.strip())) or \
+                                         bool(re.match(r"^\s*\(?[A-Za-z0-9]{1,4}\)?[:\.\-]\s*", line_text))
+                    
+                    if num_words < 1: # Should not happen if len(line_text) >=5, but good check
+                        continue
+                    if num_words == 1 and len(line_text) < 10 and not is_short_code_like: # Single short word, not code-like
+                        # Check if this single word is a strong, specific fence keyword (not just "post")
+                        is_strong_single_fence_keyword = line_text.lower() in ['fence', 'fencing', 'gate', 'gates', 'barrier', 'guardrail']
+                        if not is_strong_single_fence_keyword:
+                            continue 
+                    elif num_words < 2 and not is_short_code_like: # (e.g. two very short words, like "TO FENCE")
+                         if len(line_text) < 10: # If it's very short and not code-like
+                            continue
+                    # --- End of Stricter Pre-filtering for V10 ---
+
                     line_text_lower = line_text.lower()
                     has_fence_keyword = any(kw in line_text_lower for kw in fence_keywords_from_app)
-                    is_candidate = has_fence_keyword or \
-                                   any(term in line_text_lower for term in ["detail", "type", "schedule", "item", "legend", "notes", "spec", "assy", "section", "elevation", "matl", "constr", "view", "plan", "typical", "standard", "description", "callout"]) or \
-                                   bool(re.match(r"^\s*\(?([A-Za-z0-9]+(?:[\.\-][A-Za-z0-9]+)*)\)?[\s:.)\-]", line_text))
-                    if is_candidate and (1 < len(line_text.split()) < 80) and len(line_text) < 500:
-                        if all(k in line_obj_data for k in ['x0', 'top', 'x1', 'bottom']):
-                            candidate_legend_lines_for_llm1.append({
-                                "id": f"line_{line_idx}", "text": line_text,
-                                "x0": round(line_obj_data['x0'], 2), "y0": round(line_obj_data['top'], 2),
-                                "x1": round(line_obj_data['x1'], 2), "y1": round(line_obj_data['bottom'], 2)
-                            })
+                    is_drawing_term_or_identifier = any(term in line_text_lower for term in ["detail", "type", "schedule", "item", "legend", "notes", "spec", "assy", "section", "elevation", "matl", "constr", "view", "plan", "typical", "standard", "description", "callout"]) or \
+                                                    bool(re.match(r"^\s*\(?([A-Za-z0-9]+(?:[\.\-][A-Za-z0-9]+)*)\)?[\s:.)\-]", line_text))
+                    
+                    if (has_fence_keyword or is_drawing_term_or_identifier):
+                        if (1 < num_words < 80) and len(line_text) < 500 : # Use num_words from above
+                            if all(k in line_obj_data for k in ['x0', 'top', 'x1', 'bottom']):
+                                candidate_legend_lines_for_llm1.append({
+                                    "id": f"line_{line_idx}", "text": line_text,
+                                    "x0": round(line_obj_data['x0'], 2), "y0": round(line_obj_data['top'], 2),
+                                    "x1": round(line_obj_data['x1'], 2), "y1": round(line_obj_data['bottom'], 2)
+                                })
             print(f"TIMER LOG: (get_fence_related_text_boxes) Pre-filtering lines for Pass 1. Found {len(candidate_legend_lines_for_llm1)} candidates.")
+
             identified_legends_from_pass1_llm_output = [] 
             confirmed_legend_core_ids = set()  
             processed_legends_for_pass2_prompt_context = [] 
+
             if candidate_legend_lines_for_llm1:
                 lines_json_str_pass1 = json.dumps(candidate_legend_lines_for_llm1, separators=(',', ':'))
                 pass1_examples = """
-Example 1 Input Line: {"id": "line_23", "text": "1. 6' HIGH INTERIOR COURT FENCE, COLOR: BLACK VINYL", "x0": 50.0, "y0": 100.0, "x1": 450.0, "y1": 110.0}
-Example 1 Output for this line (within the 'identified_fences' list): {"id": "line_23", "full_text": "1. 6' HIGH INTERIOR COURT FENCE, COLOR: BLACK VINYL", "core_identifier_text": "1", "type": "legend_item"}
-Example 2 Input Line: {"id": "line_45", "text": "ALL FENCE POSTS TO BE SET IN CONCRETE FOOTINGS PER DETAIL 3/CD-2.", "x0": 50.0, "y0": 120.0, "x1": 480.0, "y1": 130.0}
-Example 2 Output for this line: {"id": "line_45", "full_text": "ALL FENCE POSTS TO BE SET IN CONCRETE FOOTINGS PER DETAIL 3/CD-2.", "core_identifier_text": "FENCE_POST_FOOTING_NOTE", "type": "note"}
-Example 3 Input Line: {"id": "line_67", "text": "6. POST TENSION SLAB - REFER TO DETAIL 3, CD-1", "x0": 50.0, "y0": 150.0, "x1": 400.0, "y1": 160.0}
-Example 3 Output for this line: {} (OMIT this non-fence item)
-Example 4 Input Line: {"id": "line_88", "text": "FENCE TYPE F2A: CHAIN LINK W/ PRIVACY SLATS", "x0": 50.0, "y0": 180.0, "x1": 350.0, "y1": 190.0}
-Example 4 Output for this line: {"id": "line_88", "full_text": "FENCE TYPE F2A: CHAIN LINK W/ PRIVACY SLATS", "core_identifier_text": "F2A", "type": "legend_item"}
-Example 5 Input Line: {"id": "line_92", "text": "PROJECT BOUNDARY LINE", "x0": 50.0, "y0": 200.0, "x1": 200.0, "y1": 210.0}
-Example 5 Output for this line: {} (OMIT this non-fence item)"""
-                prompt_pass1 = f"""You are an engineering drawing analyst. Your primary goal is to identify text elements that are **SPECIFICALLY about fences, gates, or their components/installation.**
-You are provided with a JSON list of TEXT LINES from a drawing page. Fence-related keywords: {', '.join(fence_keywords_from_app)}.
-Your task is:
-1.  Analyze each input line. Identify ONLY lines **explicitly describing FENCES, GATES, BARRIERS, GUARDRAILS, or their direct attributes.** Ignore lines about unrelated items (e.g., "LIGHT POLE", "POST TENSION SLAB"), even if they are in a list with fence items.
-2.  For each **fence-specific** line:
-    a.  Determine **`core_identifier_text`**: **Priority 1:** Exact tag (e.g., "F1", "1", "NOTE 3"), removing trailing punctuation. **Priority 2:** ALL_CAPS_SNAKE_CASE summary (e.g., "FENCE_HEIGHT_SPEC"). **Priority 3:** "GENERAL_FENCE_NOTE" or "N/A_DESC".
+Example 1 Input Line: {"id": "line_23", "text": "1. 6' HIGH INTERIOR COURT FENCE, COLOR: BLACK VINYL"}
+Example 1 Output: {"id": "line_23", "full_text": "1. 6' HIGH INTERIOR COURT FENCE, COLOR: BLACK VINYL", "core_identifier_text": "1", "type": "legend_item"}
+Example 2 Input Line: {"id": "line_45", "text": "ALL FENCE POSTS TO BE SET IN CONCRETE FOOTINGS PER DETAIL 3/CD-2."}
+Example 2 Output: {"id": "line_45", "full_text": "ALL FENCE POSTS TO BE SET IN CONCRETE FOOTINGS PER DETAIL 3/CD-2.", "core_identifier_text": "FENCE_POST_FOOTING_NOTE", "type": "note"}
+Example 3 Input Line: {"id": "line_67", "text": "6. POST TENSION SLAB - REFER TO DETAIL 3, CD-1"}
+Example 3 Output: {} (OMIT - NOT fence-related)
+Example 4 Input Line: {"id": "line_101", "text": "VISITORS' LOW FENCE"}
+Example 4 Output: {"id": "line_101", "full_text": "VISITORS' LOW FENCE", "core_identifier_text": "VISITORS_LOW_FENCE", "type": "description"}
+Example 5 Input Line: {"id": "line_102", "text": "DATE PRINTED: 11/4/2024"} 
+Example 5 Output: {} (OMIT - Not fence-related, likely boilerplate/noise)
+Example 6 Input Line: {"id": "line_103", "text": "ft"} 
+Example 6 Output: {} (OMIT - Too short, likely OCR noise or irrelevant fragment)
+"""
+                prompt_pass1 = f"""You are an engineering drawing analyst. Your goal is to identify text elements SPECIFICALLY about FENCES, GATES, or their components.
+You are given a JSON list of TEXT LINES. Fence-related keywords: {', '.join(fence_keywords_from_app)}.
+Your task:
+1.  Analyze each input line. Identify ONLY lines that EXPLICITLY describe FENCES, GATES, BARRIERS, GUARDRAILS, or their direct attributes (e.g., fence height, gate type, post material).
+    - IGNORE lines that are clearly not fence-related (e.g., "LIGHT POLE", "POST TENSION SLAB", "PROJECT BOUNDARY", "DATE PRINTED").
+    - IGNORE very short (e.g. < 4 characters), fragmented, or noisy text (e.g., standalone "ft", "mm", random characters) unless it's a very clear and known fence identifier type/code (e.g. "F1").
+2.  For each **fence-specific and meaningful** line identified:
+    a.  Determine **`core_identifier_text`**: 
+        - **P1:** Exact tag (e.g., "F1", "1", "NOTE 3"), remove trailing punctuation. 
+        - **P2:** ALL_CAPS_SNAKE_CASE summary for descriptive text (e.g., "FENCE_HEIGHT_SPEC").
+        - **P3:** "GENERAL_FENCE_NOTE" or "N/A_DESC".
     b.  Provide **`type`**: "legend_item", "specification", "note", or "description".
-Examples: {pass1_examples}
-Output ONLY a single valid JSON object: {{"identified_fences": [{{...output for fence-related line 1...}}, ...]}}. 'id' and 'full_text' must match input. If NO fence-specific items, return {{"identified_fences": []}}. Strictly JSON.
-Input Text Lines: {lines_json_str_pass1}"""
+
+Examples (output shows items to be included in 'identified_fences' list):
+{pass1_examples}
+
+Output ONLY a single valid JSON object: {{"identified_fences": [{{...output for fence-related line 1...}}, ...]}}.
+'id' and 'full_text' must match input. OMIT non-fence-related or noisy lines from the output list (i.e., do not create an entry for them).
+If NO valid fence-specific items are found, return {{"identified_fences": []}}. Strictly JSON.
+
+Input Text Lines:
+{lines_json_str_pass1}"""
+                
                 response_content_pass1 = ""
                 try:
                     print(f"TIMER LOG: (get_fence_related_text_boxes) Initiating Pass 1 Text LLM call ({len(candidate_legend_lines_for_llm1)} lines).")
@@ -228,7 +266,7 @@ Input Text Lines: {lines_json_str_pass1}"""
                     if identified_legends_from_pass1_llm_output:
                         temp_legend_map = {item['id']: item for item in candidate_legend_lines_for_llm1} 
                         for legend_data_llm in identified_legends_from_pass1_llm_output:
-                            if not isinstance(legend_data_llm, dict): continue
+                            if not isinstance(legend_data_llm, dict) or not legend_data_llm: continue
                             original_line_id = legend_data_llm.get("id")
                             if not original_line_id: continue
                             original_line_obj_from_map = temp_legend_map.get(original_line_id)
@@ -248,7 +286,7 @@ Input Text Lines: {lines_json_str_pass1}"""
                 except Exception as e_p1: print(f"TIMER LOG: Error in Pass 1: {e_p1}"); print(f"TIMER LOG: Pass 1 Resp: {response_content_pass1[:500] if response_content_pass1 else 'None'}")
             print(f"TIMER LOG: After Pass 1, core_ids for Pass 2: {confirmed_legend_core_ids}")
 
-            # --- PASS 2: Indicator Identification (Focus on Numerical Specificity) ---
+            # --- PASS 2 Logic (Identical to V9) ---
             if confirmed_legend_core_ids and words: 
                 print(f"TIMER LOG: Starting Pass 2: Indicator Identification ({len(words)} Words).")
                 candidate_indicator_words_for_llm2 = []
@@ -289,66 +327,22 @@ Input Text Lines: {lines_json_str_pass1}"""
                         if len(leg_detail.get("full_text", "")) > 70: leg_text_snippet += "..."
                         pass1_context_json_for_pass2.append({"identifier": leg_detail.get("core_identifier_text"),"description_snippet": leg_text_snippet, "type" : leg_detail.get("type")})
                     confirmed_legends_context_str_for_prompt = json.dumps(pass1_context_json_for_pass2, separators=(',',':'))
-                    
                     pass2_examples = """
-Example 1 (Good Indicator):
-Input Candidate: {"id": "word_105", "text": "1", "core_text_matched": "1", "x0": 350.0, "y0": 250.0, "x1": 355.0, "y1": 258.0}
-(Context has: {"identifier": "1", "description_snippet": "1. 6' HIGH INTERIOR COURT FENCE...", "type": "legend_item"})
-Output for this candidate: {"id": "word_105", "matched_legend_identifier": "1", "text_content": "1"}
-Reasoning: This "1" is likely a callout pointing to the fence type 1.
-
-Example 2 (Bad Indicator - Dimension):
-Input Candidate: {"id": "word_200", "text": "10'", "core_text_matched": "10", "x0": 400.0, "y0": 300.0, "x1": 415.0, "y1": 308.0} 
-(Assume "10" is NOT a core_identifier from Pass 1. If "10" *was* a core_id like "POST_10", this example would change. For now, assume it matched "10" from a legend item like "10. Ground Rod" which IS fence-related, but this "10'" is clearly a dimension.)
-Output for this candidate: [] 
-Reasoning: "10'" looks like a dimension (10 feet), not a callout for a legend item "10". It includes a unit mark.
-
-Example 3 (Bad Indicator - Part of text):
-Input Candidate: {"id": "word_10", "text": "Fence", "core_text_matched": "FENCE_POST_FOOTING_NOTE", "x0": 60.0, "y0": 121.0, "x1": 90.0, "y1": 129.0}
-(Context has: {"identifier": "FENCE_POST_FOOTING_NOTE", "description_snippet": "ALL FENCE POSTS TO BE SET...", "type": "note"})
-Output for this candidate: []
-Reasoning: This word "Fence" is part of the note text itself, not a standalone indicator of the entire note.
-
-Example 4 (Good Alphanumeric Indicator):
-Input Candidate: {"id": "word_77", "text": "F2A", "core_text_matched": "F2A", "x0": 500.0, "y0": 550.0, "x1": 520.0, "y1": 558.0}
-(Context has: {"identifier": "F2A", "description_snippet": "FENCE TYPE F2A: CHAIN LINK...", "type": "legend_item"})
-Output for this candidate: {"id": "word_77", "matched_legend_identifier": "F2A", "text_content": "F2A"}
-
-Example 5 (Bad Numerical Indicator - Looks like a quantity or part of a measurement in descriptive text):
-Input Candidate: {"id": "word_301", "text": "2", "core_text_matched": "2", "x0": 150.0, "y0": 400.0, "x1": 155.0, "y1": 408.0}
-(Context has: {"identifier": "2", "description_snippet": "2. GATE HARDWARE SET (HINGES, LATCH)", "type": "legend_item"})
-(Imagine this "2" on the drawing is next to text like "PROVIDE 2 ANCHOR BOLTS" or "(2) REQUIRED")
-Output for this candidate: []
-Reasoning: This "2" appears to be a quantity within a descriptive text or dimension, not a callout pointing to legend item 2.
-
-Example 6 (Bad Numerical Indicator - Dimension Value):
-Input Candidate: {"id": "word_401", "text": "150", "core_text_matched": "150", "x0": 200.0, "y0": 600.0, "x1": 220.0, "y1": 608.0}
-(Assume "150" is NOT a core_identifier from Pass 1 that refers to a fence type. If it were, this decision might change. If it matched a non-fence legend item ID, it wouldn't even be a candidate. This example assumes "150" might be a generic number that happens to match a fence ID like "FENCE_MODEL_150" if such an ID existed, but visually it's part of "150mm" or on a dimension line).
-Output for this candidate: []
-Reasoning: This number "150" is likely a dimension value (e.g., 150mm, 150 LF) and not a callout for a legend item.
-"""
-
+Example 1 (Good Indicator): {"id": "word_105", "text": "1", "core_text_matched": "1"} -> Output: {"id": "word_105", "matched_legend_identifier": "1", "text_content": "1"}
+Example 2 (Bad Indicator - Dimension): {"id": "word_200", "text": "10'", "core_text_matched": "10"} -> Output: []
+Example 3 (Bad Indicator - Part of text): {"id": "word_10", "text": "Fence", "core_text_matched": "FENCE_POST_FOOTING_NOTE"} -> Output: []
+Example 4 (Good Alphanumeric): {"id": "word_77", "text": "F2A", "core_text_matched": "F2A"} -> Output: {"id": "word_77", "matched_legend_identifier": "F2A", "text_content": "F2A"}
+Example 5 (Bad Numerical - Quantity): {"id": "word_301", "text": "2", "core_text_matched": "2"} (Context: "2. GATE HARDWARE", Word context: "PROVIDE 2 ANCHOR BOLTS") -> Output: []
+Example 6 (Bad Numerical - Dimension Value): {"id": "word_401", "text": "150", "core_text_matched": "150"} (Context: "150. FENCE MODEL X", Word context: "150mm typ.") -> Output: []"""
                     prompt_pass2 = f"""You are an engineering drawing analyst.
-Context: These Fence-related items (legends, specs, notes) and their core identifiers were previously identified:
-{confirmed_legends_context_str_for_prompt}
-
-You are given a JSON list of CANDIDATE INDICATOR text elements. Their 'core_text_matched' value matches a `core_identifier_text` from the context.
-Your task is to determine if each candidate is TRULY acting as a standalone graphical callout/indicator on the drawing.
-A true indicator:
-- Is usually very short (e.g., "F1", "1", "A", "N3").
-- Is spatially distinct and appears to label a specific part of the drawing, often near leader lines or symbols.
-- Is NOT part of a longer sentence, dimension string (e.g., "10'-0\"", "1:20", values on dimension lines with units like ', mm, cm, LF), title block, or the main body of a legend/specification item already detailed in the context.
-- **Crucially for numbers:** A number is an indicator if it's clearly tagging an item corresponding to a legend entry (e.g., a "1" in a circle with a leader line pointing to a fence). It is NOT an indicator if it's just a measurement (e.g., "10'", "150mm"), a quantity (e.g., "2 POSTS"), part of a scale, or a page number. Words that include units (', ", mm, cm, LF, etc.) are almost never indicators.
-
-Examples (output shows items for 'confirmed_indicators'):
-{pass2_examples}
-
-Input Candidate Indicators:
-{indicators_json_str_pass2}
-
-Output ONLY a single valid JSON object: {{"confirmed_indicators": [{{...}}]}}.
-If a candidate is NOT a true indicator, OMIT it. If none, return {{"confirmed_indicators": []}}. Strictly JSON.
-"""
+Context: Fence-related items & identifiers: {confirmed_legends_context_str_for_prompt}
+You are given CANDIDATE INDICATOR text elements. Their 'core_text_matched' matches an identifier from context.
+Task: Determine if each is a TRUE standalone graphical callout/indicator.
+A TRUE indicator: Is short, spatially distinct, labels a drawing part, NOT part of sentence/dimension (e.g., "10'-0\"", "1:20", values with units like ', mm, LF), title, or main body of context items.
+NUMBERS: An indicator if clearly tagging a legend item (e.g., "1" in circle with leader). NOT if measurement ("10'"), quantity ("2 POSTS"), scale, page number. Words with units (', ", mm, LF) are almost NEVER indicators.
+Examples (output shows items for 'confirmed_indicators'): {pass2_examples}
+Input Candidates: {indicators_json_str_pass2}
+Output ONLY JSON: {{"confirmed_indicators": [{{...}}]}}. OMIT non-indicators. If none, {{"confirmed_indicators": []}}. Strictly JSON."""
                     response_content_pass2 = ""
                     try:
                         print(f"TIMER LOG: Initiating Pass 2 Text LLM call ({len(candidate_indicator_words_for_llm2)} candidates).")
