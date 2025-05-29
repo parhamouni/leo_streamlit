@@ -1,15 +1,143 @@
 # utils.py
-# (Keep all other functions like time_it, retry_with_backoff, analyze_page, etc., as they were in V8)
-# The main change is in get_fence_related_text_boxes -> Pass 2 prompt and examples
 
-# ... (imports and other functions as in the previous full utils.py V8) ...
+import time
+import functools
+import fitz  # PyMuPDF
+import base64
+import re
+import random 
+from langchain_core.messages import HumanMessage
+from openai import RateLimitError, APIError, APITimeoutError # Make sure these are imported
+import pdfplumber
+from io import BytesIO
+import json
+
+# Custom Exception for unrecoverable rate limit
+class UnrecoverableRateLimitError(Exception):
+    pass
+
+# --- Timing Decorator ---
+# DEFINITION MUST COME BEFORE FIRST USE
+def time_it(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        func_name = f"{func.__module__}.{func.__name__}"
+        # For production, consider using the logging module instead of print
+        # print(f"TIMER LOG: ---> Entering {func_name}") 
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        duration = end_time - start_time
+        # print(f"TIMER LOG: <--- Exiting  {func_name} (Duration: {duration:.4f} seconds)")
+        return result
+    return wrapper
+
+# --- Core Functions ---
+
+@time_it # Now 'time_it' is defined
+def extract_snippet(text, fence_keywords):
+    for kw in fence_keywords:
+        match = re.search(rf".{{0,50}}\b{re.escape(kw)}\b.{{0,50}}", text, re.IGNORECASE)
+        if match:
+            return match.group(0)
+    return None
+
+def is_positive_response(response: str) -> bool:
+    response = response.strip().lower()
+    return response.startswith("yes") or response.startswith('"yes')
+
+@time_it
+def retry_with_backoff(llm_invoke_method, messages_list, retries=5, base_delay=2):
+    func_name = llm_invoke_method.__qualname__ if hasattr(llm_invoke_method, '__qualname__') else "llm_invoke"
+    for attempt in range(retries):
+        try:
+            return llm_invoke_method(messages_list)
+        except RateLimitError as rle:
+            if attempt == retries - 1:
+                print(f"TIMER LOG: Max retries for '{func_name}' (RateLimitError). Last error: {rle}")
+                raise UnrecoverableRateLimitError(f"OpenAI API rate limit. Please try later. (Details: {rle})")
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+            print(f"TIMER LOG: RateLimitError for '{func_name}'. Retry {attempt+1}/{retries} in {delay:.2f}s. Error: {rle}")
+            time.sleep(delay)
+        except (APIError, APITimeoutError) as apie:
+            if attempt == retries - 1:
+                print(f"TIMER LOG: Max retries for '{func_name}' (APIError/Timeout). Last error: {apie}")
+                raise # Re-raise original or a custom one summarizing this
+            delay = base_delay * (2 ** attempt) + random.uniform(0,1)
+            print(f"TIMER LOG: API Error/Timeout for '{func_name}'. Retry {attempt+1}/{retries} in {delay:.2f}s. Error: {apie}")
+            time.sleep(delay)
+        except Exception as e:
+            if attempt == retries - 1:
+                print(f"TIMER LOG: Max retries for '{func_name}' (Unexpected). Last error: {e}")
+                raise
+            delay = base_delay * (2 ** attempt) + random.uniform(0,1)
+            print(f"TIMER LOG: Unexpected Error for '{func_name}'. Retry {attempt+1}/{retries} in {delay:.2f}s. Error: {e}")
+            time.sleep(delay)
+    raise RuntimeError(f"Exceeded max retries for {func_name}. Should have been caught earlier.")
+
+
+@time_it
+def analyze_page(page_data_for_analysis, llm_text, llm_vision, fence_keywords):
+    page_num = page_data_for_analysis.get('page_number', 'N/A')
+    text_content = page_data_for_analysis.get("text", "")
+    print(f"TIMER LOG: (analyze_page) Page {page_num} - Starting analysis.")
+    
+    text_response_content = None
+    text_snippet = extract_snippet(text_content, fence_keywords)
+    text_found = False
+    vision_found = False
+    vision_response_content = None
+
+    text_prompt = f"""Analyze the following text from an engineering drawing page.
+Does this text contain any information, descriptions, or specifications related to fences, fencing, gates, barriers, or guardrails?
+Consider any mention of these terms or types of these structures.
+Start your answer with 'Yes' or 'No'. Then, briefly explain your reasoning. Text: {text_content}"""
+    
+    print(f"TIMER LOG: (analyze_page) Page {page_num} - Preparing for text LLM call.")
+    try:
+        response_obj = retry_with_backoff(llm_text.invoke, [HumanMessage(content=text_prompt)])
+        text_response_content = response_obj.content
+        text_found = is_positive_response(text_response_content)
+        print(f"TIMER LOG: (analyze_page) Page {page_num} - Text LLM call successful.")
+    except UnrecoverableRateLimitError: 
+        raise
+    except Exception as e:
+        print(f"TIMER LOG: (analyze_page) Page {page_num} - Error during text analysis LLM call: {e}")
+        text_response_content = f"Error in text analysis: {e}"
+
+    image_b64_for_vision = page_data_for_analysis.get("image_b64")
+    if llm_vision and image_b64_for_vision and (not text_found or page_data_for_analysis.get("force_vision", False)):
+        print(f"TIMER LOG: (analyze_page) Page {page_num} - Preparing for vision LLM call.")
+        image_url = f"data:image/png;base64,{image_b64_for_vision}"
+        vision_prompt_messages = [ HumanMessage(content=[ {"type": "text", "text": "Analyze this engineering drawing image. Does it visually depict any fences, fencing structures, gates, or barriers? Start your answer with 'Yes' or 'No'. Then, briefly explain your reasoning."}, {"type": "image_url", "image_url": {"url": image_url, "detail": "low"}} ]) ]
+        try:
+            response_obj_vision = retry_with_backoff(llm_vision.invoke, vision_prompt_messages)
+            vision_response_content = response_obj_vision.content
+            vision_found = is_positive_response(vision_response_content)
+            print(f"TIMER LOG: (analyze_page) Page {page_num} - Vision LLM call successful.")
+        except UnrecoverableRateLimitError: 
+            raise
+        except Exception as e_vision:
+            print(f"TIMER LOG: (analyze_page) Page {page_num} - Error during vision analysis LLM call: {e_vision}")
+            vision_response_content = f"Error in vision analysis: {e_vision}"
+
+    fence_found_overall = text_found or vision_found
+    print(f"TIMER LOG: (analyze_page) Page {page_num} - Analysis complete. Fence found: {fence_found_overall}.")
+    
+    return {
+        "page_number": page_num, 
+        "fence_found": fence_found_overall, 
+        "text_found": text_found,
+        "vision_found": vision_found, 
+        "text_response": text_response_content,
+        "vision_response": vision_response_content, 
+        "text_snippet": text_snippet
+    }
+
 
 @time_it
 def get_fence_related_text_boxes(page_bytes, llm, fence_keywords_from_app, selected_llm_model_name="gpt-3.5-turbo"):
     print(f"TIMER LOG: (get_fence_related_text_boxes) Starting REFINED TWO-PASS - v9 (Stricter Numerical Indicator Filtering in Pass 2).")
-    # ... (overall_gfrtb_start_time, page_width, page_height, final_highlight_boxes_list, words initialization) ...
-    # ... (pdfplumber parsing to get page_obj, words, extracted_lines - same as before) ...
-    # ... (Pass 1 logic, including its prompt and examples, remains the same as V8 - it should correctly identify fence-specific items and their core IDs) ...
     overall_gfrtb_start_time = time.time()
     
     page_width, page_height = 0, 0
@@ -123,7 +251,6 @@ Input Text Lines: {lines_json_str_pass1}"""
             # --- PASS 2: Indicator Identification (Focus on Numerical Specificity) ---
             if confirmed_legend_core_ids and words: 
                 print(f"TIMER LOG: Starting Pass 2: Indicator Identification ({len(words)} Words).")
-                # ... (candidate_indicator_words_for_llm2 selection logic remains the same as V7/V8) ...
                 candidate_indicator_words_for_llm2 = []
                 for idx, word_obj_data in enumerate(words):
                     text_val = word_obj_data['text'].strip()
@@ -133,7 +260,7 @@ Input Text Lines: {lines_json_str_pass1}"""
                     core_word_text_for_match = raw_core_word_text.upper()
                     core_word_text_for_match = re.sub(r"[.:\s]+$", "", core_word_text_for_match)
                     if core_word_text_for_match in confirmed_legend_core_ids:
-                        if 0 < len(text_val) <= 15: # Length check for candidate text
+                        if 0 < len(text_val) <= 15: 
                             is_already_part_of_identified_item = False
                             for identified_item_box in final_highlight_boxes_list: 
                                 if identified_item_box.get('tag_from_llm', '').upper() == core_word_text_for_match or \
@@ -148,7 +275,7 @@ Input Text Lines: {lines_json_str_pass1}"""
                             if not is_already_part_of_identified_item:
                                 candidate_indicator_words_for_llm2.append({
                                     "id": f"word_{idx}", "text": text_val, 
-                                    "core_text_matched": core_word_text_for_match, # This is the ID it matched from Pass 1
+                                    "core_text_matched": core_word_text_for_match, 
                                     "x0": round(word_obj_data['x0'], 2), "y0": round(word_obj_data['top'], 2),
                                     "x1": round(word_obj_data['x1'], 2), "y1": round(word_obj_data['bottom'], 2)
                                 })
@@ -156,7 +283,6 @@ Input Text Lines: {lines_json_str_pass1}"""
 
                 if candidate_indicator_words_for_llm2:
                     indicators_json_str_pass2 = json.dumps(candidate_indicator_words_for_llm2, separators=(',',':'))
-                    # ... (pass1_context_json_for_pass2 preparation same as V7/V8) ...
                     pass1_context_json_for_pass2 = []
                     for leg_detail in processed_legends_for_pass2_prompt_context:
                         leg_text_snippet = leg_detail.get("full_text", "")[:70]; 
@@ -164,7 +290,6 @@ Input Text Lines: {lines_json_str_pass1}"""
                         pass1_context_json_for_pass2.append({"identifier": leg_detail.get("core_identifier_text"),"description_snippet": leg_text_snippet, "type" : leg_detail.get("type")})
                     confirmed_legends_context_str_for_prompt = json.dumps(pass1_context_json_for_pass2, separators=(',',':'))
                     
-                    # --- Updated Few-Shot Examples and Instructions for Pass 2 (v9) ---
                     pass2_examples = """
 Example 1 (Good Indicator):
 Input Candidate: {"id": "word_105", "text": "1", "core_text_matched": "1", "x0": 350.0, "y0": 250.0, "x1": 355.0, "y1": 258.0}
@@ -176,7 +301,7 @@ Example 2 (Bad Indicator - Dimension):
 Input Candidate: {"id": "word_200", "text": "10'", "core_text_matched": "10", "x0": 400.0, "y0": 300.0, "x1": 415.0, "y1": 308.0} 
 (Assume "10" is NOT a core_identifier from Pass 1. If "10" *was* a core_id like "POST_10", this example would change. For now, assume it matched "10" from a legend item like "10. Ground Rod" which IS fence-related, but this "10'" is clearly a dimension.)
 Output for this candidate: [] 
-Reasoning: "10'" looks like a dimension (10 feet), not a callout for a legend item "10".
+Reasoning: "10'" looks like a dimension (10 feet), not a callout for a legend item "10". It includes a unit mark.
 
 Example 3 (Bad Indicator - Part of text):
 Input Candidate: {"id": "word_10", "text": "Fence", "core_text_matched": "FENCE_POST_FOOTING_NOTE", "x0": 60.0, "y0": 121.0, "x1": 90.0, "y1": 129.0}
@@ -192,9 +317,15 @@ Output for this candidate: {"id": "word_77", "matched_legend_identifier": "F2A",
 Example 5 (Bad Numerical Indicator - Looks like a quantity or part of a measurement in descriptive text):
 Input Candidate: {"id": "word_301", "text": "2", "core_text_matched": "2", "x0": 150.0, "y0": 400.0, "x1": 155.0, "y1": 408.0}
 (Context has: {"identifier": "2", "description_snippet": "2. GATE HARDWARE SET (HINGES, LATCH)", "type": "legend_item"})
-(Imagine this "2" on the drawing is next to text like "PROVIDE 2 ANCHOR BOLTS")
+(Imagine this "2" on the drawing is next to text like "PROVIDE 2 ANCHOR BOLTS" or "(2) REQUIRED")
 Output for this candidate: []
 Reasoning: This "2" appears to be a quantity within a descriptive text or dimension, not a callout pointing to legend item 2.
+
+Example 6 (Bad Numerical Indicator - Dimension Value):
+Input Candidate: {"id": "word_401", "text": "150", "core_text_matched": "150", "x0": 200.0, "y0": 600.0, "x1": 220.0, "y1": 608.0}
+(Assume "150" is NOT a core_identifier from Pass 1 that refers to a fence type. If it were, this decision might change. If it matched a non-fence legend item ID, it wouldn't even be a candidate. This example assumes "150" might be a generic number that happens to match a fence ID like "FENCE_MODEL_150" if such an ID existed, but visually it's part of "150mm" or on a dimension line).
+Output for this candidate: []
+Reasoning: This number "150" is likely a dimension value (e.g., 150mm, 150 LF) and not a callout for a legend item.
 """
 
                     prompt_pass2 = f"""You are an engineering drawing analyst.
@@ -206,8 +337,8 @@ Your task is to determine if each candidate is TRULY acting as a standalone grap
 A true indicator:
 - Is usually very short (e.g., "F1", "1", "A", "N3").
 - Is spatially distinct and appears to label a specific part of the drawing, often near leader lines or symbols.
-- Is NOT part of a longer sentence, dimension string (e.g., "10'-0\"", "1:20", values on dimension lines), title block, or the main body of a legend/specification item already detailed in the context.
-- **Crucially for numbers:** A number is an indicator if it's clearly tagging an item corresponding to a legend entry (e.g., a "1" in a circle with a leader line pointing to a fence). It is NOT an indicator if it's just a measurement, a quantity (e.g., "2 POSTS"), part of a scale, or a page number.
+- Is NOT part of a longer sentence, dimension string (e.g., "10'-0\"", "1:20", values on dimension lines with units like ', mm, cm, LF), title block, or the main body of a legend/specification item already detailed in the context.
+- **Crucially for numbers:** A number is an indicator if it's clearly tagging an item corresponding to a legend entry (e.g., a "1" in a circle with a leader line pointing to a fence). It is NOT an indicator if it's just a measurement (e.g., "10'", "150mm"), a quantity (e.g., "2 POSTS"), part of a scale, or a page number. Words that include units (', ", mm, cm, LF, etc.) are almost never indicators.
 
 Examples (output shows items for 'confirmed_indicators'):
 {pass2_examples}
@@ -219,7 +350,6 @@ Output ONLY a single valid JSON object: {{"confirmed_indicators": [{{...}}]}}.
 If a candidate is NOT a true indicator, OMIT it. If none, return {{"confirmed_indicators": []}}. Strictly JSON.
 """
                     response_content_pass2 = ""
-                    # ... (The rest of Pass 2 LLM call, JSON parsing, and processing logic remains the same as V7/V8) ...
                     try:
                         print(f"TIMER LOG: Initiating Pass 2 Text LLM call ({len(candidate_indicator_words_for_llm2)} candidates).")
                         pass2_llm_call_start_time = time.time()
@@ -246,7 +376,6 @@ If a candidate is NOT a true indicator, OMIT it. If none, return {{"confirmed_in
                     except UnrecoverableRateLimitError: raise 
                     except Exception as e_p2: print(f"TIMER LOG: Error in Pass 2: {e_p2}"); print(f"TIMER LOG: Pass 2 Resp: {response_content_pass2[:500] if response_content_pass2 else 'None'}")
         
-        # ... (Deduplication and return logic remains the same as V7/V8) ...
         dedup_map_final = {}
         for item in final_highlight_boxes_list:
             item_id = item.get('id') 
