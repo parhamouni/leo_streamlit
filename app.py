@@ -164,7 +164,7 @@ if uploaded_pdf_file_obj:
         st.session_state.uploaded_pdf_name = uploaded_pdf_file_obj.name
         st.session_state.original_pdf_bytes = uploaded_pdf_file_obj.getvalue()
         st.session_state.last_uploaded_file_id = current_file_id
-        st.experimental_rerun() # Force rerun to ensure clean state for auto-analysis trigger
+        st.rerun() # Force rerun to ensure clean state for auto-analysis trigger
 
     if openai_key and llm_analysis_instance and \
        not st.session_state.run_analysis_triggered and \
