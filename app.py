@@ -447,7 +447,7 @@ elif st.session_state.processing_complete:
     display_page_result_expander(st.session_state.fence_pages, col_f_res, current_session_id)
     display_page_result_expander(st.session_state.non_fence_pages, col_nf_res, current_session_id)
 
-elif not st.session_state.original_pdf_bytes : st.info("Upload PDF and ensure API key is set in sidebar.")
+elif not st.session_state.original_pdf_bytes : st.info("Upload PDF.")
 elif not (openai_key and llm_analysis_instance): st.error("OpenAI models not initialized. Check API key.")
 elif st.session_state.analysis_halted_due_to_error: st.error("Analysis was halted. Upload file again or try a different one.")
 
