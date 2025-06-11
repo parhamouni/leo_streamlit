@@ -1,5 +1,3 @@
-# utils.py (Version 10)
-
 import time
 import functools
 import fitz  # PyMuPDF
@@ -75,63 +73,102 @@ def retry_with_backoff(llm_invoke_method, messages_list, retries=5, base_delay=2
 
 
 @time_it
-def analyze_page(page_data_for_analysis, llm_text, llm_vision, fence_keywords):
-    page_num = page_data_for_analysis.get('page_number', 'N/A')
-    text_content = page_data_for_analysis.get("text", "")
-    print(f"TIMER LOG: (analyze_page) Page {page_num} - Starting analysis.")
-    
-    text_response_content = None
-    text_snippet = extract_snippet(text_content, fence_keywords)
-    text_found = False
-    vision_found = False
-    vision_response_content = None
+def analyze_page(page_data, llm_text, llm_vision, fence_keywords):
+    """
+    Prompt-only revision.
 
-    text_prompt = f"""Analyze the following text from an engineering drawing page.
-Does this text contain any information, descriptions, or specifications related to fences, fencing, gates, barriers, or guardrails?
-Consider any mention of these terms or types of these structures.
-Start your answer with 'Yes' or 'No'. Then, briefly explain your reasoning. Text: {text_content}"""
-    
-    print(f"TIMER LOG: (analyze_page) Page {page_num} - Preparing for text LLM call.")
+    • Sends <800 characters of page text + up to 6 ‘cue lines’.
+    • Model must reply with JSON {"answer":"yes|no","reason":"…"}.
+    • Returns fence_found = True if answer==yes (case-insensitive).
+    """
+
+    pg_num   = page_data.get("page_number", "N/A")
+    ocr_text = page_data.get("text", "")
+    img_b64  = page_data.get("image_b64")
+
+    # ---- build a focused excerpt --------------------------------
+    lines = ocr_text.splitlines()
+    cue   = [ln for ln in lines
+             if any(tag in ln.lower()
+                    for tag in ("f-", "cl", "fence", "gate",
+                                "guardrail", "barrier", "chain"))]
+    excerpt = (ocr_text[:800] + "\n" + "\n".join(cue[:6])).strip()
+
+    # ---- compose the prompt -------------------------------------
+    system = (
+        "You are an assistant that returns STRICT JSON like "
+        '{"answer":"yes","reason":"…"}  or {"answer":"no","reason":"…"}.\n'
+        "• yes  = the sheet is mainly about fences / gates / guardrails / barriers\n"
+        "• no   = everything else (title, lighting, schedules, etc.)"
+    )
+
+    few_shot = """
+{"answer":"yes","reason":"Legend line for F-2 chain-link fence."}
+Text: "F-2  8' CL FENCE  SEE DETAIL 3/L2-01"
+--
+{"answer":"yes","reason":"Specifies a security gate."}
+Text: "NEW SECURITY GATE (12' SWING) AT SERVICE ENTRY"
+--
+{"answer":"no","reason":"Only a title / index sheet."}
+Text: "TITLE SHEET  •  DRAWING INDEX  •  SCALE 1:200"
+"""
+
+    prompt = (
+        f"{system}\n\n{few_shot}\n"
+        "-----\n"
+        f'Text: "{excerpt}"'
+    )
+
+    # ---- LLM call -----------------------------------------------
     try:
-        response_obj = retry_with_backoff(llm_text.invoke, [HumanMessage(content=text_prompt)])
-        text_response_content = response_obj.content
-        text_found = is_positive_response(text_response_content)
-        print(f"TIMER LOG: (analyze_page) Page {page_num} - Text LLM call successful.")
-    except UnrecoverableRateLimitError: 
+        raw = retry_with_backoff(llm_text.invoke,
+                                 [HumanMessage(content=prompt)]).content
+    except UnrecoverableRateLimitError:
         raise
     except Exception as e:
-        print(f"TIMER LOG: (analyze_page) Page {page_num} - Error during text analysis LLM call: {e}")
-        text_response_content = f"Error in text analysis: {e}"
+        raw = f'{{"answer":"no","reason":"error {e}"}}'
 
-    image_b64_for_vision = page_data_for_analysis.get("image_b64")
-    if llm_vision and image_b64_for_vision and (not text_found or page_data_for_analysis.get("force_vision", False)):
-        print(f"TIMER LOG: (analyze_page) Page {page_num} - Preparing for vision LLM call.")
-        image_url = f"data:image/png;base64,{image_b64_for_vision}"
-        vision_prompt_messages = [ HumanMessage(content=[ {"type": "text", "text": "Analyze this engineering drawing image. Does it visually depict any fences, fencing structures, gates, or barriers? Start your answer with 'Yes' or 'No'. Then, briefly explain your reasoning."}, {"type": "image_url", "image_url": {"url": image_url, "detail": "low"}} ]) ]
+    # ---- parse yes / no -----------------------------------------
+    answer = "no"
+    try:
+        if "```" in raw:
+            raw = raw.split("```")[1]
+        answer = json.loads(raw.strip()).get("answer", "no").lower()
+    except Exception:
+        answer = raw.strip().split()[0].lower()  # fallback
+
+    text_yes = answer.startswith("y")
+
+    # ---- optional vision pass (unchanged) ------------------------
+    vis_yes = False
+    if llm_vision and img_b64 and not text_yes:
+        v_prompt = [
+            {"type":"text",
+             "text":'JSON {"answer":"yes|no"}. Fence/gate visible?'},
+            {"type":"image_url",
+             "image_url":{"url":f"data:image/png;base64,{img_b64}","detail":"low"}}
+        ]
         try:
-            response_obj_vision = retry_with_backoff(llm_vision.invoke, vision_prompt_messages)
-            vision_response_content = response_obj_vision.content
-            vision_found = is_positive_response(vision_response_content)
-            print(f"TIMER LOG: (analyze_page) Page {page_num} - Vision LLM call successful.")
-        except UnrecoverableRateLimitError: 
-            raise
-        except Exception as e_vision:
-            print(f"TIMER LOG: (analyze_page) Page {page_num} - Error during vision analysis LLM call: {e_vision}")
-            vision_response_content = f"Error in vision analysis: {e_vision}"
+            v_raw = retry_with_backoff(llm_vision.invoke,
+                                       [HumanMessage(content=v_prompt)]).content
+            vis_yes = '"yes"' in v_raw.lower()
+        except Exception:
+            v_raw = None
+    else:
+        v_raw = None
 
-    fence_found_overall = text_found or vision_found
-    print(f"TIMER LOG: (analyze_page) Page {page_num} - Analysis complete. Fence found: {fence_found_overall}.")
-    
+    found = text_yes or vis_yes
+    snippet = extract_snippet(ocr_text, fence_keywords) if found else None
+
     return {
-        "page_number": page_num, 
-        "fence_found": fence_found_overall, 
-        "text_found": text_found,
-        "vision_found": vision_found, 
-        "text_response": text_response_content,
-        "vision_response": vision_response_content, 
-        "text_snippet": text_snippet
+        "page_number"  : pg_num,
+        "fence_found"  : found,
+        "text_found"   : text_yes,
+        "vision_found" : vis_yes,
+        "text_response": raw,
+        "vision_response": v_raw,
+        "text_snippet" : snippet,
     }
-
 
 @time_it
 def get_fence_related_text_boxes(page_bytes, llm, fence_keywords_from_app, selected_llm_model_name="gpt-3.5-turbo"):
