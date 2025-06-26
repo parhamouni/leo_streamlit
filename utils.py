@@ -4,15 +4,57 @@ import fitz  # PyMuPDF
 import base64
 import re
 import random 
+import os
 from langchain_core.messages import HumanMessage
 from openai import RateLimitError, APIError, APITimeoutError
 import pdfplumber
 from io import BytesIO
 import json
+# pip install --upgrade google-cloud-documentai
+from google.cloud import documentai_v1 as documentai
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
+
+# Import comprehensive text extraction
+try:
+    from comprehensive_page_extractor import extract_comprehensive_page_text
+    COMPREHENSIVE_EXTRACTION_AVAILABLE = True
+    print("✅ Comprehensive text extraction available")
+except ImportError:
+    COMPREHENSIVE_EXTRACTION_AVAILABLE = False
+    print("⚠️ Comprehensive text extraction not available - using fallback methods")
+
+# Legacy global Document AI client - deprecated, use google_cloud_config parameter instead
+document_ai_client = None
+
+def create_document_ai_client(google_cloud_config=None):
+    """Create Document AI client from configuration - only supports Streamlit secrets."""
+    try:
+        if google_cloud_config and google_cloud_config.get("service_account_info"):
+            # Use service account info from configuration (Streamlit secrets)
+            from google.oauth2 import service_account
+            credentials = service_account.Credentials.from_service_account_info(
+                google_cloud_config["service_account_info"]
+            )
+            client = documentai.DocumentProcessorServiceClient(credentials=credentials)
+            print("✅ Document AI client created from Streamlit secrets configuration")
+            return client
+        else:
+            print("⚠️ No Google Cloud configuration provided. Please ensure secrets are configured in Streamlit.")
+            return None
+            
+    except Exception as e:
+        print(f"⚠️ Document AI client creation failed: {e}")
+        return None
+
+# No legacy initialization - all configuration should come from app.py
+
 
 # Custom Exception for unrecoverable rate limit
 class UnrecoverableRateLimitError(Exception):
     pass
+
+
 
 # --- Timing Decorator ---
 def time_it(func):
@@ -29,6 +71,95 @@ def time_it(func):
     return wrapper
 
 # --- Core Functions ---
+
+@time_it
+def extract_comprehensive_text_from_page(page_bytes: bytes, page_number: int = 1, google_cloud_config=None) -> Dict:
+    """
+    Extract comprehensive text from a PDF page using multiple methods:
+    1. PDF text layer (native text)
+    2. Text annotations (excluding visual-only annotations)  
+    3. OCR (with deduplication against existing text)
+    
+    Args:
+        page_bytes: PDF page as bytes
+        page_number: Page number for reference
+        
+    Returns:
+        Dictionary with extracted text data and statistics
+    """
+    try:
+        # Open PDF page from bytes
+        doc = fitz.open(stream=page_bytes, filetype="pdf")
+        if not doc or len(doc) == 0:
+            return {"error": "Could not open PDF page", "text": "", "all_text": [], "stats": {}}
+        
+        page = doc[0]  # Get first (and only) page
+        
+        if COMPREHENSIVE_EXTRACTION_AVAILABLE and google_cloud_config:
+            # Create Document AI client and processor name from config
+            client = create_document_ai_client(google_cloud_config)
+            processor_name = f"projects/{google_cloud_config['project_number']}/locations/{google_cloud_config['location']}/processors/{google_cloud_config['processor_id']}"
+            
+            if client:
+                # Use comprehensive extraction with OCR
+                result = extract_comprehensive_page_text(
+                    page=page,
+                    client=client,
+                    processor_name=processor_name,
+                    use_ocr=True
+                )
+            else:
+                # Fallback if client creation failed
+                result = None
+        elif COMPREHENSIVE_EXTRACTION_AVAILABLE and document_ai_client:
+            # Fallback to legacy global client - but this should not be used anymore
+            print("⚠️ Using legacy global Document AI client - configuration should be passed explicitly")
+            result = None
+        else:
+            result = None
+            
+        if result:
+            # Combine all text for analysis
+            all_text_items = result['all_text']
+            combined_text = ' '.join([item['text'] for item in all_text_items])
+            
+            doc.close()
+            
+            return {
+                "text": combined_text,
+                "text_words": result['text_words'],
+                "text_annotations": result['text_annotations'],
+                "ocr_texts": result['ocr_texts'],
+                "all_text": all_text_items,
+                "stats": result['stats'],
+                "page_number": page_number,
+                "extraction_method": "comprehensive"
+            }
+        else:
+            # Fallback to basic text extraction
+            text_words = page.get_text("words")
+            combined_text = ' '.join([word[4] for word in text_words])  # word[4] is the text
+            
+            doc.close()
+            
+            return {
+                "text": combined_text,
+                "text_words": [{"text": word[4], "x0": word[0], "y0": word[1], 
+                              "x1": word[2], "y1": word[3], "source": "text_layer"} 
+                              for word in text_words],
+                "text_annotations": [],
+                "ocr_texts": [],
+                "all_text": [{"text": word[4], "source": "text_layer"} for word in text_words],
+                "stats": {"total_words": len(text_words), "total_elements": len(text_words), 
+                         "ocr_enabled": False},
+                "page_number": page_number,
+                "extraction_method": "fallback"
+            }
+            
+    except Exception as e:
+        print(f"Error in comprehensive text extraction: {e}")
+        return {"error": str(e), "text": "", "all_text": [], "stats": {}, 
+                "extraction_method": "error"}
 
 @time_it
 def extract_snippet(text, fence_keywords):
@@ -73,33 +204,50 @@ def retry_with_backoff(llm_invoke_method, messages_list, retries=5, base_delay=2
 
 
 @time_it
-def analyze_page(page_data, llm_text, llm_vision, fence_keywords):
+def analyze_page(page_data, llm_text, fence_keywords, google_cloud_config=None):
     """
-    Prompt-only revision.
-
-    • Sends <800 characters of page text + up to 6 ‘cue lines’.
-    • Model must reply with JSON {"answer":"yes|no","reason":"…"}.
-    • Returns fence_found = True if answer==yes (case-insensitive).
+    Enhanced page analysis using comprehensive text extraction.
+    
+    • Extracts text from multiple sources (text layer + annotations + OCR)
+    • Model must reply with JSON {"answer":"yes|no","reason":"…"}
+    • Returns fence_found = True if answer==yes (case-insensitive)
     """
 
-    pg_num   = page_data.get("page_number", "N/A")
-    ocr_text = page_data.get("text", "")
-    img_b64  = page_data.get("image_b64")
+    pg_num = page_data.get("page_number", "N/A")
+    
+    # ---- Extract comprehensive text from page bytes ----
+    page_bytes = page_data.get("page_bytes")
+    if page_bytes:
+        print(f"🔍 Running comprehensive text extraction for page {pg_num}...")
+        extraction_result = extract_comprehensive_text_from_page(page_bytes, pg_num, google_cloud_config)
+        
+        comprehensive_text = extraction_result.get("text", "")
+        extraction_stats = extraction_result.get("stats", {})
+        extraction_method = extraction_result.get("extraction_method", "unknown")
+        
+        print(f"📊 Page {pg_num} extraction: {extraction_stats.get('total_elements', 0)} total texts "
+              f"({extraction_stats.get('total_ocr_unique', 0)} from OCR) via {extraction_method}")
+    else:
+        # Fallback to original text if no page_bytes
+        comprehensive_text = page_data.get("text", "")
+        extraction_stats = {}
+        extraction_method = "legacy"
 
-    # ---- build a focused excerpt --------------------------------
-    lines = ocr_text.splitlines()
-    cue   = [ln for ln in lines
-             if any(tag in ln.lower()
-                    for tag in ("f-", "cl", "fence", "gate",
-                                "guardrail", "barrier", "chain"))]
-    excerpt = (ocr_text[:800] + "\n" + "\n".join(cue[:6])).strip()
+    # ---- Build focused excerpt for analysis ----
+    # Use more text since we have comprehensive extraction
+    max_excerpt_length = 1200 if extraction_method == "comprehensive" else 800
+    excerpt = comprehensive_text
+    
+    # if len(comprehensive_text) > max_excerpt_length:
+    #     excerpt += "... [text truncated]"
 
-    # ---- compose the prompt -------------------------------------
+    # ---- Compose enhanced prompt ----
     system = (
         "You are an assistant that returns STRICT JSON like "
         '{"answer":"yes","reason":"…"}  or {"answer":"no","reason":"…"}.\n'
         "• yes  = the sheet is mainly about fences / gates / guardrails / barriers\n"
-        "• no   = everything else (title, lighting, schedules, etc.)"
+        "• no   = everything else (title, lighting, schedules, etc.)\n\n"
+        f"Text extracted via {extraction_method} method with {extraction_stats.get('total_elements', 'unknown')} elements."
     )
 
     few_shot = """
@@ -109,8 +257,14 @@ Text: "F-2  8' CL FENCE  SEE DETAIL 3/L2-01"
 {"answer":"yes","reason":"Specifies a security gate."}
 Text: "NEW SECURITY GATE (12' SWING) AT SERVICE ENTRY"
 --
+{"answer":"yes","reason":"Contains fence post specifications and details."}
+Text: "FENCE POST FOOTING DETAIL  CONCRETE FOOTING 24\" DEEP  GALVANIZED POST"
+--
 {"answer":"no","reason":"Only a title / index sheet."}
 Text: "TITLE SHEET  •  DRAWING INDEX  •  SCALE 1:200"
+--
+{"answer":"no","reason":"Electrical plan with no fence elements."}
+Text: "LIGHTING PLAN  ELECTRICAL OUTLETS  SWITCH LOCATIONS"
 """
 
     prompt = (
@@ -119,7 +273,7 @@ Text: "TITLE SHEET  •  DRAWING INDEX  •  SCALE 1:200"
         f'Text: "{excerpt}"'
     )
 
-    # ---- LLM call -----------------------------------------------
+    # ---- LLM call ----
     try:
         raw = retry_with_backoff(llm_text.invoke,
                                  [HumanMessage(content=prompt)]).content
@@ -128,47 +282,85 @@ Text: "TITLE SHEET  •  DRAWING INDEX  •  SCALE 1:200"
     except Exception as e:
         raw = f'{{"answer":"no","reason":"error {e}"}}'
 
-    # ---- parse yes / no -----------------------------------------
+    # ---- Parse yes/no ----
     answer = "no"
+    
+    # Debug logging to track the issue
+    print(f"🔍 Page {pg_num} DEBUG: Raw LLM response: '{raw}'")
+    
     try:
+        clean_raw = raw
         if "```" in raw:
-            raw = raw.split("```")[1]
-        answer = json.loads(raw.strip()).get("answer", "no").lower()
-    except Exception:
-        answer = raw.strip().split()[0].lower()  # fallback
+            # Extract content between code blocks
+            parts = raw.split("```")
+            if len(parts) >= 3:
+                clean_raw = parts[1]
+            else:
+                clean_raw = parts[1] if len(parts) > 1 else raw
+            print(f"🔍 Page {pg_num} DEBUG: Extracted from code block: '{clean_raw}'")
+        
+        clean_raw = clean_raw.strip()
+        
+        # Remove language identifier if present (e.g., "json" at the beginning)
+        if clean_raw.lower().startswith('json'):
+            clean_raw = clean_raw[4:].strip()
+            print(f"🔍 Page {pg_num} DEBUG: Removed 'json' prefix: '{clean_raw}'")
+        
+        print(f"🔍 Page {pg_num} DEBUG: Attempting to parse JSON: '{clean_raw}'")
+        
+        parsed_json = json.loads(clean_raw)
+        answer = parsed_json.get("answer", "no").lower()
+        
+        print(f"🔍 Page {pg_num} DEBUG: Parsed JSON successfully. Answer field: '{answer}'")
+        
+    except Exception as e:
+        print(f"⚠️ Page {pg_num} DEBUG: JSON parsing failed with error: {e}")
+        # Fallback to simple text parsing if JSON fails
+        answer = raw.strip().split()[0].lower() if raw.strip() else "no"
+        print(f"🔍 Page {pg_num} DEBUG: Fallback answer: '{answer}'")
 
     text_yes = answer.startswith("y")
-
-    # ---- optional vision pass (unchanged) ------------------------
-    vis_yes = False
-    if llm_vision and img_b64 and not text_yes:
-        v_prompt = [
-            {"type":"text",
-             "text":'JSON {"answer":"yes|no"}. Fence/gate visible?'},
-            {"type":"image_url",
-             "image_url":{"url":f"data:image/png;base64,{img_b64}","detail":"low"}}
-        ]
-        try:
-            v_raw = retry_with_backoff(llm_vision.invoke,
-                                       [HumanMessage(content=v_prompt)]).content
-            vis_yes = '"yes"' in v_raw.lower()
-        except Exception:
-            v_raw = None
-    else:
-        v_raw = None
-
-    found = text_yes or vis_yes
-    snippet = extract_snippet(ocr_text, fence_keywords) if found else None
+    found = text_yes
+    
+    print(f"📋 Page {pg_num} DEBUG: Final decision - answer='{answer}', text_yes={text_yes}, found={found}")
+    snippet = extract_snippet(comprehensive_text, fence_keywords) if found else None
 
     return {
-        "page_number"  : pg_num,
-        "fence_found"  : found,
-        "text_found"   : text_yes,
-        "vision_found" : vis_yes,
+        "page_number": pg_num,
+        "fence_found": found,
+        "text_found": text_yes,
         "text_response": raw,
-        "vision_response": v_raw,
-        "text_snippet" : snippet,
+        "text_snippet": snippet,
+        "extraction_stats": extraction_stats,
+        "extraction_method": extraction_method,
+        "comprehensive_text": comprehensive_text
     }
+
+@time_it  
+def get_comprehensive_text_for_analysis(page_bytes: bytes, google_cloud_config=None) -> str:
+    """
+    Extract comprehensive text from a page for use in text box analysis.
+    Returns combined text from all sources.
+    """
+    try:
+        extraction_result = extract_comprehensive_text_from_page(page_bytes, google_cloud_config=google_cloud_config)
+        if extraction_result.get("error"):
+            print(f"⚠️ Comprehensive extraction failed: {extraction_result['error']}")
+            return ""
+        
+        # Get comprehensive text
+        comprehensive_text = extraction_result.get("text", "")
+        stats = extraction_result.get("stats", {})
+        method = extraction_result.get("extraction_method", "unknown")
+        
+        print(f"📝 Comprehensive text extraction: {stats.get('total_elements', 0)} elements "
+              f"via {method} method")
+        
+        return comprehensive_text
+        
+    except Exception as e:
+        print(f"❌ Error in comprehensive text extraction: {e}")
+        return ""
 
 @time_it
 def get_fence_related_text_boxes(page_bytes, llm, fence_keywords_from_app, selected_llm_model_name="gpt-3.5-turbo"):
@@ -421,3 +613,37 @@ Output ONLY JSON: {{"confirmed_indicators": [{{...}}]}}. OMIT non-indicators. If
             dedup_map_final_except = {item.get('id'): item for item in final_highlight_boxes_list if item.get('id')}
             return list(dedup_map_final_except.values()), page_width, page_height
         return [], page_width, page_height
+
+
+# Test function for comprehensive text extraction
+def test_comprehensive_extraction(google_cloud_config=None):
+    """
+    Test function to verify comprehensive text extraction is working.
+    """
+    print("🧪 Testing comprehensive text extraction integration...")
+    
+    if not COMPREHENSIVE_EXTRACTION_AVAILABLE:
+        print("❌ Comprehensive extraction not available")
+        return False
+    
+    # Test client creation
+    if google_cloud_config:
+        test_client = create_document_ai_client(google_cloud_config)
+        if test_client:
+            print("✅ Document AI client created successfully from configuration")
+            processor_name = f"projects/{google_cloud_config['project_number']}/locations/{google_cloud_config['location']}/processors/{google_cloud_config['processor_id']}"
+            print(f"📄 Processor: {processor_name}")
+            return True
+        else:
+            print("❌ Could not create Document AI client from configuration")
+            return False
+    elif document_ai_client:
+        print("✅ Legacy Document AI client available (but configuration should be passed explicitly)")
+        return True
+    else:
+        print("❌ No Document AI client available")
+        return False
+
+# Run test on import
+if __name__ == "__main__":
+    test_comprehensive_extraction()

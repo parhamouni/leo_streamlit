@@ -15,8 +15,7 @@ HIGHLIGHT_COLOR_UI = (0, 0.9, 0)
 HIGHLIGHT_WIDTH_UI = 2.0
 HIGHLIGHT_COLOR_PDF = (0, 0.9, 0)
 HIGHLIGHT_WIDTH_PDF = 2.0
-DISPLAY_IMAGE_DPI = 96 
-VISION_IMAGE_DPI = 72  
+DISPLAY_IMAGE_DPI = 96  
 
 st.set_page_config(page_title="Fence Detector", layout="wide")
 st.markdown("""<style> /* Your CSS */ </style>""", unsafe_allow_html=True) 
@@ -58,6 +57,26 @@ with st.sidebar:
     if not openai_key:
         openai_key_input = st.text_input("Enter OpenAI API Key", type="password", key="api_key_input_sidebar")
         if openai_key_input: openai_key = openai_key_input; st.rerun()
+    
+    # Load Google Cloud credentials for comprehensive text extraction
+    google_cloud_config = None
+    try:
+        if "google_cloud" in st.secrets and "gcp_service_account" in st.secrets:
+            google_cloud_config = {
+                "project_number": st.secrets["google_cloud"]["project_number"],
+                "location": st.secrets["google_cloud"]["location"], 
+                "processor_id": st.secrets["google_cloud"]["processor_id"],
+                "service_account_info": dict(st.secrets["gcp_service_account"])
+            }
+            print(f"SESSION {current_session_id} LOG: Google Cloud config loaded from secrets")
+    except Exception as e:
+        print(f"SESSION {current_session_id} WARNING: Could not load Google Cloud config: {e}")
+        google_cloud_config = None
+    
+    # Test comprehensive extraction if available
+    if google_cloud_config:
+        from utils import test_comprehensive_extraction
+        test_comprehensive_extraction(google_cloud_config)
     st.subheader("Model Selection")
     model_options = {
         "gpt-4o (128k context, recommended)": "gpt-4o",
@@ -71,8 +90,7 @@ with st.sidebar:
     selected_label = st.radio("Select LLM:", list(model_options.keys()), key="model_selector_radio", index=default_model_idx)
     st.session_state.selected_model_for_analysis = model_options[selected_label]
     st.info(f"Using: **{st.session_state.selected_model_for_analysis}**.")
-    process_images_vision = st.toggle("🖼️ Enable visual analysis", value=False, key="vision_toggle")
-    vision_model_name_option = "gpt-4-turbo" 
+ 
     highlight_fence_text_app = st.toggle("🔍 Highlight text & indicators", value=True, key="highlight_toggle")
     st.subheader("Fence Keywords")
     if 'fence_keywords_app' not in st.session_state: st.session_state.fence_keywords_app = ['fence']
@@ -83,14 +101,12 @@ with st.sidebar:
     FENCE_KEYWORDS_APP = st.session_state.fence_keywords_app
 
 
-llm_analysis_instance, llm_vision_instance = None, None
+llm_analysis_instance = None
 if openai_key:
     try:
-        # ... (LLM init - same as before) ...
-        print(f"SESSION {current_session_id} LOG: Initializing LLM instances.")
+        print(f"SESSION {current_session_id} LOG: Initializing LLM instance.")
         llm_analysis_instance = ChatOpenAI(model=st.session_state.selected_model_for_analysis, temperature=0, openai_api_key=openai_key, timeout=180, max_retries=2)
-        if process_images_vision: llm_vision_instance = ChatOpenAI(model=vision_model_name_option, temperature=0, openai_api_key=openai_key, timeout=180, max_retries=2)
-        print(f"SESSION {current_session_id} LOG: LLM instances initialized.")
+        print(f"SESSION {current_session_id} LOG: LLM instance initialized.")
     except Exception as e: st.error(f"LLM Init Error: {e}"); openai_key = None; print(f"SESSION {current_session_id} ERROR: LLM Init Error: {e}")
 
 
@@ -279,16 +295,22 @@ if st.session_state.run_analysis_triggered and \
             status_txt_area.text(f"Processing Page {curr_pg_num}/{st.session_state.doc_total_pages}...")
             print(f"SESSION {current_session_id} LOG: Processing page {curr_pg_num}.")
             page_obj = doc_proc_loop.load_page(i); text_content = page_obj.get_text("text")
-            page_data_an = {"page_number": curr_pg_num, "text": text_content}
-            if process_images_vision:
-                print(f"SESSION {current_session_id} LOG: Page {curr_pg_num} - Generating image for vision (DPI: {VISION_IMAGE_DPI}).")
-                pix_vis = page_obj.get_pixmap(alpha=False, dpi=VISION_IMAGE_DPI) 
-                img_b_vis = pix_vis.tobytes("png"); del pix_vis 
-                page_data_an["image_b64"] = base64.b64encode(img_b_vis).decode("utf-8")
+            
+            # Create single-page PDF bytes for comprehensive text extraction
+            single_page_pdf_bytes = None
+            try:
+                temp_doc = fitz.open()
+                temp_doc.insert_pdf(doc_proc_loop, from_page=i, to_page=i)
+                single_page_pdf_bytes = temp_doc.tobytes()
+                temp_doc.close()
+            except Exception as e:
+                print(f"SESSION {current_session_id} WARNING: Could not create single page PDF for page {curr_pg_num}: {e}")
+            
+            page_data_an = {"page_number": curr_pg_num, "text": text_content, "page_bytes": single_page_pdf_bytes}
             analysis_res_core = {}; fatal_err_page = False
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
-                    analysis_res_core = analyze_page(page_data_an, llm_analysis_instance, llm_vision_instance if process_images_vision else None, FENCE_KEYWORDS_APP)
+                    analysis_res_core = analyze_page(page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config)
             except UnrecoverableRateLimitError as urle:
                 msg = f"🛑 API Rate Limit Pg {curr_pg_num}: {urle}. Analysis halted."; status_txt_area.error(msg); st.error(msg)
                 st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; print(f"SESSION {current_session_id} ERROR: {msg}"); break
@@ -311,7 +333,7 @@ if st.session_state.run_analysis_triggered and \
                     st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; print(f"SESSION {current_session_id} ERROR: {msg}"); break
                 except Exception as e_hl: st.warning(f"Highlight error pg {curr_pg_num}: {e_hl}"); print(f"SESSION {current_session_id} WARNING: Highlight error pg {curr_pg_num}: {e_hl}")
             elif not fatal_err_page and highlight_fence_text_app and analysis_result.get('fence_found'):
-                 status_txt_area.text(f"Page {curr_pg_num}: Fence found (e.g. vision), no text match for detailed highlighting.")
+                 status_txt_area.text(f"Page {curr_pg_num}: Fence found, no text match for detailed highlighting.")
             if fatal_err_page: break
             target_col = col_f if analysis_result.get('fence_found') else col_nf
             (st.session_state.fence_pages if analysis_result.get('fence_found') else st.session_state.non_fence_pages).append(analysis_result)
@@ -320,7 +342,7 @@ if st.session_state.run_analysis_triggered and \
                 if analysis_result.get('fence_found'):
                     reasons = []; 
                     if analysis_result.get('text_found'): reasons.append("Text")
-                    if analysis_result.get('vision_found'): reasons.append("Image")
+
                     if analysis_result.get('fence_text_boxes_details') and highlight_fence_text_app: reasons.append("Highlights")
                     if reasons: exp_title += f" ({' & '.join(reasons)} Match)"
                 with st.expander(exp_title, expanded=True):
@@ -344,15 +366,14 @@ if st.session_state.run_analysis_triggered and \
                         if analysis_result.get('fence_found'):
                             pts = []; 
                             if analysis_result.get('text_found'): pts.append("✔️ Text")
-                            if analysis_result.get('vision_found'): pts.append("✔️ Image")
+
                             if analysis_result.get('fence_text_boxes_details') and highlight_fence_text_app : pts.append("✔️ Highlights")
                             if not pts: pts.append("Fence flagged")
                             st.markdown("\n".join(f"- {s}" for s in pts))
                         else: st.markdown("No strong fence indicators.")
                         if analysis_result.get('text_response'):
                             with st.popover("Text Log"): st.markdown(f"_{analysis_result['text_response']}_")
-                        if analysis_result.get('vision_response'):
-                            with st.popover("Image Log"): st.markdown(f"_{analysis_result['vision_response']}_")
+
                         if analysis_result.get('text_snippet'):
                             st.markdown("---"); st.markdown("**Key Snippet:**"); st.code(analysis_result['text_snippet'],language=None)
                         if analysis_result.get('highlight_fence_text_app_setting', True) and \
@@ -403,7 +424,7 @@ elif st.session_state.processing_complete:
                 if res_data_item.get('fence_found'):
                     reasons_res = []; 
                     if res_data_item.get('text_found'): reasons_res.append("Text")
-                    if res_data_item.get('vision_found'): reasons_res.append("Image")
+
                     if res_data_item.get('fence_text_boxes_details') and res_data_item.get('highlight_fence_text_app_setting', True): reasons_res.append("Highlights")
                     if reasons_res: exp_title_res += f" ({' & '.join(reasons_res)} Match)"
                 with st.expander(exp_title_res, expanded=False):
@@ -424,15 +445,14 @@ elif st.session_state.processing_complete:
                         if res_data_item.get('fence_found'):
                             pts_r = [] 
                             if res_data_item.get('text_found'): pts_r.append("✔️ Text")
-                            if res_data_item.get('vision_found'): pts_r.append("✔️ Image")
+
                             if res_data_item.get('fence_text_boxes_details') and res_data_item.get('highlight_fence_text_app_setting',True) : pts_r.append("✔️ Highlights")
                             if not pts_r: pts_r.append("Fence flagged")
                             st.markdown("\n".join(f"- {s}" for s in pts_r))
                         else: st.markdown("No strong fence indicators.")
                         if res_data_item.get('text_response'):
                             with st.popover("Text Log"): st.markdown(f"_{res_data_item['text_response']}_")
-                        if res_data_item.get('vision_response'):
-                            with st.popover("Image Log"): st.markdown(f"_{res_data_item['vision_response']}_")
+
                         if res_data_item.get('text_snippet'): st.markdown("---"); st.code(res_data_item['text_snippet'],language=None)
                         if res_data_item.get('highlight_fence_text_app_setting', True) and \
                            res_data_item.get('fence_text_boxes_details') and res_data_item.get('fence_found'):
