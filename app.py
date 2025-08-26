@@ -310,7 +310,10 @@ if st.session_state.run_analysis_triggered and \
             analysis_res_core = {}; fatal_err_page = False
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
-                    analysis_res_core = analyze_page(page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config)
+                    analysis_res_core = analyze_page(
+                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config
+                    )
+
             except UnrecoverableRateLimitError as urle:
                 msg = f"🛑 API Rate Limit Pg {curr_pg_num}: {urle}. Analysis halted."; status_txt_area.error(msg); st.error(msg)
                 st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; print(f"SESSION {current_session_id} ERROR: {msg}"); break
@@ -325,8 +328,15 @@ if st.session_state.run_analysis_triggered and \
                 finally: 
                     if temp_doc_single: temp_doc_single.close()
                 try:
-                    with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):
-                        boxes,_,_ = get_fence_related_text_boxes(single_pg_bytes_io.getvalue(), llm_analysis_instance, FENCE_KEYWORDS_APP, st.session_state.selected_model_for_analysis)
+                    with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):   
+                        boxes,_,_ = get_fence_related_text_boxes(
+                            single_pg_bytes_io.getvalue(),
+                            llm_analysis_instance,
+                            FENCE_KEYWORDS_APP,
+                            st.session_state.selected_model_for_analysis,
+                            google_cloud_config  # <-- pass it through
+                        )
+
                         if boxes: analysis_result['fence_text_boxes_details'] = boxes
                 except UnrecoverableRateLimitError as urle_hl:
                     msg = f"🛑 API Rate Limit Highlight Pg {curr_pg_num}: {urle_hl}. Halted."; status_txt_area.error(msg); st.error(msg)
