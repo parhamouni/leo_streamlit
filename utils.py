@@ -249,29 +249,32 @@ def get_comprehensive_text_for_analysis(page_bytes: bytes, google_cloud_config=N
 # =========================
 @time_it
 def analyze_page(
-    page_data: Dict,
+    page_data,
     llm_text,
-    fence_keywords: List[str],
+    fence_keywords,
     google_cloud_config=None,
     ocr_dpi: int = 96,
     enable_tesseract_fallback: bool = False,
     neighbor_text_provider=None,
-) -> Dict:
+    recall_mode: str | None = None,   # NEW: optional override; else uses env var
+):
     """
-    Recall-biased classification. Uses json_invoke + safe prompt builder.
-    Accepts "yes" or lower-confidence positive as True if confidence >= 0.40.
+    Recall-aware page classification with JSON enforcement + optional neighbor context.
+    Decision policy:
+      - strict   : only answer=='yes'
+      - balanced : answer=='yes' OR (confidence>=0.65 AND has_primary_signal)
+      - high     : answer=='yes' OR (confidence>=0.55 AND has_primary_signal)
     """
+    import json, os
+
     pg_num = page_data.get("page_number", "N/A")
 
-    # Extract text (page bytes preferred)
+    # ---- Extract text (same as before) ----
     page_bytes = page_data.get("page_bytes")
     if page_bytes:
         extraction_result = extract_comprehensive_text_from_page(
-            page_bytes,
-            pg_num,
-            google_cloud_config,
-            ocr_dpi=ocr_dpi,
-            enable_tesseract_fallback=enable_tesseract_fallback,
+            page_bytes, pg_num, google_cloud_config, ocr_dpi=ocr_dpi,
+            enable_tesseract_fallback=enable_tesseract_fallback
         )
         comprehensive_text = extraction_result.get("text", "")
         extraction_stats = extraction_result.get("stats", {})
@@ -281,53 +284,75 @@ def analyze_page(
         extraction_stats = {}
         extraction_method = "legacy"
 
-    # Neighbor context (±1 page) if sparse
+    # Optional neighbor context for sparse pages
     context_bits = []
     if neighbor_text_provider and extraction_stats.get("total_elements", 0) < 40:
         try:
             nbefore = neighbor_text_provider(pg_num - 1)
             nafter = neighbor_text_provider(pg_num + 1)
-            if nbefore:
-                context_bits.append(f"PrevPageExcerpt: {nbefore[:300]}")
-            if nafter:
-                context_bits.append(f"NextPageExcerpt: {nafter[:300]}")
+            if nbefore: context_bits.append(f"PrevPageExcerpt: {nbefore[:300]}")
+            if nafter:  context_bits.append(f"NextPageExcerpt: {nafter[:300]}")
         except Exception:
             pass
 
-    context_info = f"Extraction: {extraction_method}, elements={extraction_stats.get('total_elements', 'n/a')}" + (
-        "; " + " | ".join(context_bits) if context_bits else ""
+    context_info = (
+        f"Extraction: {extraction_method}, elements={extraction_stats.get('total_elements','n/a')}"
+        + ("; " + " | ".join(context_bits) if context_bits else "")
     )
-
     prompt = make_analyze_page_prompt(context_info=context_info, page_text=comprehensive_text)
 
+    # ---- LLM call ----
     try:
-        # Prefer JSON-enforced invocation
-        raw_obj = json_invoke(llm_text, [HumanMessage(content=prompt)])
+        raw_obj = retry_with_backoff(llm_text.invoke, [HumanMessage(content=prompt)])
         raw = raw_obj.content if hasattr(raw_obj, "content") else str(raw_obj)
-        parsed_json = json.loads(raw)
-        answer = parsed_json.get("answer", "no").lower()
-        confidence = float(parsed_json.get("confidence", 0.0))
-        signals = parsed_json.get("signals", [])
-        reason = parsed_json.get("reason", "")
+        parsed = json.loads(raw)
+        answer = str(parsed.get("answer", "no")).strip().lower()
+        confidence = float(parsed.get("confidence", 0.0))
+        signals = parsed.get("signals", []) or []
+        reason = parsed.get("reason", "")
     except Exception as e:
         print(f"analyze_page JSON parse failed pg {pg_num}: {e}")
         answer, confidence, signals, reason = "no", 0.0, [], f"error {e}"
 
-    found = (answer == "yes") or (float(confidence) >= 0.40)
+    # ---- Decision policy (fixed) ----
+    # Primary fence vocabulary for cross-checking signals
+    primary_vocab = {k.lower() for k in (fence_keywords or [])}
+    primary_vocab |= {
+        "fence","fencing","gate","gates","barrier","guardrail",
+        "chain link","chain-link","chainlink","screen wall","privacy screen"
+    }
+    signals_l = [s.lower() for s in signals if isinstance(s, str)]
+    has_primary_signal = any(any(p in s for p in primary_vocab) for s in signals_l)
+
+    mode = (recall_mode or os.getenv("RECALL_MODE", "balanced")).strip().lower()
+    if mode == "strict":
+        found = (answer == "yes")
+    elif mode == "high":
+        found = (answer == "yes") or (confidence >= 0.55 and has_primary_signal)
+    else:  # balanced (default)
+        found = (answer == "yes") or (confidence >= 0.65 and has_primary_signal)
+
+    print(f"[ANALYZE_DEBUG] pg={pg_num} ans={answer} conf={confidence:.2f} "
+          f"has_primary_signal={has_primary_signal} mode={mode} -> found={found}")
+
     snippet = extract_snippet(comprehensive_text, fence_keywords) if found else None
 
     return {
         "page_number": pg_num,
         "fence_found": found,
-        "text_found": answer == "yes",
-        "text_response": json.dumps(
-            {"answer": answer, "confidence": confidence, "signals": signals, "reason": reason}
-        ),
+        "text_found": (answer == "yes"),
+        "text_response": json.dumps({
+            "answer": answer,
+            "confidence": confidence,
+            "signals": signals,
+            "reason": reason
+        }),
         "text_snippet": snippet,
         "extraction_stats": extraction_stats,
         "extraction_method": extraction_method,
         "comprehensive_text": comprehensive_text,
     }
+
 
 # --- Token & geometry helpers for precise highlighting ---
 
