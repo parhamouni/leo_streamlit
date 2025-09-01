@@ -509,29 +509,93 @@ STRICT JSON:
         print(f"_llm_filter_indicators failed: {e}")
         return []
 
-
 @time_it
 def get_fence_related_text_boxes(
     page_bytes,
     llm,
     fence_keywords_from_app,
+    extra_keywords=None,                   # << NEW: pass analyzer signals here
     selected_llm_model_name="gpt-3.5-turbo",
-    google_cloud_config=None,  # <-- NEW (optional) for DocAI fallback
+    google_cloud_config=None,              # optional DocAI fallback
 ):
     """
-    v14 – keywords/legend ALWAYS highlighted; indicators LLM-filtered;
-    + Document AI OCR fallback when the text layer is empty.
-
+    v14-hybrid-ocr-signals:
+      - Highlights ONLY user keywords + per-page 'signals'.
+      - Text-layer path + opportunistic OCR on mixed pages.
+      - Token-level boxes with ±context tokens; height clamped.
+      - Geometric dedup (IoU) across text-layer & OCR.
     Returns: (boxes, page_width, page_height)
     Each box: {id, text, x0,y0,x1,y1, type_from_llm, tag_from_llm}
     """
-    import json, re, time
+    import re, time
     from io import BytesIO
+    from statistics import median
+    import fitz
+    import pdfplumber
 
     t0 = time.time()
-    print("TIMER LOG: (get_fence_related_text_boxes) v14 keywords-first + LLM-filtered indicators + DocAI OCR fallback")
+    print("TIMER LOG: (get_fence_related_text_boxes) v14-hybrid-ocr-signals")
 
-    # ------------- helpers -------------
+    # ---------- Tunables ----------
+    # text-layer
+    PAD_TEXT = 1.8
+    MAX_H_MULT_TEXT = 1.6
+    GAP_SPLIT_FACTOR_TEXT = 0.9
+    CONTEXT_TOKENS_TEXT = 2
+
+    # OCR
+    PAD_OCR = 1.4
+    MAX_H_MULT_OCR = 1.6
+    GAP_SPLIT_FACTOR_OCR = 0.9
+    CONTEXT_TOKENS_OCR = 2
+
+    # OCR “also-run” heuristics (mixed pages)
+    OCR_IF_TEXT_MATCHES_LT = 2
+    OCR_IF_PYMUPDF_TOKENS_LT = 25
+    IMAGE_AREA_RATIO = 0.05
+
+    # Geometric dedup
+    IOU_DEDUP_THRESH = 0.85
+
+    # ---------------- helpers ----------------
+    def _pad_rect(x0, y0, x1, y1, pad=1.2):
+        return (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+
+    def _center(r):
+        x0, y0, x1, y1 = r
+        return ((x0 + x1)/2.0, (y0 + y1)/2.0)
+
+    def _point_in_rect(px, py, r):
+        x0, y0, x1, y1 = r
+        return (x0 <= px <= x1) and (y0 <= py <= y1)
+
+    def _canon(s: str) -> str:
+        s = (s or "").lower()
+        s = re.sub(r"[\u2010-\u2015\-_]+", " ", s)  # hyphen/underscore -> space
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _iou(a, b):
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+        ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+        iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+        inter = iw * ih
+        au = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+        bu = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+        union = au + bu - inter
+        return (inter / union) if union > 0 else 0.0
+
+    def _dedup_geom(boxes, iou_thresh=IOU_DEDUP_THRESH):
+        kept = []
+        for b in boxes:
+            br = (b["x0"], b["y0"], b["x1"], b["y1"])
+            if any(_iou(br, (k["x0"], k["y0"], k["x1"], k["y1"])) >= iou_thresh for k in kept):
+                continue
+            kept.append(b)
+        return kept
+
     def _pymupdf_tokens_from_bytes(pb: bytes):
         try:
             with fitz.open(stream=BytesIO(pb), filetype="pdf") as d:
@@ -539,8 +603,7 @@ def get_fence_related_text_boxes(
             out = []
             for t in w:
                 txt = str(t[4]).strip()
-                if not txt:
-                    continue
+                if not txt: continue
                 out.append({
                     "text": txt,
                     "x0": float(t[0]), "y0": float(t[1]),
@@ -552,172 +615,81 @@ def get_fence_related_text_boxes(
             print(f"_pymupdf_tokens_from_bytes error: {e}")
             return []
 
-    def _rect_union(rects):
-        if not rects: return None
-        x0 = min(r[0] for r in rects); y0 = min(r[1] for r in rects)
-        x1 = max(r[2] for r in rects); y1 = max(r[3] for r in rects)
-        return (x0, y0, x1, y1)
-
-    def _pad_rect(x0, y0, x1, y1, pad=1.5):
-        return (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
-
-    def _center(rect):
-        x0, y0, x1, y1 = rect
-        return ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
-
-    def _point_in_rect(px, py, rect):
-        x0, y0, x1, y1 = rect
-        return (x0 <= px <= x1) and (y0 <= py <= y1)
-
-    def _norm_text(s: str) -> str:
-        return re.sub(r"[\s\.\-:_\(\)\[\]\{\}]+", "", (s or "")).upper()
-
-    def _line_token_union(line_rect, tokens):
-        tx = []
-        for t in tokens:
-            cx, cy = _center((t["x0"], t["y0"], t["x1"], t["y1"]))
-            if _point_in_rect(cx, cy, line_rect):
-                tx.append((t["x0"], t["y0"], t["x1"], t["y1"]))
-        return _rect_union(tx) or line_rect
-
-    # --- keynote detection (LLM) ---
-    def _llm_extract_keynotes(lines_for_llm, llm_obj, fence_kws):
-        compact = [{"id": it["id"], "text": it["text"]} for it in lines_for_llm if it.get("text")]
-        payload = json.dumps(compact, separators=(",", ":"))
-        prompt = f"""
-You are an engineering drawing analyst. You receive text lines from a plan sheet.
-Extract ONLY keynote-style items that are fences/gates/guardrails/barriers or close (e.g., SCREEN WALL used as a barrier).
-STRICT JSON: {{"keynotes":[{{"id":"<original line id>","code":"<short code>","text":"<description>"}}]}}
-Keep items relevant to: {", ".join(fence_kws + ['screen wall','cmu wall','security gate'])}.
-If none: return {{"keynotes":[]}}.
-Lines:
-{payload}
-""".strip()
+    def _page_image_area_ratio(pb: bytes):
         try:
-            r = retry_with_backoff(llm_obj.invoke, [HumanMessage(content=prompt)])
-            raw = r.content.strip()
-            m = re.search(r"```json\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
-            if m: raw = m.group(1).strip()
-            if not raw.startswith("{"):
-                b0, b1 = raw.find("{"), raw.rfind("}")
-                if b0 != -1 and b1 > b0:
-                    raw = raw[b0:b1+1]
-            data = json.loads(raw)
-            keynotes = data.get("keynotes", [])
-            for kn in keynotes:
-                if isinstance(kn.get("code"), str):
-                    kn["code"] = kn["code"].strip()
-            return keynotes
+            with fitz.open(stream=BytesIO(pb), filetype="pdf") as d:
+                page = d[0]
+                info = page.get_text("rawdict")
+                page_area = page.rect.width * page.rect.height
+                img_area = 0.0
+                for b in info.get("blocks", []):
+                    if b.get("type") == 1:
+                        x0, y0, x1, y1 = b["bbox"]
+                        img_area += max(0.0, x1 - x0) * max(0.0, y1 - y0)
+                return (img_area / page_area) if page_area > 0 else 0.0
         except Exception as e:
-            print(f"_llm_extract_keynotes failed: {e}")
-            return []
-
-    # --- indicator filter (LLM) ---
-    def _llm_filter_indicators(candidate_words, llm_obj, legend_context):
-        pw = json.dumps([{"id": w["id"], "text": w["text"]} for w in candidate_words], separators=(",", ":"))
-        pl = json.dumps([{"code": c["code"], "text": c["text"]} for c in legend_context], separators=(",", ":"))
-        prompt = f"""
-You get LEGEND codes: {pl}
-And CANDIDATE tokens on plan: {pw}
-Return ONLY candidates that are TRUE indicator labels for one of the legend codes.
-STRICT JSON: {{"confirmed":[{{"id":"<candidate id>","code":"<matching code>","text":"<candidate text>"}}]}}
-""".strip()
-        try:
-            r = retry_with_backoff(llm_obj.invoke, [HumanMessage(content=prompt)])
-            raw = r.content.strip()
-            m = re.search(r"```json\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
-            if m: raw = m.group(1).strip()
-            if not raw.startswith("{"):
-                b0, b1 = raw.find("{"), raw.rfind("}")
-                if b0 != -1 and b1 > b0:
-                    raw = raw[b0:b1+1]
-            data = json.loads(raw)
-            confirmed = data.get("confirmed", [])
-            cmap = {w["id"]: w for w in candidate_words}
-            out = []
-            for it in confirmed:
-                wid = it.get("id")
-                if wid in cmap:
-                    w = cmap[wid]
-                    out.append({**w, "matched_code": it.get("code")})
-            return out
-        except Exception as e:
-            print(f"_llm_filter_indicators failed: {e}")
-            return []
+            print(f"_page_image_area_ratio error: {e}")
+            return 0.0
 
     def _docai_tokens_and_lines(pb: bytes, cfg, dpi: int = 72):
-        """
-        Returns (ocr_lines, ocr_tokens).
-        Better grouping: split lines on large X-gaps in addition to Y proximity.
-        """
-        if not cfg:
-            return [], []
+        """Returns (lines, tokens, page_w, page_h)."""
+        if not cfg: return [], [], 0.0, 0.0
         try:
             client = create_document_ai_client(cfg)
-            if not client:
-                return [], []
+            if not client: return [], [], 0.0, 0.0
 
             with fitz.open(stream=BytesIO(pb), filetype="pdf") as d:
                 page = d[0]
-                pix = page.get_pixmap(dpi=dpi)  # 72 worked well in your logs
+                pix = page.get_pixmap(dpi=dpi)
                 img_data = pix.tobytes("png")
-                page_w, page_h = page.rect.width, page.rect.height
-                scale_x = page_w / pix.width
-                scale_y = page_h / pix.height
+                page_w, page_h = float(page.rect.width), float(page.rect.height)
+                sx, sy = page_w / float(pix.width), page_h / float(pix.height)
 
             from google.cloud import documentai_v1 as documentai
             raw_document = documentai.RawDocument(content=img_data, mime_type="image/png")
-            processor_name = f"projects/{cfg['project_number']}/locations/{cfg['location']}/processors/{cfg['processor_id']}"
-            request = documentai.ProcessRequest(name=processor_name, raw_document=raw_document)
-            result = client.process_document(request=request)
-            doc = result.document
+            name = f"projects/{cfg['project_number']}/locations/{cfg['location']}/processors/{cfg['processor_id']}"
+            req = documentai.ProcessRequest(name=name, raw_document=raw_document)
+            res = client.process_document(request=req)
+            doc = res.document
 
             tokens = []
             if doc.pages:
                 pg = doc.pages[0]
-                for tok in pg.tokens:
-                    # text
+                full = doc.text or ""
+                for tok in getattr(pg, "tokens", []):
                     text_content = ""
-                    if tok.layout.text_anchor:
-                        ta = tok.layout.text_anchor
+                    ta = tok.layout.text_anchor
+                    if ta:
                         if getattr(ta, "text_segments", None):
                             seg = ta.text_segments[0]
-                            text_content = doc.text[seg.start_index:seg.end_index]
+                            text_content = full[seg.start_index:seg.end_index]
                         elif getattr(ta, "content", None):
                             text_content = ta.content
                     txt = (text_content or "").strip()
-                    if not txt:
-                        continue
-                    # bbox
+                    if not txt: continue
                     v = tok.layout.bounding_poly.vertices
                     if len(v) >= 4:
-                        x0, y0 = v[0].x * scale_x, v[0].y * scale_y
-                        x1, y1 = v[2].x * scale_x, v[2].y * scale_y
+                        x0, y0 = float(v[0].x) * sx, float(v[0].y) * sy
+                        x1, y1 = float(v[2].x) * sx, float(v[2].y) * sy
                         tokens.append({"text": txt, "x0": x0, "y0": y0, "x1": x1, "y1": y1})
 
-            if not tokens:
-                return [], []
+            if not tokens: return [], [], page_w, page_h
 
-            # sort tokens top-to-bottom, then left-to-right
+            # sort & group into lines with robust tolerances
             tokens.sort(key=lambda t: ((t["y0"] + t["y1"]) / 2.0, t["x0"]))
-
-            # robust thresholds
             heights = [t["y1"] - t["y0"] for t in tokens]
             widths  = [t["x1"] - t["x0"] for t in tokens]
             med_h = sorted(heights)[len(heights)//2] if heights else 8.0
             med_w = sorted(widths )[len(widths )//2] if widths  else 8.0
 
-            y_tol      = max(6.0, med_h * 0.6)               # how close vertically to be same line
-            x_gap_tol  = max(8.0, med_w * 3.0, page_w * 0.02)  # break line when horizontal gap is big
+            y_tol     = max(6.0, med_h * 0.6)
+            x_gap_tol = max(8.0, med_w * 3.0, page_w * 0.02)
 
-            lines = []
-            cur = []
-            prev_cy = None
-            prev_x1 = None
+            lines, cur = [], []
+            prev_cy = prev_x1 = None
 
             def flush(group):
                 if not group: return
-                # group is one real line slice (no huge X gaps)
                 x0 = min(t["x0"] for t in group); y0 = min(t["y0"] for t in group)
                 x1 = max(t["x1"] for t in group); y1 = max(t["y1"] for t in group)
                 text = " ".join(t["text"] for t in sorted(group, key=lambda tt: tt["x0"]))
@@ -728,33 +700,120 @@ STRICT JSON: {{"confirmed":[{{"id":"<candidate id>","code":"<matching code>","te
                 if (prev_cy is None) or (abs(cy - prev_cy) <= y_tol and prev_x1 is not None and (t["x0"] - prev_x1) <= x_gap_tol):
                     cur.append(t)
                 else:
-                    flush(cur)
-                    cur = [t]
-                prev_cy = cy
-                prev_x1 = t["x1"]
+                    flush(cur); cur = [t]
+                prev_cy = cy; prev_x1 = t["x1"]
             flush(cur)
 
-            return lines, tokens
+            return lines, tokens, page_w, page_h
         except Exception as e:
             print(f"[HL DEBUG] DocAI fallback failed: {e}")
-            return [], []
+            return [], [], 0.0, 0.0
 
+    # --- keyword preparation (user + signals) ---
+    def _augment_keywords(raw_list):
+        """Add hyphen/space variants and singular/plural for multi-word phrases."""
+        out = set()
+        for s in raw_list:
+            s = (s or "").strip()
+            if not s: continue
+            base = s
+            out.add(base)
+            # hyphen/space variants
+            h2s = base.replace("-", " ")
+            s2h = base.replace(" ", "-")
+            out.add(h2s); out.add(s2h)
+            # singular/plural if multi-word
+            toks = base.split()
+            if len(toks) >= 2:
+                last = toks[-1]
+                if last.endswith("s"):
+                    sing = " ".join(toks[:-1] + [last[:-1]])
+                    out.add(sing); out.add(sing.replace(" ", "-"))
+                else:
+                    plur = " ".join(toks[:-1] + [last + "s"])
+                    out.add(plur); out.add(plur.replace(" ", "-"))
+            # collapsed (“screenwall”) variant for two-word phrases
+            if len(base.split()) == 2:
+                out.add(base.replace(" ", ""))
+        return sorted(set(out))
 
-    # ------------- main -------------
+    raw_user = [k for k in (fence_keywords_from_app or []) if isinstance(k, str)]
+    raw_signals = [k for k in (extra_keywords or []) if isinstance(k, str)]
+    # normalize to canonical form used by matcher
+    merged_raw = list({k.strip() for k in (raw_user + raw_signals) if k and k.strip()})
+    # create variants, then canonicalize for the matcher
+    expanded = _augment_keywords([_canon(k) for k in merged_raw])
+    norm_kws = list({_canon(k) for k in expanded})
+    phrase_lists = [k.split() for k in norm_kws if " " in k]
+    single_set   = {k for k in norm_kws if " " not in k}
+
+    def _find_spans(line_tokens_norm, phrase_lists, single_set):
+        spans = []
+        used = [False] * len(line_tokens_norm)
+        # phrases (longest-first)
+        for P in sorted(phrase_lists, key=lambda p: -len(p)):
+            L = len(P); i = 0
+            while i <= len(line_tokens_norm) - L:
+                if line_tokens_norm[i:i+L] == P:
+                    spans.append((i, i+L-1))
+                    for k in range(i, i+L): used[k] = True
+                    i += L
+                else: i += 1
+        # singles
+        for i, tok in enumerate(line_tokens_norm):
+            if not used[i] and tok in single_set:
+                spans.append((i, i))
+        spans.sort(key=lambda s: s[0])
+        return spans
+
+    def _expand_spans_with_context(spans, n_tokens, max_idx):
+        return [(max(0, a - n_tokens), min(max_idx, b + n_tokens)) for a, b in spans]
+
+    def _tight_boxes_from_spans(tokens_line, spans, pad_px, max_height_mult, gap_split_factor):
+        if not spans: return []
+        h_med = median([max(1.0, t["y1"] - t["y0"]) for t in tokens_line]) if tokens_line else 8.0
+        gap_thresh = gap_split_factor * h_med
+        out = []
+        for a, b in spans:
+            segs, start = [], a
+            for j in range(a, b):
+                gap = tokens_line[j+1]["x0"] - tokens_line[j]["x1"]
+                if gap > gap_thresh:
+                    segs.append((start, j)); start = j + 1
+            segs.append((start, b))
+            for sa, sb in segs:
+                seg = tokens_line[sa:sb+1]
+                x0 = min(t["x0"] for t in seg); x1 = max(t["x1"] for t in seg)
+                ty0 = min(t["y0"] for t in seg); ty1 = max(t["y1"] for t in seg)
+                height = min((ty1 - ty0), max_height_mult * h_med)
+                cy = 0.5 * (ty0 + ty1)
+                y0 = cy - 0.5 * height; y1 = cy + 0.5 * height
+                x0, y0, x1, y1 = _pad_rect(x0, y0, x1, y1, pad=pad_px)
+                out.append((x0, y0, x1, y1))
+        return out
+
+    def _should_run_ocr_also(text_layer_boxes, tokens_text, pb: bytes):
+        if len(text_layer_boxes) < OCR_IF_TEXT_MATCHES_LT: return True
+        if len(tokens_text)        < OCR_IF_PYMUPDF_TOKENS_LT: return True
+        try:
+            if _page_image_area_ratio(pb) >= IMAGE_AREA_RATIO: return True
+        except Exception:
+            pass
+        return False
+
+    # ---------------- page prep ----------------
     final_boxes = []
     page_width = page_height = 0
 
-    # tokens for tight geometry
-    tokens = _pymupdf_tokens_from_bytes(page_bytes)
+    tokens_text = _pymupdf_tokens_from_bytes(page_bytes)
 
-    # pdfplumber page/words/lines (for layout + candidate gen)
+    # pdfplumber objects (text-layer path)
     words_pl, lines_pl = [], []
     try:
         with pdfplumber.open(BytesIO(page_bytes)) as pdf:
-            if not pdf.pages:
-                return [], 0, 0
+            if not pdf.pages: return [], 0, 0
             p = pdf.pages[0]
-            page_width, page_height = p.width, p.height
+            page_width, page_height = float(p.width), float(p.height)
             try:
                 words_pl = p.extract_words(
                     use_text_flow=True, split_at_punctuation=False,
@@ -772,130 +831,81 @@ STRICT JSON: {{"confirmed":[{{"id":"<candidate id>","code":"<matching code>","te
         print(f"TIMER LOG: pdfplumber open error: {e}")
         return [], 0, 0
 
-    # ---------- A) KEYWORD/LEGEND LINES: always highlight ----------
-    primary = {k.lower() for k in (fence_keywords_from_app or [])}
-    primary |= {"fence", "fencing", "gate", "gates", "barrier", "guardrail", "screen wall", "screenwall",
-                "chain link", "chain-link", "chainlink"}
-    secondary = {"mesh", "panel", "post"}  # needs a primary anchor on the same line
+    # ---- (A) TEXT-LAYER keyword spans ----
+    # map tokens to each line by center-in-rect
+    line_tokens_map = {}
+    for i, L in enumerate(lines_pl or []):
+        lr = (float(L.get("x0", 0)), float(L.get("top", 0)), float(L.get("x1", 0)), float(L.get("bottom", 0)))
+        ltoks = []
+        for t in tokens_text:
+            cx, cy = _center((t["x0"], t["y0"], t["x1"], t["y1"]))
+            if _point_in_rect(cx, cy, lr):
+                ltoks.append(t)
+        ltoks.sort(key=lambda tt: tt["x0"])
+        line_tokens_map[i] = ltoks
 
     for i, L in enumerate(lines_pl or []):
         txt = (L.get("text") or "").strip()
         if not txt: continue
-        lt = txt.lower()
-        has_primary = any(k in lt for k in primary)
-        has_secondary = any(k in lt for k in secondary)
-        if not has_primary and not has_secondary:
-            continue
-        if has_secondary and not has_primary:
-            if not any(a in lt for a in ["fence","gate","guardrail","barrier","screen wall","chain link","chain-link","chainlink"]):
-                continue
-        if all(k in L for k in ["x0", "top", "x1", "bottom"]):
-            line_rect = (float(L["x0"]), float(L["top"]), float(L["x1"]), float(L["bottom"]))
-            union_rect = _line_token_union(line_rect, tokens)
-            x0, y0, x1, y1 = _pad_rect(*union_rect, pad=1.5)
+        ltoks = line_tokens_map.get(i, [])
+        if not ltoks: continue
+        ln_norm = [_canon(t["text"]) for t in ltoks]
+        spans = _find_spans(ln_norm, [pl for pl in phrase_lists], single_set)
+        if not spans: continue
+        spans = _expand_spans_with_context(spans, CONTEXT_TOKENS_TEXT, len(ltoks)-1)
+        for j, (x0, y0, x1, y1) in enumerate(
+            _tight_boxes_from_spans(ltoks, spans, PAD_TEXT, MAX_H_MULT_TEXT, GAP_SPLIT_FACTOR_TEXT)
+        ):
             final_boxes.append({
-                "id": f"kwline_{i}",
+                "id": f"kw_text_{i}_{j}",
                 "text": txt,
                 "x0": round(x0, 2), "y0": round(y0, 2),
                 "x1": round(x1, 2), "y1": round(y1, 2),
                 "type_from_llm": "keyword_line",
-                "tag_from_llm": "KEYWORD"
+                "tag_from_llm": "KEYWORD_TEXT"
             })
 
-    # ---------- B) KEYNOTES (code + description): detect via LLM, then always highlight ----------
-    line_payload = []
-    line_lookup = {}
-    for i, L in enumerate(lines_pl or []):
-        txt = (L.get("text") or "").strip()
-        if not txt: continue
-        lid = f"ln_{i}"
-        line_payload.append({"id": lid, "text": txt})
-        line_lookup[lid] = L
-    keynote_items = _llm_extract_keynotes(line_payload, llm, list(primary))
-    keynote_codes = set()
-    if keynote_items:
-        for item in keynote_items:
-            lid = item.get("id")
-            code = (item.get("code") or "").strip()
-            desc = (item.get("text") or "").strip()
-            L = line_lookup.get(lid)
-            if not (L and code): continue
-            line_rect = (float(L["x0"]), float(L["top"]), float(L["x1"]), float(L["bottom"]))
-            x0, y0, x1, y1 = _pad_rect(*_line_token_union(line_rect, tokens), pad=1.5) if tokens else _pad_rect(*line_rect, pad=1.5)
-            final_boxes.append({
-                "id": lid,
-                "text": f"{code} {desc}" if desc else code,
-                "x0": round(x0, 2), "y0": round(y0, 2),
-                "x1": round(x1, 2), "y1": round(y1, 2),
-                "type_from_llm": "legend_item",
-                "tag_from_llm": code
-            })
-            keynote_codes.add(code)
+    # Decide if we should ALSO run OCR (mixed page)
+    run_ocr_anyway = _should_run_ocr_also(final_boxes, tokens_text, page_bytes)
 
-    # ---------- C) INDICATORS: only LLM-confirmed ----------
-    candidates = []
-    if keynote_codes and words_pl:
-        for idx, w in enumerate(words_pl):
-            t = (w.get("text") or "").strip()
-            if t in keynote_codes and len(t) <= 6:
-                candidates.append({
-                    "id": f"kw_{idx}",
-                    "text": t,
-                    "x0": round(float(w["x0"]), 2), "y0": round(float(w["top"]), 2),
-                    "x1": round(float(w["x1"]), 2), "y1": round(float(w["bottom"]), 2),
-                })
-    if candidates:
-        legend_ctx = [{"code": b["tag_from_llm"], "text": b["text"]}
-                      for b in final_boxes if b.get("type_from_llm") == "legend_item"]
-        confirmed = _llm_filter_indicators(candidates, llm, legend_ctx)
-        for ci in confirmed:
-            norm = _norm_text(ci["text"])
-            matches = [t for t in tokens if _norm_text(t["text"]) == norm]
-            chosen = None
-            if matches:
-                base_c = _center((ci["x0"], ci["y0"], ci["x1"], ci["y1"]))
-                best_d, best_tok = 1e18, None
-                for t in matches:
-                    tc = _center((t["x0"], t["y0"], t["x1"], t["y1"]))
-                    d = abs(tc[0] - base_c[0]) + abs(tc[1] - base_c[1])
-                    if d < best_d:
-                        best_d, best_tok = d, t
-                if best_tok:
-                    chosen = (best_tok["x0"], best_tok["y0"], best_tok["x1"], best_tok["y1"])
-            rect = chosen or (ci["x0"], ci["y0"], ci["x1"], ci["y1"])
-            x0, y0, x1, y1 = _pad_rect(*rect, pad=1.2)
-            final_boxes.append({
-                "id": ci["id"],
-                "text": ci["text"],
-                "x0": round(x0, 2), "y0": round(y0, 2),
-                "x1": round(x1, 2), "y1": round(y1, 2),
-                "type_from_llm": "indicator",
-                "tag_from_llm": ci.get("matched_code")
-            })
+    # ---- (B) OCR path ----
+    if run_ocr_anyway or not final_boxes:
+        if not final_boxes and not run_ocr_anyway:
+            print("[HL DEBUG] No text-layer matches — using DocAI OCR fallback.")
+        else:
+            print("[HL DEBUG] Running OCR in addition to text-layer (mixed page).")
 
-    # ---------- D) DocAI OCR fallback when nothing found ----------
-    if not final_boxes:
-        print("[HL DEBUG] No boxes from text-layer — using DocAI OCR fallback.")
-        ocr_lines, ocr_tokens = _docai_tokens_and_lines(page_bytes, google_cloud_config, dpi=72)
-        print(f"[HL DEBUG] docai_tokens={len(ocr_tokens)}  docai_lines={len(ocr_lines)}")
+        ocr_lines, ocr_tokens, pw, ph = _docai_tokens_and_lines(page_bytes, google_cloud_config, dpi=72)
+        if pw and ph: page_width, page_height = pw, ph
 
-        if ocr_lines or ocr_tokens:
-            # A) keyword lines
-            for i, L in enumerate(ocr_lines):
-                txt = (L.get("text") or "").strip()
-                if not txt: continue
-                lt = txt.lower()
-                has_primary = any(k in lt for k in primary)
-                has_secondary = any(k in lt for k in secondary)
-                if not has_primary and not has_secondary:
-                    continue
-                if has_secondary and not has_primary:
-                    if not any(a in lt for a in ["fence","gate","guardrail","barrier","screen wall","chain link","chain-link","chainlink"]):
-                        continue
-                line_rect = (float(L["x0"]), float(L["top"]), float(L["x1"]), float(L["bottom"]))
-                x0, y0, x1, y1 = _pad_rect(*line_rect, pad=1.5)
-                final_boxes.append({
-                    "id": f"kwline_ocr_{i}",
+        # tokens per OCR line
+        ocr_line_tokens = {}
+        for i, L in enumerate(ocr_lines):
+            lr = (float(L["x0"]), float(L["top"]), float(L["x1"]), float(L["bottom"]))
+            ltoks = []
+            for t in ocr_tokens:
+                cx, cy = _center((t["x0"], t["y0"], t["x1"], t["y1"]))
+                if _point_in_rect(cx, cy, lr):
+                    ltoks.append(t)
+            ltoks.sort(key=lambda tt: tt["x0"])
+            ocr_line_tokens[i] = ltoks
+
+        # keyword spans on OCR lines
+        ocr_boxes = []
+        for i, L in enumerate(ocr_lines):
+            txt = (L.get("text") or "").strip()
+            if not txt: continue
+            ltoks = ocr_line_tokens.get(i, [])
+            if not ltoks: continue
+            ln_norm = [_canon(t["text"]) for t in ltoks]
+            spans = _find_spans(ln_norm, [pl for pl in phrase_lists], single_set)
+            if not spans: continue
+            spans = _expand_spans_with_context(spans, CONTEXT_TOKENS_OCR, len(ltoks)-1)
+            for j, (x0, y0, x1, y1) in enumerate(
+                _tight_boxes_from_spans(ltoks, spans, PAD_OCR, MAX_H_MULT_OCR, GAP_SPLIT_FACTOR_OCR)
+            ):
+                ocr_boxes.append({
+                    "id": f"kw_ocr_{i}_{j}",
                     "text": txt,
                     "x0": round(x0, 2), "y0": round(y0, 2),
                     "x1": round(x1, 2), "y1": round(y1, 2),
@@ -903,71 +913,16 @@ STRICT JSON: {{"confirmed":[{{"id":"<candidate id>","code":"<matching code>","te
                     "tag_from_llm": "KEYWORD_OCR"
                 })
 
-            # B) keynotes via LLM on OCR lines
-            line_payload = [{"id": f"lnocr_{i}", "text": (L.get("text") or "").strip()} for i, L in enumerate(ocr_lines) if (L.get("text") or "").strip()]
-            line_lookup = {f"lnocr_{i}": L for i, L in enumerate(ocr_lines)}
-            keynote_items = _llm_extract_keynotes(line_payload, llm, list(primary))
-            keynote_codes = set()
-            for item in keynote_items:
-                lid = item.get("id")
-                code = (item.get("code") or "").strip()
-                desc = (item.get("text") or "").strip()
-                L = line_lookup.get(lid)
-                if not (L and code): continue
-                line_rect = (float(L["x0"]), float(L["top"]), float(L["x1"]), float(L["bottom"]))
-                x0, y0, x1, y1 = _pad_rect(*line_rect, pad=1.5)
-                final_boxes.append({
-                    "id": lid,
-                    "text": f"{code} {desc}" if desc else code,
-                    "x0": round(x0, 2), "y0": round(y0, 2),
-                    "x1": round(x1, 2), "y1": round(y1, 2),
-                    "type_from_llm": "legend_item",
-                    "tag_from_llm": code
-                })
-                keynote_codes.add(code)
+        if ocr_boxes:
+            final_boxes = _dedup_geom(final_boxes + ocr_boxes, iou_thresh=IOU_DEDUP_THRESH)
 
-            # C) indicators from OCR tokens (LLM-filtered)
-            if keynote_codes and ocr_tokens:
-                candidates = []
-                for idx, t in enumerate(ocr_tokens):
-                    txt = (t.get("text") or "").strip()
-                    if txt in keynote_codes and len(txt) <= 6:
-                        candidates.append({
-                            "id": f"kwocr_{idx}",
-                            "text": txt,
-                            "x0": round(t["x0"], 2), "y0": round(t["y0"], 2),
-                            "x1": round(t["x1"], 2), "y1": round(t["y1"], 2),
-                        })
-                if candidates:
-                    legend_ctx = [{"code": b["tag_from_llm"], "text": b["text"]}
-                                  for b in final_boxes if b.get("type_from_llm") == "legend_item"]
-                    confirmed = _llm_filter_indicators(candidates, llm, legend_ctx)
-                    for ci in confirmed:
-                        x0, y0, x1, y1 = _pad_rect(ci["x0"], ci["y0"], ci["x1"], ci["y1"], pad=1.2)
-                        final_boxes.append({
-                            "id": ci["id"],
-                            "text": ci["text"],
-                            "x0": round(x0, 2), "y0": round(y0, 2),
-                            "x1": round(x1, 2), "y1": round(y1, 2),
-                            "type_from_llm": "indicator",
-                            "tag_from_llm": ci.get("matched_code")
-                        })
+    # stable IDs & debug
+    for idx, it in enumerate(final_boxes):
+        it["id"] = it.get("id") or f"kw_{idx+1}"
 
-    # ---------- E) dedup & return ----------
-    dedup = {}
-    for it in final_boxes:
-        iid = it.get("id") or f"auto_{len(dedup)+1}"
-        dedup[iid] = it
-    final_boxes = list(dedup.values())
+    print(f"[HL DEBUG] final_boxes={len(final_boxes)}  page=({page_width}x{page_height})")
+    print(f"TIMER LOG: v14-hybrid-ocr-signals done. Boxes={len(final_boxes)} in {time.time() - t0:.3f}s")
 
-    # DEBUG
-    print(f"[HL DEBUG] page_width={page_width}, page_height={page_height}")
-    print(f"[HL DEBUG] tokens(PyMuPDF)={len(tokens)}  words_pl={len(words_pl)}  lines_pl={len(lines_pl)}")
-    print(f"[HL DEBUG] keyword-lines={len([b for b in final_boxes if b.get('type_from_llm')=='keyword_line'])}")
-    print(f"[HL DEBUG] legend-items={len([b for b in final_boxes if b.get('type_from_llm')=='legend_item'])}")
-    print(f"[HL DEBUG] indicators={len([b for b in final_boxes if b.get('type_from_llm')=='indicator'])}")
-    print(f"[HL DEBUG] total_boxes={len(final_boxes)}")
-    print(f"TIMER LOG: v14 done. Boxes={len(final_boxes)} in {time.time() - t0:.3f}s")
     return final_boxes, page_width, page_height
 
 # =========================

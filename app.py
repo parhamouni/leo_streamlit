@@ -9,6 +9,7 @@ import io
 import time 
 import uuid 
 import hashlib # For hashing PDF bytes
+import json
 
 # --- Highlight Appearance & Performance ---
 HIGHLIGHT_COLOR_UI = (0, 0.9, 0)
@@ -314,6 +315,12 @@ if st.session_state.run_analysis_triggered and \
                         page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
                         recall_mode="strict"   # or "balanced"/"high"
                     )
+                    try:
+                        jr = json.loads(analysis_res_core["text_response"])
+                        signals = jr.get("signals", [])
+                    except Exception:
+                        pass
+
 
             except UnrecoverableRateLimitError as urle:
                 msg = f"🛑 API Rate Limit Pg {curr_pg_num}: {urle}. Analysis halted."; status_txt_area.error(msg); st.error(msg)
@@ -334,9 +341,11 @@ if st.session_state.run_analysis_triggered and \
                             single_pg_bytes_io.getvalue(),
                             llm_analysis_instance,
                             FENCE_KEYWORDS_APP,
+                            signals,
                             st.session_state.selected_model_for_analysis,
                             google_cloud_config  # <-- pass it through
                         )
+
 
                         if boxes: analysis_result['fence_text_boxes_details'] = boxes
                 except UnrecoverableRateLimitError as urle_hl:
