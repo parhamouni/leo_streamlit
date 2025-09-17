@@ -59,25 +59,28 @@ document_ai_client = None
 
 def create_document_ai_client(google_cloud_config=None):
     """
-    Create Document AI client from configuration (Streamlit secrets dict shape).
-    google_cloud_config should include service_account_info.
+    Create (or reuse) a single Document AI client from configuration.
+    Re-using the client avoids repeatedly opening gRPC channels and buffers.
     """
+    global document_ai_client
     try:
+        if document_ai_client is not None:
+            return document_ai_client
+
         if google_cloud_config and google_cloud_config.get("service_account_info"):
             from google.oauth2 import service_account
             credentials = service_account.Credentials.from_service_account_info(
                 google_cloud_config["service_account_info"]
             )
-            client = documentai.DocumentProcessorServiceClient(credentials=credentials)
-            print("✅ Document AI client created from provided configuration")
-            return client
+            document_ai_client = documentai.DocumentProcessorServiceClient(credentials=credentials)
+            print("✅ Document AI client created (will be reused across pages)")
+            return document_ai_client
         else:
             print("⚠️ No Google Cloud configuration provided.")
             return None
     except Exception as e:
         print(f"⚠️ Document AI client creation failed: {e}")
         return None
-
 
 # =========================
 # Utilities
@@ -140,92 +143,99 @@ def extract_comprehensive_text_from_page(
     enable_tesseract_fallback: bool = False,
 ) -> Dict:
     """
-    Prefer comprehensive extractor (text layer + annotations + GCP OCR).
-    Fallback: text layer (+ optional local Tesseract OCR) for recall.
+    Compact text extraction:
+      - Returns only a combined plain-text string + small stats.
+      - DOES NOT return heavy arrays like text_words/annotations/ocr_texts/all_text.
+      - This keeps transient memory lower and avoids accidentally storing megabytes
+        in session state.
     """
     try:
-        doc = fitz.open(stream=page_bytes, filetype="pdf")
-        if not doc or len(doc) == 0:
-            return {"error": "Could not open PDF page", "text": "", "all_text": [], "stats": {}}
-        page = doc[0]
+        # Open page safely
+        with fitz.open(stream=page_bytes, filetype="pdf") as doc:
+            if len(doc) == 0:
+                return {"error": "Could not open PDF page", "text": "", "stats": {}, "page_number": page_number, "extraction_method": "error"}
+            page = doc[0]
 
-        # Try comprehensive extractor if available and config provided
-        if COMPREHENSIVE_EXTRACTION_AVAILABLE and google_cloud_config:
-            client = create_document_ai_client(google_cloud_config)
-            processor_name = (
-                f"projects/{google_cloud_config['project_number']}/"
-                f"locations/{google_cloud_config['location']}/"
-                f"processors/{google_cloud_config['processor_id']}"
-            )
-            if client:
-                result = extract_comprehensive_page_text(
-                    page=page,
-                    client=client,
-                    processor_name=processor_name,
-                    use_ocr=True,
-                    dpi=ocr_dpi,
-                )
-            else:
-                result = None
-        else:
-            result = None
-
-        if result:
-            all_text_items = result.get("all_text", [])
-            combined_text = " ".join([item["text"] for item in all_text_items]) if all_text_items else ""
-            doc.close()
-            return {
-                "text": combined_text,
-                "text_words": result.get("text_words", []),
-                "text_annotations": result.get("text_annotations", []),
-                "ocr_texts": result.get("ocr_texts", []),
-                "all_text": all_text_items,
-                "stats": result.get("stats", {}),
-                "page_number": page_number,
-                "extraction_method": "comprehensive",
+            combined_text = ""
+            extraction_method = "fallback"
+            stats = {
+                "total_words": 0,
+                "total_annotations": 0,
+                "total_ocr_found": 0,
+                "total_ocr_unique": 0,
+                "total_ocr_duplicates_removed": 0,
+                "total_elements": 0,
+                "ocr_enabled": False,
+                "page_dimensions": (page.rect.width, page.rect.height),
+                "page_rotation": page.rotation,
             }
 
-        # --------- Fallback path: PDF text layer + optional local OCR ----------
-        text_words = page.get_text("words")
-        base_text = " ".join([w[4] for w in text_words])
+            # -------- Preferred: comprehensive extractor (DocAI + text layer + annots) --------
+            result = None
+            if COMPREHENSIVE_EXTRACTION_AVAILABLE and google_cloud_config:
+                client = create_document_ai_client(google_cloud_config)
+                if client:
+                    try:
+                        result = extract_comprehensive_page_text(
+                            page=page,
+                            client=client,
+                            processor_name=(
+                                f"projects/{google_cloud_config['project_number']}/"
+                                f"locations/{google_cloud_config['location']}/"
+                                f"processors/{google_cloud_config['processor_id']}"
+                            ),
+                            use_ocr=True,
+                            dpi=ocr_dpi,
+                        )
+                        # Build compact return
+                        if result:
+                            all_items = result.get("all_text") or []
+                            if all_items:
+                                combined_text = " ".join(it.get("text", "") for it in all_items if it.get("text"))
+                            extraction_method = "comprehensive"
+                            stats = result.get("stats", stats)
+                    except Exception as _e:
+                        # Fall back to text layer path below
+                        result = None
 
-        ocr_added = []
-        if enable_tesseract_fallback:
-            try:
-                import pytesseract
-                from PIL import Image
+            # -------- Fallback: text layer (+ optional local OCR) --------
+            if not combined_text:
+                # Text-layer tokens
+                words = page.get_text("words")  # tuples (x0,y0,x1,y1,text,block,line,word)
+                base_text = " ".join(w[4] for w in words) if words else ""
+                stats.update({
+                    "total_words": len(words or []),
+                    "total_elements": len(words or []),
+                    "ocr_enabled": False,
+                })
 
-                pix = page.get_pixmap(dpi=ocr_dpi)
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                ocr_text = pytesseract.image_to_string(img)
-                if ocr_text:
-                    ocr_added.append({"text": ocr_text, "source": "tesseract"})
-                    base_text = (base_text + " " + ocr_text).strip()
-            except Exception as _e:
-                print(f"Tesseract fallback failed: {_e}")
+                if enable_tesseract_fallback:
+                    try:
+                        import pytesseract
+                        from PIL import Image
+                        pix = page.get_pixmap(dpi=ocr_dpi)
+                        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                        ocr_text = pytesseract.image_to_string(img)
+                        if ocr_text:
+                            base_text = (base_text + " " + ocr_text).strip()
+                            stats["ocr_enabled"] = True
+                    except Exception:
+                        pass
 
-        doc.close()
-        return {
-            "text": base_text,
-            "text_words": [
-                {"text": w[4], "x0": w[0], "y0": w[1], "x1": w[2], "y1": w[3], "source": "text_layer"}
-                for w in text_words
-            ],
-            "text_annotations": [],
-            "ocr_texts": ocr_added,
-            "all_text": ([{"text": w[4], "source": "text_layer"} for w in text_words] + ocr_added),
-            "stats": {
-                "total_words": len(text_words),
-                "total_elements": len(text_words) + len(ocr_added),
-                "ocr_enabled": bool(ocr_added),
-            },
-            "page_number": page_number,
-            "extraction_method": "fallback+tesseract" if ocr_added else "fallback",
-        }
+                combined_text = base_text
+                extraction_method = "fallback+tesseract" if stats.get("ocr_enabled") else "fallback"
+
+            # Ensure we always return a compact payload
+            return {
+                "text": combined_text or "",
+                "stats": stats,
+                "page_number": page_number,
+                "extraction_method": extraction_method,
+            }
 
     except Exception as e:
         print(f"Error in comprehensive text extraction: {e}")
-        return {"error": str(e), "text": "", "all_text": [], "stats": {}, "extraction_method": "error"}
+        return {"error": str(e), "text": "", "stats": {}, "page_number": page_number, "extraction_method": "error"}
 
 
 @time_it
@@ -256,40 +266,41 @@ def analyze_page(
     ocr_dpi: int = 96,
     enable_tesseract_fallback: bool = False,
     neighbor_text_provider=None,
-    recall_mode: str | None = None,   # NEW: optional override; else uses env var
+    recall_mode: str | None = None,
 ):
     """
-    Recall-aware page classification with JSON enforcement + optional neighbor context.
-    Decision policy:
-      - strict   : only answer=='yes'
-      - balanced : answer=='yes' OR (confidence>=0.65 AND has_primary_signal)
-      - high     : answer=='yes' OR (confidence>=0.55 AND has_primary_signal)
+    Recall-aware page classification (compact result).
+    Key change: we DO NOT return the full page text anymore, only a short snippet.
+    This prevents megabytes of text from accumulating in st.session_state.
     """
     import json, os
 
     pg_num = page_data.get("page_number", "N/A")
 
-    # ---- Extract text (same as before) ----
+    # ---- Extract compact text ----
     page_bytes = page_data.get("page_bytes")
     if page_bytes:
         extraction_result = extract_comprehensive_text_from_page(
-            page_bytes, pg_num, google_cloud_config, ocr_dpi=ocr_dpi,
-            enable_tesseract_fallback=enable_tesseract_fallback
+            page_bytes,
+            pg_num,
+            google_cloud_config,
+            ocr_dpi=ocr_dpi,
+            enable_tesseract_fallback=enable_tesseract_fallback,
         )
-        comprehensive_text = extraction_result.get("text", "")
-        extraction_stats = extraction_result.get("stats", {})
+        comprehensive_text = extraction_result.get("text", "") or ""
+        extraction_stats = extraction_result.get("stats", {}) or {}
         extraction_method = extraction_result.get("extraction_method", "unknown")
     else:
-        comprehensive_text = page_data.get("text", "")
+        comprehensive_text = page_data.get("text", "") or ""
         extraction_stats = {}
         extraction_method = "legacy"
 
-    # Optional neighbor context for sparse pages
+    # ---- Optional neighbor context for sparse pages (kept tiny) ----
     context_bits = []
     if neighbor_text_provider and extraction_stats.get("total_elements", 0) < 40:
         try:
             nbefore = neighbor_text_provider(pg_num - 1)
-            nafter = neighbor_text_provider(pg_num + 1)
+            nafter  = neighbor_text_provider(pg_num + 1)
             if nbefore: context_bits.append(f"PrevPageExcerpt: {nbefore[:300]}")
             if nafter:  context_bits.append(f"NextPageExcerpt: {nafter[:300]}")
         except Exception:
@@ -314,8 +325,7 @@ def analyze_page(
         print(f"analyze_page JSON parse failed pg {pg_num}: {e}")
         answer, confidence, signals, reason = "no", 0.0, [], f"error {e}"
 
-    # ---- Decision policy (fixed) ----
-    # Primary fence vocabulary for cross-checking signals
+    # ---- Decision policy ----
     primary_vocab = {k.lower() for k in (fence_keywords or [])}
     primary_vocab |= {
         "fence","fencing","gate","gates","barrier","guardrail",
@@ -329,15 +339,14 @@ def analyze_page(
         found = (answer == "yes")
     elif mode == "high":
         found = (answer == "yes") or (confidence >= 0.55 and has_primary_signal)
-    else:  # balanced (default)
+    else:  # balanced
         found = (answer == "yes") or (confidence >= 0.65 and has_primary_signal)
 
-    print(f"[ANALYZE_DEBUG] pg={pg_num} ans={answer} conf={confidence:.2f} "
-          f"has_primary_signal={has_primary_signal} mode={mode} -> found={found}")
-
+    # Short snippet only (<= ~100 chars around first hit)
     snippet = extract_snippet(comprehensive_text, fence_keywords) if found else None
 
-    return {
+    # IMPORTANT: Do NOT return the full page text (saves lots of memory)
+    result = {
         "page_number": pg_num,
         "fence_found": found,
         "text_found": (answer == "yes"),
@@ -350,9 +359,12 @@ def analyze_page(
         "text_snippet": snippet,
         "extraction_stats": extraction_stats,
         "extraction_method": extraction_method,
-        "comprehensive_text": comprehensive_text,
+        # "comprehensive_text": <removed on purpose>
     }
 
+    # Help GC: drop references before returning
+    comprehensive_text = None
+    return result
 
 # --- Token & geometry helpers for precise highlighting ---
 

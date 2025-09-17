@@ -112,79 +112,127 @@ if openai_key:
 
 
 def get_image_download_link_html(img_bytes, filename, text):
+    """
+    Return a download <a> tag using a data URL with the correct MIME type.
+    If the bytes are JPEG but the filename ends with .png, rewrite to .jpg
+    to avoid mismatches. Call sites do not need to change.
+    """
+    # MIME sniffing
+    mime = "application/octet-stream"
+    if img_bytes[:2] == b"\xff\xd8":
+        mime = "image/jpeg"
+        if filename.lower().endswith(".png"):
+            filename = filename[:-4] + ".jpg"
+    elif img_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        mime = "image/png"
+
     b64 = base64.b64encode(img_bytes).decode()
-    return f'<a href="data:image/png;base64,{b64}" download="{filename}" class="download-button">{text}</a>'
+    return f'<a href="data:{mime};base64,{b64}" download="{filename}" class="download-button">{text}</a>'
 
-@time_it 
-@st.cache_data(ttl=3600, show_spinner=False, max_entries=200) # Increased max_entries
-def _generate_display_images_for_page_cached(page_idx, 
-                                            pdf_hash_for_cache_key, # CHANGED: Use PDF hash as part of key
+@time_it
+@st.cache_data(ttl=900, show_spinner=False, max_entries=60)  # 15 min, at most 60 entries
+def _generate_display_images_for_page_cached(page_idx,
+                                            pdf_hash_for_cache_key,
                                             fence_text_boxes_details_tuple,
-                                            ui_color, ui_width, display_dpi, 
+                                            ui_color, ui_width, display_dpi,
                                             session_id_for_log="N/A_CACHE"):
-    # This function now RELIES on st.session_state.original_pdf_bytes being the
-    # correct bytes for the given pdf_hash_for_cache_key.
-    # This makes the cached function "impure" but avoids hashing full PDF bytes on every call.
-    
+    """
+    Memory-aware preview renderer:
+      - Renders JPEG previews (much smaller than PNG) at a modest DPI.
+      - Cache limited to 60 entries with short TTL to keep RSS low.
+      - The 3rd arg should be a tuple of (x0,y0,x1,y1) rects (geometry-only).
+        For backward-compatibility, if items look like dict-items we try to
+        reconstruct x0..y1 from them.
+    """
     if 'original_pdf_bytes' not in st.session_state or st.session_state.original_pdf_bytes is None:
-        print(f"SESSION {session_id_for_log} ERROR (_cached): original_pdf_bytes not in session_state for hash {pdf_hash_for_cache_key}")
+        print(f"SESSION {session_id_for_log} ERROR (_cached): original_pdf_bytes missing for hash {pdf_hash_for_cache_key}")
         return None, None
-    
-    # Verify if the current session PDF matches the hash. This is an extra check.
-    # In practice, st.cache_data.clear() on new PDF upload should handle this.
-    current_pdf_bytes = st.session_state.original_pdf_bytes
-    # Recalculate hash of current PDF bytes in session to compare (can be slow if done often)
-    # For simplicity, we'll assume st.cache_data.clear() and the pdf_hash_for_cache_key argument 
-    # are sufficient to ensure correctness. A mismatch here would indicate a deeper state issue.
 
-    original_image_bytes, highlighted_image_bytes = None, None
-    func_call_id = str(uuid.uuid4())[:4] 
-    print(f"SESSION {session_id_for_log} CACHE_CALL ({func_call_id}): _generate_display_images_for_page_cached for Page {page_idx}, PDF Hash: {pdf_hash_for_cache_key}. Num boxes: {len(fence_text_boxes_details_tuple)}")
-    render_start_time = time.time()
+    # Parse rectangles defensively
+    rects = []
     try:
-        # Use the PDF bytes from session state
+        for it in (fence_text_boxes_details_tuple or ()):
+            # Already a rect tuple?
+            if isinstance(it, (tuple, list)) and len(it) == 4 and all(isinstance(v, (int, float)) for v in it):
+                x0, y0, x1, y1 = map(float, it)
+                rects.append((x0, y0, x1, y1))
+            else:
+                # Possibly tuple of dict-items
+                try:
+                    d = dict(it)
+                    x0 = float(d.get('x0')); y0 = float(d.get('y0')); x1 = float(d.get('x1')); y1 = float(d.get('y1'))
+                    rects.append((x0, y0, x1, y1))
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"SESSION {session_id_for_log} WARNING: could not parse rects for cache key: {e}")
+
+    current_pdf_bytes = st.session_state.original_pdf_bytes
+    original_image_bytes, highlighted_image_bytes = None, None
+
+    func_call_id = str(uuid.uuid4())[:4]
+    print(f"SESSION {session_id_for_log} CACHE_CALL ({func_call_id}): _generate_display_images_for_page_cached "
+          f"pg={page_idx}, hash={pdf_hash_for_cache_key[:8]}…, rects={len(rects)}")
+
+    t0 = time.time()
+    try:
+        # Render original preview (JPEG @ display_dpi)
         with fitz.open(stream=io.BytesIO(current_pdf_bytes), filetype="pdf") as doc_orig:
             page_orig = doc_orig.load_page(page_idx)
-            pix_orig = page_orig.get_pixmap(dpi=display_dpi); original_image_bytes = pix_orig.tobytes("png"); del pix_orig
+            pix_orig = page_orig.get_pixmap(dpi=display_dpi)
+            original_image_bytes = pix_orig.tobytes("jpg", jpg_quality=70)
+            del pix_orig
 
-            if fence_text_boxes_details_tuple: # Check the tuple directly
-                fence_text_boxes_details = [dict(item_tuple) for item_tuple in fence_text_boxes_details_tuple]
-                with fitz.open(stream=io.BytesIO(current_pdf_bytes), filetype="pdf") as doc_hl:
-                    page_hl = doc_hl.load_page(page_idx)
-                    derot_matrix = page_hl.derotation_matrix
-                    for box_detail in fence_text_boxes_details:
-                        rot_rect = fitz.Rect(box_detail['x0'], box_detail['y0'], box_detail['x1'], box_detail['y1'])
-                        final_rect = rot_rect * derot_matrix if page_hl.rotation != 0 else rot_rect
-                        final_rect.normalize()
-                        if not final_rect.is_empty and final_rect.is_valid:
-                            page_hl.draw_rect(final_rect, color=ui_color, width=ui_width, overlay=True)
-                    pix_hl = page_hl.get_pixmap(dpi=display_dpi); highlighted_image_bytes = pix_hl.tobytes("png"); del pix_hl
-    except Exception as e: print(f"SESSION {session_id_for_log} ERROR ({func_call_id}) in _generate_display_images_for_page_cached for page {page_idx}: {e}")
-    render_duration = time.time() - render_start_time
-    print(f"SESSION {session_id_for_log} CACHE_CALL_RENDER_TIME ({func_call_id}): Page {page_idx} took {render_duration:.4f}s for PyMuPDF rendering.")
+        # Render highlighted preview only if we actually have rects
+        if rects:
+            with fitz.open(stream=io.BytesIO(current_pdf_bytes), filetype="pdf") as doc_hl:
+                page_hl = doc_hl.load_page(page_idx)
+                derot_matrix = page_hl.derotation_matrix
+                for (x0, y0, x1, y1) in rects:
+                    r = fitz.Rect(x0, y0, x1, y1)
+                    fr = r * derot_matrix if page_hl.rotation != 0 else r
+                    fr.normalize()
+                    if not fr.is_empty and fr.is_valid:
+                        page_hl.draw_rect(fr, color=ui_color, width=ui_width, overlay=True)
+                pix_hl = page_hl.get_pixmap(dpi=display_dpi)
+                highlighted_image_bytes = pix_hl.tobytes("jpg", jpg_quality=70)
+                del pix_hl
+
+    except Exception as e:
+        print(f"SESSION {session_id_for_log} ERROR ({func_call_id}) _generate_display_images_for_page_cached pg {page_idx}: {e}")
+
+    print(f"SESSION {session_id_for_log} CACHE_CALL_RENDER_TIME ({func_call_id}): "
+          f"pg {page_idx} took {time.time() - t0:.4f}s.")
     return original_image_bytes, highlighted_image_bytes
 
+
 def generate_display_images_for_page_wrapper(page_result_data, session_id):
-    # Assumes st.session_state.current_pdf_hash and st.session_state.original_pdf_bytes are set
+    """
+    Wraps the cached renderer. Converts the page's box list to a geometry-only
+    tuple so the cache key stays small and stable.
+    """
     page_idx = page_result_data.get('page_index_in_original_doc')
     pdf_hash = st.session_state.get('current_pdf_hash')
 
-    if page_idx is None or pdf_hash is None: 
-        print(f"SESSION {session_id} WARNING (wrapper): Missing page_idx or pdf_hash for on-demand image gen.")
+    if page_idx is None or pdf_hash is None:
+        print(f"SESSION {session_id} WARNING (wrapper): Missing page_idx or pdf_hash.")
         return None, None
-        
-    boxes_details = page_result_data.get('fence_text_boxes_details', [])
-    details_tuple = tuple(tuple(sorted(d.items())) for d in sorted(boxes_details, key=lambda x: x.get('id', str(x)))) if boxes_details else tuple()
-    
-    # The cached function now relies on session_state for the actual PDF bytes,
-    # but the hash is part of the cache key to differentiate between PDFs.
+
+    boxes_details = page_result_data.get('fence_text_boxes_details', []) or []
+    # Geometry-only cache signature: ((x0,y0,x1,y1), ...)
+    box_rects_tuple = tuple(
+        (float(b.get('x0', 0.0)), float(b.get('y0', 0.0)),
+         float(b.get('x1', 0.0)), float(b.get('y1', 0.0)))
+        for b in boxes_details
+    )
+
     return _generate_display_images_for_page_cached(
-        page_idx, 
-        pdf_hash, # Pass the PDF hash
-        details_tuple, 
-        HIGHLIGHT_COLOR_UI, 
-        HIGHLIGHT_WIDTH_UI, 
-        DISPLAY_IMAGE_DPI, 
+        page_idx,
+        pdf_hash,
+        box_rects_tuple,           # <— small, avoids text in cache key
+        HIGHLIGHT_COLOR_UI,
+        HIGHLIGHT_WIDTH_UI,
+        DISPLAY_IMAGE_DPI,
         session_id
     )
 
@@ -225,6 +273,155 @@ def generate_combined_highlighted_pdf(original_pdf_bytes, fence_pages_results_li
     if output_doc: output_doc.close()
     print(f"SESSION {session_id} LOG: Finished generating combined PDF. Success: {pdf_bytes is not None}")
     return (pdf_bytes, fname) if pdf_bytes else (None, fname)
+
+def compute_doc_legend_and_refs_compact(
+    pdf_bytes: bytes,
+    llm,
+    google_cloud_config=None,
+    max_pages: int = 60,
+    char_budget_per_page: int = 2400,
+    max_workers: int = 4,
+):
+    """
+    Low-memory, document-level pass:
+      1) Discover legend-like items per page (LLM).
+      2) Merge to a canonical legend index (LLM).
+      3) Detect references to those identifiers on pages (LLM).
+
+    Returns:
+      {
+        "id_list": ["F1", "F-2A", "0113", ...],
+        "page_refs": { 3: [{"identifier":"F1","confidence":0.8,"evidence":"F1 CHAIN LINK..."}], ... },
+        "index_compact": [ {"identifier":"F1","title":"8' CL FENCE","short_description":"...","definition_pages":[1,2]}, ... ]
+      }
+
+    Notes:
+      - Uses only the PDF text layer for speed/memory; this is usually enough to
+        build a useful identifier pool. You can extend to OCR later if needed.
+      - Limits pages and per-page text length to keep both token usage and RAM low.
+    """
+    import io, json, os
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from langchain_core.messages import HumanMessage
+    from llm_utils import (
+        json_invoke,
+        make_legend_discovery_prompt,
+        make_legend_merge_prompt,
+        make_page_ref_prompt,
+    )
+    import fitz  # PyMuPDF
+
+    # --- Collect small per-page texts (sequential, very cheap) ---
+    page_texts = []
+    total_pages = 0
+    with fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf") as doc:
+        total_pages = len(doc)
+        n = min(total_pages, int(os.getenv("MAX_PAGES_FOR_LEGEND", str(max_pages))))
+        for i in range(n):
+            try:
+                p = doc.load_page(i)
+                t = p.get_text("text") or ""
+                if len(t) > char_budget_per_page:
+                    t = t[:char_budget_per_page]
+                page_texts.append(t)
+            except Exception as e:
+                print(f"[legend] text read failed on page {i+1}: {e}")
+                page_texts.append("")
+
+    # --- 1) Legend discovery per page (in parallel) ---
+    candidates = []
+    if page_texts:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {}
+            for i, text in enumerate(page_texts):
+                pnum = i + 1
+                prompt = make_legend_discovery_prompt(pnum, text)
+                futures[ex.submit(json_invoke, llm, [HumanMessage(content=prompt)])] = pnum
+
+            for fut in as_completed(futures):
+                pnum = futures[fut]
+                try:
+                    resp = fut.result()
+                    content = resp.content if hasattr(resp, "content") else str(resp)
+                    data = json.loads(content)
+                    items = data.get("legend_items", []) or []
+                    for it in items:
+                        it.setdefault("page", pnum)
+                    candidates.extend(items)
+                except Exception as e:
+                    print(f"[legend] page {pnum} failed: {e}")
+
+    # --- 2) Merge candidates to canonical index ---
+    index = []
+    id_list = []
+    try:
+        cjson = json.dumps(candidates, separators=(",", ":"))
+        merge_prompt = make_legend_merge_prompt(cjson)  # <-- correct builder
+        merge_resp = json_invoke(llm, [HumanMessage(content=merge_prompt)])
+        mc = merge_resp.content if hasattr(merge_resp, "content") else str(merge_resp)
+        merged = json.loads(mc)
+        index = merged.get("index", []) or []
+        id_list = [x.get("identifier") for x in index if x.get("identifier")]
+    except Exception as e:
+        print(f"[legend-merge] failed: {e}")
+
+    # --- 3) Detect per-page references to identifiers (in parallel) ---
+    page_refs = {}
+    if id_list and page_texts:
+        id_list_preview = ", ".join(id_list[:60]) + (" …" if len(id_list) > 60 else "")
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {}
+            for i, text in enumerate(page_texts):
+                pnum = i + 1
+                prompt = make_page_ref_prompt(id_list_preview, text)
+                futures[ex.submit(json_invoke, llm, [HumanMessage(content=prompt)])] = pnum
+
+            for fut in as_completed(futures):
+                pnum = futures[fut]
+                try:
+                    resp = fut.result()
+                    content = resp.content if hasattr(resp, "content") else str(resp)
+                    data = json.loads(content)
+                    refs = data.get("references", []) or []
+                    if refs:
+                        page_refs[pnum] = [
+                            {
+                                "identifier": r.get("identifier"),
+                                "confidence": float(r.get("confidence", 0.0)),
+                                "evidence": r.get("evidence", ""),
+                            }
+                            for r in refs
+                            if r.get("identifier")
+                        ]
+                except Exception as e:
+                    print(f"[xref] page {pnum} failed: {e}")
+
+    # compact index to keep memory tiny
+    index_compact = [
+        {k: v for k, v in item.items() if k in ("identifier", "title", "short_description", "definition_pages")}
+        for item in (index or [])
+    ]
+
+    return {"id_list": id_list, "page_refs": page_refs, "index_compact": index_compact}
+
+
+def merge_extra_keywords(signals: list) -> list:
+    """
+    Merge page-local 'signals' with document-level legend identifiers
+    discovered by compute_doc_legend_and_refs_compact(). Keeps size bounded.
+    """
+    import itertools
+    merged = list(signals or [])
+    try:
+        id_list = st.session_state.get("legend_id_list") or []
+        if id_list:
+            merged = list(dict.fromkeys(itertools.chain(merged, id_list)))  # de-dup preserve order
+        if len(merged) > 60:
+            merged = merged[:60]
+    except Exception:
+        pass
+    return merged
+
 
 # --- Main App Flow ---
 st.markdown("<div class='section-header'><h2>📄 Upload Engineering Drawings</h2></div>", unsafe_allow_html=True)
@@ -284,6 +481,23 @@ if st.session_state.run_analysis_triggered and \
         if doc_proc_loop: doc_proc_loop.close()
         print(f"SESSION {current_session_id} ERROR: Failed to open PDF for processing: {e}")
         st.stop() 
+        # --- OPTIONAL: document-level cross analysis (legend + references) ---
+    try:
+        cross = compute_doc_legend_and_refs_compact(
+            st.session_state.original_pdf_bytes,
+            llm_analysis_instance,
+            google_cloud_config=google_cloud_config,
+            max_pages=60,                 # keep budget bounded
+            char_budget_per_page=2400,
+            max_workers=4,
+        )
+        st.session_state.legend_id_list = cross.get("id_list", [])
+        st.session_state.page_refs = cross.get("page_refs", {})
+        st.session_state.legend_index_compact = cross.get("index_compact", [])
+        if st.session_state.legend_id_list:
+            print(f"[CROSS] legend identifiers: {len(st.session_state.legend_id_list)}")
+    except Exception as e:
+        print(f"[CROSS] cross analysis skipped due to error: {e}")
     st.markdown("<hr>", unsafe_allow_html=True); st.markdown("<h2>📊 Analysis Results (Live)</h2>", unsafe_allow_html=True)
     summary_placeholder = st.empty(); col_f, col_nf = st.columns(2)
     with col_f: st.subheader("✅ Fence-Related Pages")
@@ -341,9 +555,9 @@ if st.session_state.run_analysis_triggered and \
                             single_pg_bytes_io.getvalue(),
                             llm_analysis_instance,
                             FENCE_KEYWORDS_APP,
-                            signals,
+                            merge_extra_keywords(signals),         # <— signals + doc-level legend IDs
                             st.session_state.selected_model_for_analysis,
-                            google_cloud_config  # <-- pass it through
+                            google_cloud_config
                         )
 
 
