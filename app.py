@@ -600,37 +600,35 @@ if st.session_state.run_analysis_triggered and \
 
                     if analysis_result.get('fence_text_boxes_details') and highlight_fence_text_app: reasons.append("Highlights")
                     if reasons: exp_title += f" ({' & '.join(reasons)} Match)"
-                with st.expander(exp_title, expanded=False):
+                with st.expander(exp_title, expanded=True):
                     img_col, det_col = st.columns([2,1])
-                    show_preview = st.toggle("Show preview", value=False, key=f"show_{analysis_result['page_number']}")
                     
-                    # Always generate images (uses cache), but only display when toggle is on
+                    # Always generate and display images (uses cache)
                     print(f"SESSION {current_session_id} DEBUG LIVE DISPLAY Page {analysis_result['page_number']}: Num boxes: {len(analysis_result.get('fence_text_boxes_details', []))}")
                     wrapper_call_start_time = time.time()
                     orig_b, hl_b = generate_display_images_for_page_wrapper(analysis_result, current_session_id)
                     wrapper_call_duration = time.time() - wrapper_call_start_time
                     print(f"SESSION {current_session_id} PERF_LOG: generate_display_images_for_page_wrapper Page {curr_pg_num} took {wrapper_call_duration:.4f}s.")
                     
-                    if show_preview and (orig_b or hl_b):
-                        with img_col: # Image display
-                            disp_img_ui = hl_b if hl_b else orig_b
-                            if disp_img_ui: st.image(disp_img_ui, caption=f"Page {analysis_result['page_number']}{' (Highlighted)' if hl_b else ''}")
-                            if hl_b:
-                                st.download_button(
-                                    "Download highlighted JPG",
-                                    data=hl_b,
-                                    file_name=f"page_{analysis_result['page_number']}_hl.jpg",
-                                    mime="image/jpeg",
-                                    key=f"dl_hl_{analysis_result['page_number']}",
-                                )
-                            if orig_b:
-                                st.download_button(
-                                    "Download original JPG",
-                                    data=orig_b,
-                                    file_name=f"page_{analysis_result['page_number']}_orig.jpg",
-                                    mime="image/jpeg",
-                                    key=f"dl_orig_{analysis_result['page_number']}",
-                                )
+                    with img_col: # Image display
+                        disp_img_ui = hl_b if hl_b else orig_b
+                        if disp_img_ui: st.image(disp_img_ui, caption=f"Page {analysis_result['page_number']}{' (Highlighted)' if hl_b else ''}")
+                        if hl_b:
+                            st.download_button(
+                                "Download highlighted JPG",
+                                data=hl_b,
+                                file_name=f"page_{analysis_result['page_number']}_hl.jpg",
+                                mime="image/jpeg",
+                                key=f"dl_hl_{analysis_result['page_number']}",
+                            )
+                        if orig_b:
+                            st.download_button(
+                                "Download original JPG",
+                                data=orig_b,
+                                file_name=f"page_{analysis_result['page_number']}_orig.jpg",
+                                mime="image/jpeg",
+                                key=f"dl_orig_{analysis_result['page_number']}",
+                            )
                     with det_col: # Text details display
                         # ... (Same detailed text display as before)
                         st.markdown("##### Analysis Details")
@@ -737,32 +735,30 @@ elif st.session_state.processing_complete:
                     if reasons_res: exp_title_res += f" ({' & '.join(reasons_res)} Match)"
                 with st.expander(exp_title_res, expanded=False):
                     img_col_r, det_col_r = st.columns([2,1])
-                    show_preview_r = st.toggle("Show preview", value=False, key=f"show_r_{res_data_item['page_number']}")
                     
-                    # Always generate images (uses cache), but only display when toggle is on
+                    # Always generate and display images (uses cache)
                     orig_b_r, hl_b_r = generate_display_images_for_page_wrapper(res_data_item, session_id_for_display)
                     
-                    if show_preview_r and (orig_b_r or hl_b_r):
-                        with img_col_r: # Image display
-                            # ... (Same as live loop image display)
-                            disp_img_r = hl_b_r if hl_b_r else orig_b_r
-                            if disp_img_r: st.image(disp_img_r, caption=f"Page {res_data_item['page_number']}{' (HL)' if hl_b_r else ''}")
-                            if hl_b_r:
-                                st.download_button(
-                                    "Download highlighted JPG",
-                                    data=hl_b_r,
-                                    file_name=f"page_{res_data_item['page_number']}_hl.jpg",
-                                    mime="image/jpeg",
-                                    key=f"dl_hl_r_{res_data_item['page_number']}",
-                                )
-                            if orig_b_r:
-                                st.download_button(
-                                    "Download original JPG",
-                                    data=orig_b_r,
-                                    file_name=f"page_{res_data_item['page_number']}_orig.jpg",
-                                    mime="image/jpeg",
-                                    key=f"dl_orig_r_{res_data_item['page_number']}",
-                                )
+                    with img_col_r: # Image display
+                        # ... (Same as live loop image display)
+                        disp_img_r = hl_b_r if hl_b_r else orig_b_r
+                        if disp_img_r: st.image(disp_img_r, caption=f"Page {res_data_item['page_number']}{' (HL)' if hl_b_r else ''}")
+                        if hl_b_r:
+                            st.download_button(
+                                "Download highlighted JPG",
+                                data=hl_b_r,
+                                file_name=f"page_{res_data_item['page_number']}_hl.jpg",
+                                mime="image/jpeg",
+                                key=f"dl_hl_r_{res_data_item['page_number']}",
+                            )
+                        if orig_b_r:
+                            st.download_button(
+                                "Download original JPG",
+                                data=orig_b_r,
+                                file_name=f"page_{res_data_item['page_number']}_orig.jpg",
+                                mime="image/jpeg",
+                                key=f"dl_orig_r_{res_data_item['page_number']}",
+                            )
                     with det_col_r: # Text details
                         # ... (Same as live loop text details display)
                         st.markdown("##### Analysis Details")
