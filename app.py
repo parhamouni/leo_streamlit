@@ -10,6 +10,8 @@ import time
 import uuid 
 import hashlib # For hashing PDF bytes
 import json
+import traceback
+import sys
 
 try:
     import psutil
@@ -22,6 +24,20 @@ try:
 except ImportError:
     def _rss_mb(): 
         return 0.0
+
+# Setup comprehensive error logging
+def log_exception(session_id, context, exception):
+    """Log detailed exception information"""
+    exc_type, exc_value, exc_traceback = sys.exc_info()
+    tb_str = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    print(f"\n{'='*80}")
+    print(f"SESSION {session_id} FATAL ERROR in {context}")
+    print(f"Exception Type: {type(exception).__name__}")
+    print(f"Exception Message: {str(exception)}")
+    print(f"Memory Usage: {_rss_mb():.1f} MB")
+    print(f"Traceback:\n{tb_str}")
+    print(f"{'='*80}\n")
+    return tb_str
 
 # --- Highlight Appearance & Performance ---
 HIGHLIGHT_COLOR_UI = (0, 0.9, 0)
@@ -513,6 +529,8 @@ if st.session_state.run_analysis_triggered and \
     with col_nf: st.subheader("❌ Non-Fence Pages")
     prog_bar = st.progress(0); status_txt_area = st.empty()
     try:
+        print(f"SESSION {current_session_id} LOG: Starting processing loop for {st.session_state.doc_total_pages} pages")
+        print(f"SESSION {current_session_id} LOG: Initial memory: {_rss_mb():.1f} MB")
         for i in range(st.session_state.doc_total_pages):
             curr_pg_num = i + 1; st.session_state.total_pages_processed_count = curr_pg_num
             prog_bar.progress(curr_pg_num / st.session_state.doc_total_pages)
@@ -568,13 +586,13 @@ if st.session_state.run_analysis_triggered and \
                         except Exception:
                             signals = []
                     except MemoryError as me:
-                        print(f"SESSION {current_session_id} ERROR: Memory error on page {curr_pg_num}: {me}")
-                        st.error(f"Memory error processing page {curr_pg_num}. Skipping OCR analysis.")
+                        tb = log_exception(current_session_id, f"Core Analysis Page {curr_pg_num} (MemoryError)", me)
+                        st.error(f"💥 Memory error processing page {curr_pg_num}. Skipping OCR analysis.")
                         analysis_res_core = {"fence_found": False, "text_found": False}
                         signals = []
                     except Exception as e:
-                        print(f"SESSION {current_session_id} ERROR: Analysis error on page {curr_pg_num}: {e}")
-                        st.warning(f"Analysis error on page {curr_pg_num}: {str(e)[:100]}...")
+                        tb = log_exception(current_session_id, f"Core Analysis Page {curr_pg_num}", e)
+                        st.warning(f"⚠️ Analysis error on page {curr_pg_num}: {str(e)[:100]}...")
                         analysis_res_core = {"fence_found": False, "text_found": False}
                         signals = []
 
@@ -605,12 +623,12 @@ if st.session_state.run_analysis_triggered and \
                             )
                             if boxes: analysis_result['fence_text_boxes_details'] = boxes
                         except MemoryError as me:
-                            print(f"SESSION {current_session_id} ERROR: Memory error in OCR on page {curr_pg_num}: {me}")
-                            st.warning(f"Memory error during OCR on page {curr_pg_num}. Skipping highlights.")
+                            tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num} (MemoryError)", me)
+                            st.warning(f"💥 Memory error during OCR on page {curr_pg_num}. Skipping highlights.")
                             analysis_result['fence_text_boxes_details'] = []
                         except Exception as e:
-                            print(f"SESSION {current_session_id} ERROR: OCR error on page {curr_pg_num}: {e}")
-                            st.warning(f"OCR error on page {curr_pg_num}: {str(e)[:100]}...")
+                            tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num}", e)
+                            st.warning(f"⚠️ OCR error on page {curr_pg_num}: {str(e)[:100]}...")
                             analysis_result['fence_text_boxes_details'] = []
                 except UnrecoverableRateLimitError as urle_hl:
                     msg = f"🛑 API Rate Limit Highlight Pg {curr_pg_num}: {urle_hl}. Halted."; status_txt_area.error(msg); st.error(msg)
@@ -635,9 +653,14 @@ if st.session_state.run_analysis_triggered and \
                     # Always generate and display images (uses cache)
                     print(f"SESSION {current_session_id} DEBUG LIVE DISPLAY Page {analysis_result['page_number']}: Num boxes: {len(analysis_result.get('fence_text_boxes_details', []))}")
                     wrapper_call_start_time = time.time()
-                    orig_b, hl_b = generate_display_images_for_page_wrapper(analysis_result, current_session_id)
-                    wrapper_call_duration = time.time() - wrapper_call_start_time
-                    print(f"SESSION {current_session_id} PERF_LOG: generate_display_images_for_page_wrapper Page {curr_pg_num} took {wrapper_call_duration:.4f}s.")
+                    try:
+                        orig_b, hl_b = generate_display_images_for_page_wrapper(analysis_result, current_session_id)
+                        wrapper_call_duration = time.time() - wrapper_call_start_time
+                        print(f"SESSION {current_session_id} PERF_LOG: generate_display_images_for_page_wrapper Page {curr_pg_num} took {wrapper_call_duration:.4f}s.")
+                    except Exception as img_err:
+                        log_exception(current_session_id, f"Image Generation Page {curr_pg_num}", img_err)
+                        st.warning(f"⚠️ Could not generate images for page {curr_pg_num}")
+                        orig_b, hl_b = None, None
                     
                     with img_col: # Image display
                         disp_img_ui = hl_b if hl_b else orig_b
@@ -695,12 +718,20 @@ if st.session_state.run_analysis_triggered and \
                     del temp_doc_single
             except:
                 pass
-            time.sleep(0.05) 
+            time.sleep(0.05)
+    except Exception as fatal_error:
+        # Catch any unhandled exceptions in the main loop
+        tb = log_exception(current_session_id, f"FATAL ERROR in main processing loop at page {st.session_state.total_pages_processed_count}", fatal_error)
+        st.error(f"🔥 Fatal error during processing: {str(fatal_error)[:200]}")
+        with st.expander("⚠️ Click to see full error details", expanded=False):
+            st.code(tb, language="python")
+        st.session_state.analysis_halted_due_to_error = True
     finally: 
         if doc_proc_loop:
             doc_proc_loop.close()
             print(f"SESSION {current_session_id} LOG: Closed main processing PDF document in finally block.")
-        doc_proc_loop = None 
+        doc_proc_loop = None
+        print(f"SESSION {current_session_id} LOG: Processing loop ended. Final memory: {_rss_mb():.1f} MB") 
     st.session_state.processing_complete = True 
     if not st.session_state.analysis_halted_due_to_error:
         prog_bar.empty(); status_txt_area.success("All pages processed!")
