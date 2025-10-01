@@ -648,46 +648,14 @@ if st.session_state.run_analysis_triggered and \
 
                     if analysis_result.get('fence_text_boxes_details') and highlight_fence_text_app: reasons.append("Highlights")
                     if reasons: exp_title += f" ({' & '.join(reasons)} Match)"
-                # Only expand the most recent 3 pages to save memory
-                is_recent = (st.session_state.total_pages_processed_count - analysis_result['page_number']) < 3
-                with st.expander(exp_title, expanded=is_recent):
+                # Don't expand any pages during live processing to save maximum memory
+                with st.expander(exp_title, expanded=False):
                     img_col, det_col = st.columns([2,1])
                     
-                    # Only generate images for expanded pages to save memory
-                    if is_recent:
-                        print(f"SESSION {current_session_id} DEBUG LIVE DISPLAY Page {analysis_result['page_number']}: Num boxes: {len(analysis_result.get('fence_text_boxes_details', []))}")
-                        wrapper_call_start_time = time.time()
-                        try:
-                            orig_b, hl_b = generate_display_images_for_page_wrapper(analysis_result, current_session_id)
-                            wrapper_call_duration = time.time() - wrapper_call_start_time
-                            print(f"SESSION {current_session_id} PERF_LOG: generate_display_images_for_page_wrapper Page {curr_pg_num} took {wrapper_call_duration:.4f}s.")
-                        except Exception as img_err:
-                            log_exception(current_session_id, f"Image Generation Page {curr_pg_num}", img_err)
-                            st.warning(f"⚠️ Could not generate images for page {curr_pg_num}")
-                            orig_b, hl_b = None, None
-                        
-                        with img_col: # Image display
-                            disp_img_ui = hl_b if hl_b else orig_b
-                            if disp_img_ui: st.image(disp_img_ui, caption=f"Page {analysis_result['page_number']}{' (Highlighted)' if hl_b else ''}")
-                            if hl_b:
-                                st.download_button(
-                                    "Download highlighted JPG",
-                                    data=hl_b,
-                                    file_name=f"page_{analysis_result['page_number']}_hl.jpg",
-                                    mime="image/jpeg",
-                                    key=f"dl_hl_{analysis_result['page_number']}",
-                                )
-                            if orig_b:
-                                st.download_button(
-                                    "Download original JPG",
-                                    data=orig_b,
-                                    file_name=f"page_{analysis_result['page_number']}_orig.jpg",
-                                    mime="image/jpeg",
-                                    key=f"dl_orig_{analysis_result['page_number']}",
-                                )
-                    else:
-                        with img_col:
-                            st.info("💡 Expand to view image preview")
+                    # Don't generate images during live processing - too memory intensive
+                    # Images will be available after processing completes
+                    with img_col:
+                        st.info("🚀 Processing... Images will be available after completion")
                     with det_col: # Text details display
                         # ... (Same detailed text display as before)
                         st.markdown("##### Analysis Details")
