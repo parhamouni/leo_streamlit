@@ -414,19 +414,12 @@ def compute_doc_legend_and_refs_compact(
 
 def merge_extra_keywords(signals: list) -> list:
     """
-    Merge page-local 'signals' with document-level legend identifiers
-    discovered by compute_doc_legend_and_refs_compact(). Keeps size bounded.
+    Return page-local signals only (cross-reference analysis disabled for memory optimization).
     """
-    import itertools
     merged = list(signals or [])
-    try:
-        id_list = st.session_state.get("legend_id_list") or []
-        if id_list:
-            merged = list(dict.fromkeys(itertools.chain(merged, id_list)))  # de-dup preserve order
-        if len(merged) > 60:
-            merged = merged[:60]
-    except Exception:
-        pass
+    # Limit size to prevent memory issues
+    if len(merged) > 30:
+        merged = merged[:30]
     return merged
 
 
@@ -503,23 +496,12 @@ if st.session_state.run_analysis_triggered and \
         if doc_proc_loop: doc_proc_loop.close()
         print(f"SESSION {current_session_id} ERROR: Failed to open PDF for processing: {e}")
         st.stop() 
-        # --- OPTIONAL: document-level cross analysis (legend + references) ---
-    try:
-        cross = compute_doc_legend_and_refs_compact(
-            st.session_state.original_pdf_bytes,
-            llm_analysis_instance,
-            google_cloud_config=google_cloud_config,
-            max_pages=60,                 # keep budget bounded
-            char_budget_per_page=2400,
-            max_workers=4,
-        )
-        st.session_state.legend_id_list = cross.get("id_list", [])
-        st.session_state.page_refs = cross.get("page_refs", {})
-        st.session_state.legend_index_compact = cross.get("index_compact", [])
-        if st.session_state.legend_id_list:
-            print(f"[CROSS] legend identifiers: {len(st.session_state.legend_id_list)}")
-    except Exception as e:
-        print(f"[CROSS] cross analysis skipped due to error: {e}")
+        # --- Cross-reference analysis disabled to save memory ---
+    # Skip cross-reference analysis entirely to prevent memory crashes
+    st.session_state.legend_id_list = []
+    st.session_state.page_refs = {}
+    st.session_state.legend_index_compact = []
+    print(f"[CROSS] Cross-reference analysis disabled for memory optimization. RAM: {_rss_mb():.1f} MB")
     st.markdown("<hr>", unsafe_allow_html=True); st.markdown("<h2>📊 Analysis Results (Live)</h2>", unsafe_allow_html=True)
     summary_placeholder = st.empty(); col_f, col_nf = st.columns(2)
     with col_f: st.subheader("✅ Fence-Related Pages")
@@ -530,7 +512,24 @@ if st.session_state.run_analysis_triggered and \
             curr_pg_num = i + 1; st.session_state.total_pages_processed_count = curr_pg_num
             prog_bar.progress(curr_pg_num / st.session_state.doc_total_pages)
             status_txt_area.text(f"Processing Page {curr_pg_num}/{st.session_state.doc_total_pages}...")
-            print(f"SESSION {current_session_id} LOG: Processing page {curr_pg_num}.")
+            print(f"SESSION {current_session_id} LOG: Processing page {curr_pg_num}. RAM: {_rss_mb():.1f} MB")
+            
+            # Memory cleanup between pages
+            if i > 0 and i % 5 == 0:  # Every 5 pages
+                import gc
+                gc.collect()
+                st.cache_data.clear()  # Clear cache periodically
+                print(f"SESSION {current_session_id} LOG: Memory cleanup at page {curr_pg_num}. RAM: {_rss_mb():.1f} MB")
+            
+            # Check memory usage and halt if too high
+            current_memory = _rss_mb()
+            if current_memory > 1200:  # Halt if RAM usage exceeds 1.2GB
+                error_msg = f"Memory usage too high ({current_memory:.1f} MB). Stopping analysis to prevent crash."
+                st.error(error_msg)
+                status_txt_area.error(error_msg)
+                st.session_state.analysis_halted_due_to_error = True
+                print(f"SESSION {current_session_id} ERROR: {error_msg}")
+                break
             page_obj = doc_proc_loop.load_page(i); text_content = page_obj.get_text("text")
             
             # Create single-page PDF bytes for comprehensive text extraction
@@ -660,6 +659,16 @@ if st.session_state.run_analysis_triggered and \
                                 if display_text_live not in disp_set_live: st.markdown(display_text_live); disp_set_live.add(display_text_live); count_live+=1
                                 if count_live >=15 and len(details_list) > 17: st.markdown(f"- ...& {len(details_list)-count_live} more."); break
             summary_placeholder.markdown(f"### Summary (Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages})\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}")
+            
+            # Memory cleanup after each page
+            try:
+                del page_obj, text_content, single_page_pdf_bytes
+                if 'single_pg_bytes_io' in locals():
+                    del single_pg_bytes_io
+                if 'temp_doc_single' in locals():
+                    del temp_doc_single
+            except:
+                pass
             time.sleep(0.05) 
     finally: 
         if doc_proc_loop:
