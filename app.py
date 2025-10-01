@@ -11,12 +11,19 @@ import uuid
 import hashlib # For hashing PDF bytes
 import json
 
+try:
+    import psutil, os
+    def _rss_mb():
+        return psutil.Process(os.getpid()).memory_info().rss / (1024**2)
+except Exception:
+    def _rss_mb(): return 0.0
+
 # --- Highlight Appearance & Performance ---
 HIGHLIGHT_COLOR_UI = (0, 0.9, 0)
-HIGHLIGHT_WIDTH_UI = 2.0
+HIGHLIGHT_WIDTH_UI = 1.5
 HIGHLIGHT_COLOR_PDF = (0, 0.9, 0)
-HIGHLIGHT_WIDTH_PDF = 2.0
-DISPLAY_IMAGE_DPI = 96  
+HIGHLIGHT_WIDTH_PDF = 1.5
+DISPLAY_IMAGE_DPI = 72  
 
 st.set_page_config(page_title="Fence Detector", layout="wide")
 st.markdown("""<style> /* Your CSS */ </style>""", unsafe_allow_html=True) 
@@ -100,6 +107,9 @@ with st.sidebar:
         st.session_state.fence_keywords_app = [k.strip().lower() for k in custom_keywords_str.split("\n") if k.strip()]
         st.rerun()
     FENCE_KEYWORDS_APP = st.session_state.fence_keywords_app
+    
+    # Memory monitoring
+    st.caption(f"RAM: {_rss_mb():.1f} MB")
 
 
 llm_analysis_instance = None
@@ -130,7 +140,7 @@ def get_image_download_link_html(img_bytes, filename, text):
     return f'<a href="data:{mime};base64,{b64}" download="{filename}" class="download-button">{text}</a>'
 
 @time_it
-@st.cache_data(ttl=900, show_spinner=False, max_entries=60)  # 15 min, at most 60 entries
+@st.cache_data(ttl=180, show_spinner=False, max_entries=18)  # 3 min, ~18 pages cached
 def _generate_display_images_for_page_cached(page_idx,
                                             pdf_hash_for_cache_key,
                                             fence_text_boxes_details_tuple,
@@ -176,12 +186,9 @@ def _generate_display_images_for_page_cached(page_idx,
 
     t0 = time.time()
     try:
-        # Render original preview (JPEG @ display_dpi)
-        with fitz.open(stream=io.BytesIO(current_pdf_bytes), filetype="pdf") as doc_orig:
-            page_orig = doc_orig.load_page(page_idx)
-            pix_orig = page_orig.get_pixmap(dpi=display_dpi)
-            original_image_bytes = pix_orig.tobytes("jpg", jpg_quality=70)
-            del pix_orig
+        # Render original preview is disabled by default to reduce memory
+        # If you want it as an option, render on demand in the UI instead.
+        # (Keep original_image_bytes=None)
 
         # Render highlighted preview only if we actually have rects
         if rects:
@@ -194,8 +201,8 @@ def _generate_display_images_for_page_cached(page_idx,
                     fr.normalize()
                     if not fr.is_empty and fr.is_valid:
                         page_hl.draw_rect(fr, color=ui_color, width=ui_width, overlay=True)
-                pix_hl = page_hl.get_pixmap(dpi=display_dpi)
-                highlighted_image_bytes = pix_hl.tobytes("jpg", jpg_quality=70)
+                pix_hl = page_hl.get_pixmap(dpi=display_dpi, alpha=False)
+                highlighted_image_bytes = pix_hl.tobytes("jpg", jpg_quality=58)
                 del pix_hl
 
     except Exception as e:
@@ -433,22 +440,37 @@ if uploaded_pdf_file_obj:
     
     if st.session_state.last_uploaded_file_id != current_file_id:
         print(f"SESSION {current_session_id} LOG: New file detected. Resetting state for {current_file_id}.")
-        # Preserve some settings across resets
-        current_selected_model = st.session_state.selected_model_for_analysis
-        current_keywords = st.session_state.fence_keywords_app
-        
-        initialize_session_state(current_session_id) # Reset to defaults
-        
-        st.session_state.selected_model_for_analysis = current_selected_model # Restore
-        st.session_state.fence_keywords_app = current_keywords # Restore
+        # Preserve user preferences
+        current_selected_model = st.session_state.get('selected_model_for_analysis', "gpt-4o")
+        current_keywords = st.session_state.get('fence_keywords_app', ['fence'])
 
+        # Hard reset memory-heavy state
+        st.session_state.update({
+            'fence_pages': [],
+            'non_fence_pages': [],
+            'total_pages_processed_count': 0,
+            'doc_total_pages': 0,
+            'processing_complete': False,
+            'analysis_halted_due_to_error': False,
+            'legend_id_list': [],
+            'page_refs': {},
+            'legend_index_compact': [],
+            'highlighted_pdf_bytes_for_download': None,
+            'highlighted_pdf_filename_for_download': None,
+            'run_analysis_triggered': False,
+        })
+
+        # Store new file bytes & hash
         st.session_state.uploaded_pdf_name = uploaded_pdf_file_obj.name
         st.session_state.original_pdf_bytes = uploaded_pdf_file_obj.getvalue()
-        # Generate and store hash of the current PDF
         st.session_state.current_pdf_hash = hashlib.sha256(st.session_state.original_pdf_bytes).hexdigest()
         st.session_state.last_uploaded_file_id = current_file_id
-        
-        st.cache_data.clear() 
+
+        # Restore user prefs
+        st.session_state.selected_model_for_analysis = current_selected_model
+        st.session_state.fence_keywords_app = current_keywords
+
+        st.cache_data.clear()
         print(f"SESSION {current_session_id} LOG: Cleared all @st.cache_data caches due to new file.")
         st.rerun() 
 
@@ -579,21 +601,38 @@ if st.session_state.run_analysis_triggered and \
 
                     if analysis_result.get('fence_text_boxes_details') and highlight_fence_text_app: reasons.append("Highlights")
                     if reasons: exp_title += f" ({' & '.join(reasons)} Match)"
-                with st.expander(exp_title, expanded=True):
+                with st.expander(exp_title, expanded=False):
                     img_col, det_col = st.columns([2,1])
-                    print(f"SESSION {current_session_id} DEBUG LIVE DISPLAY Page {analysis_result['page_number']}: Num boxes: {len(analysis_result.get('fence_text_boxes_details', []))}")
-                    wrapper_call_start_time = time.time()
-                    with st.spinner(f"Rendering image for page {analysis_result['page_number']}..."): 
-                        orig_b, hl_b = generate_display_images_for_page_wrapper(analysis_result, current_session_id) # Pass session_id
-                    wrapper_call_duration = time.time() - wrapper_call_start_time
-                    print(f"SESSION {current_session_id} PERF_LOG: generate_display_images_for_page_wrapper Page {curr_pg_num} took {wrapper_call_duration:.4f}s.")
-                    with img_col: # Image display
-                        disp_img_ui = hl_b if hl_b else orig_b
-                        if disp_img_ui: st.image(disp_img_ui, caption=f"Page {analysis_result['page_number']}{' (Highlighted)' if hl_b else ''}")
-                        dl_links_html_live = []
-                        if hl_b: dl_links_html_live.append(get_image_download_link_html(hl_b, f"page_{analysis_result['page_number']}_hl.png", "DL HL Img"))
-                        if orig_b: dl_links_html_live.append(get_image_download_link_html(orig_b, f"page_{analysis_result['page_number']}_orig.png", "DL Orig Img"))
-                        if dl_links_html_live: st.markdown(" ".join(dl_links_html_live), unsafe_allow_html=True)
+                    show_preview = st.toggle("Show preview", value=False, key=f"show_{analysis_result['page_number']}")
+                    orig_b, hl_b = None, None
+                    if show_preview:
+                        print(f"SESSION {current_session_id} DEBUG LIVE DISPLAY Page {analysis_result['page_number']}: Num boxes: {len(analysis_result.get('fence_text_boxes_details', []))}")
+                        wrapper_call_start_time = time.time()
+                        with st.spinner(f"Rendering image for page {analysis_result['page_number']}..."):
+                            orig_b, hl_b = generate_display_images_for_page_wrapper(analysis_result, current_session_id)
+                        wrapper_call_duration = time.time() - wrapper_call_start_time
+                        print(f"SESSION {current_session_id} PERF_LOG: generate_display_images_for_page_wrapper Page {curr_pg_num} took {wrapper_call_duration:.4f}s.")
+                    
+                    if show_preview and (orig_b or hl_b):
+                        with img_col: # Image display
+                            disp_img_ui = hl_b if hl_b else orig_b
+                            if disp_img_ui: st.image(disp_img_ui, caption=f"Page {analysis_result['page_number']}{' (Highlighted)' if hl_b else ''}")
+                            if hl_b:
+                                st.download_button(
+                                    "Download highlighted JPG",
+                                    data=hl_b,
+                                    file_name=f"page_{analysis_result['page_number']}_hl.jpg",
+                                    mime="image/jpeg",
+                                    key=f"dl_hl_{analysis_result['page_number']}",
+                                )
+                            if orig_b:
+                                st.download_button(
+                                    "Download original JPG",
+                                    data=orig_b,
+                                    file_name=f"page_{analysis_result['page_number']}_orig.jpg",
+                                    mime="image/jpeg",
+                                    key=f"dl_orig_{analysis_result['page_number']}",
+                                )
                     with det_col: # Text details display
                         # ... (Same detailed text display as before)
                         st.markdown("##### Analysis Details")
@@ -631,22 +670,49 @@ if st.session_state.run_analysis_triggered and \
     if not st.session_state.analysis_halted_due_to_error:
         prog_bar.empty(); status_txt_area.success("All pages processed!")
         if st.session_state.fence_pages and st.session_state.original_pdf_bytes:
-            pdf_b, pdf_n = generate_combined_highlighted_pdf(st.session_state.original_pdf_bytes, st.session_state.fence_pages, st.session_state.uploaded_pdf_name, current_session_id)
-            if pdf_b: st.session_state.highlighted_pdf_bytes_for_download, st.session_state.highlighted_pdf_filename_for_download = pdf_b, pdf_n
-            else: st.warning(f"Could not generate PDF: {pdf_n}")
+            pdf_b, pdf_n = generate_combined_highlighted_pdf(
+                st.session_state.original_pdf_bytes,
+                st.session_state.fence_pages,
+                st.session_state.uploaded_pdf_name,
+                current_session_id
+            )
+            if pdf_b:
+                # cache by hash to avoid keeping duplicate big blobs in session
+                @st.cache_data
+                def _store_combined_pdf(pdf_hash, pdf_bytes, pdf_name):
+                    return pdf_bytes, pdf_name
+                st.session_state.combined_pdf_ref = _store_combined_pdf(
+                    st.session_state.current_pdf_hash, pdf_b, pdf_n
+                )
+            else:
+                st.warning(f"Could not generate PDF: {pdf_n}")
     else: prog_bar.empty() 
     final_summary_text = f"### Final Summary ({'Halted' if st.session_state.analysis_halted_due_to_error else 'Completed'})\n- Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages}\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}"
     summary_placeholder.markdown(final_summary_text)
-    if st.session_state.get('highlighted_pdf_bytes_for_download') and not st.session_state.analysis_halted_due_to_error:
-        st.download_button("⬇️ Download Highlighted Fence Pages (PDF)", st.session_state.highlighted_pdf_bytes_for_download, st.session_state.highlighted_pdf_filename_for_download, "application/pdf", key="dl_combined_pdf_main")
+    if st.session_state.get('combined_pdf_ref') and not st.session_state.analysis_halted_due_to_error:
+        data, fname = st.session_state.combined_pdf_ref
+        st.download_button(
+            "⬇️ Download Highlighted Fence Pages (PDF)",
+            data,
+            fname,
+            "application/pdf",
+            key="dl_combined_pdf_main"
+        )
 
 elif st.session_state.processing_complete: 
     print(f"SESSION {current_session_id} LOG: Displaying previously processed results (rerun).")
     st.markdown("<hr>", unsafe_allow_html=True); st.markdown("<h2>📊 Analysis Results</h2>", unsafe_allow_html=True)
     final_summary_text_rerun = f"### Final Summary ({'Halted Previously' if st.session_state.analysis_halted_due_to_error else 'Completed'})\n- Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages}\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}"
     st.markdown(final_summary_text_rerun)
-    if st.session_state.get('highlighted_pdf_bytes_for_download') and not st.session_state.analysis_halted_due_to_error:
-         st.download_button("⬇️ Download Highlighted Fence Pages (PDF)", st.session_state.highlighted_pdf_bytes_for_download, st.session_state.highlighted_pdf_filename_for_download, "application/pdf", key="dl_combined_pdf_rerun")
+    if st.session_state.get('combined_pdf_ref') and not st.session_state.analysis_halted_due_to_error:
+        data, fname = st.session_state.combined_pdf_ref
+        st.download_button(
+            "⬇️ Download Highlighted Fence Pages (PDF)",
+            data,
+            fname,
+            "application/pdf",
+            key="dl_combined_pdf_rerun"
+        )
     col_f_res, col_nf_res = st.columns(2)
     with col_f_res: st.subheader(f"✅ Fence-Related Pages ({len(st.session_state.fence_pages)})")
     with col_nf_res: st.subheader(f"❌ Non-Fence Pages ({len(st.session_state.non_fence_pages)})")
@@ -663,16 +729,33 @@ elif st.session_state.processing_complete:
                     if reasons_res: exp_title_res += f" ({' & '.join(reasons_res)} Match)"
                 with st.expander(exp_title_res, expanded=False):
                     img_col_r, det_col_r = st.columns([2,1])
-                    with st.spinner(f"Loading image page {res_data_item['page_number']}..."):
-                        orig_b_r, hl_b_r = generate_display_images_for_page_wrapper(res_data_item, session_id_for_display) # Pass session_id
-                    with img_col_r: # Image display
-                        # ... (Same as live loop image display)
-                        disp_img_r = hl_b_r if hl_b_r else orig_b_r
-                        if disp_img_r: st.image(disp_img_r, caption=f"Page {res_data_item['page_number']}{' (HL)' if hl_b_r else ''}")
-                        dl_links_html_rerun = []
-                        if hl_b_r: dl_links_html_rerun.append(get_image_download_link_html(hl_b_r, f"page_{res_data_item['page_number']}_hl.png", "DL HL Img"))
-                        if orig_b_r: dl_links_html_rerun.append(get_image_download_link_html(orig_b_r, f"page_{res_data_item['page_number']}_orig.png", "DL Orig Img"))
-                        if dl_links_html_rerun: st.markdown(" ".join(dl_links_html_rerun), unsafe_allow_html=True)
+                    show_preview_r = st.toggle("Show preview", value=False, key=f"show_r_{res_data_item['page_number']}")
+                    orig_b_r, hl_b_r = None, None
+                    if show_preview_r:
+                        with st.spinner(f"Loading image page {res_data_item['page_number']}..."):
+                            orig_b_r, hl_b_r = generate_display_images_for_page_wrapper(res_data_item, session_id_for_display)
+                    
+                    if show_preview_r and (orig_b_r or hl_b_r):
+                        with img_col_r: # Image display
+                            # ... (Same as live loop image display)
+                            disp_img_r = hl_b_r if hl_b_r else orig_b_r
+                            if disp_img_r: st.image(disp_img_r, caption=f"Page {res_data_item['page_number']}{' (HL)' if hl_b_r else ''}")
+                            if hl_b_r:
+                                st.download_button(
+                                    "Download highlighted JPG",
+                                    data=hl_b_r,
+                                    file_name=f"page_{res_data_item['page_number']}_hl.jpg",
+                                    mime="image/jpeg",
+                                    key=f"dl_hl_r_{res_data_item['page_number']}",
+                                )
+                            if orig_b_r:
+                                st.download_button(
+                                    "Download original JPG",
+                                    data=orig_b_r,
+                                    file_name=f"page_{res_data_item['page_number']}_orig.jpg",
+                                    mime="image/jpeg",
+                                    key=f"dl_orig_r_{res_data_item['page_number']}",
+                                )
                     with det_col_r: # Text details
                         # ... (Same as live loop text details display)
                         st.markdown("##### Analysis Details")
