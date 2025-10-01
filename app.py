@@ -543,8 +543,8 @@ if st.session_state.run_analysis_triggered and \
                 memory_usage += sum(sys.getsizeof(v) for v in st.session_state.values() if hasattr(v, '__len__')) / (1024**2)
             print(f"SESSION {current_session_id} LOG: Processing page {curr_pg_num}. RAM: {memory_usage:.1f} MB")
             
-            # Memory cleanup between pages
-            if i > 0 and i % 5 == 0:  # Every 5 pages
+            # Memory cleanup between pages (aggressive for Streamlit Cloud)
+            if i > 0 and i % 3 == 0:  # Every 3 pages
                 import gc
                 gc.collect()
                 st.cache_data.clear()  # Clear cache periodically
@@ -552,9 +552,10 @@ if st.session_state.run_analysis_triggered and \
             
             # Check memory usage and halt if too high
             current_memory = _rss_mb()
-            if current_memory > 1200:  # Halt if RAM usage exceeds 1.2GB
-                error_msg = f"Memory usage too high ({current_memory:.1f} MB). Stopping analysis to prevent crash."
+            if current_memory > 900:  # Halt if RAM usage exceeds 900MB (for Streamlit Cloud)
+                error_msg = f"⚠️ Memory usage too high ({current_memory:.1f} MB). Stopping analysis to prevent crash."
                 st.error(error_msg)
+                st.warning("💡 Tip: You can download the partial results below and resume processing later.")
                 status_txt_area.error(error_msg)
                 st.session_state.analysis_halted_due_to_error = True
                 print(f"SESSION {current_session_id} ERROR: {error_msg}")
@@ -647,7 +648,9 @@ if st.session_state.run_analysis_triggered and \
 
                     if analysis_result.get('fence_text_boxes_details') and highlight_fence_text_app: reasons.append("Highlights")
                     if reasons: exp_title += f" ({' & '.join(reasons)} Match)"
-                with st.expander(exp_title, expanded=True):
+                # Only expand the most recent 3 pages to save memory
+                is_recent = (st.session_state.total_pages_processed_count - analysis_result['page_number']) < 3
+                with st.expander(exp_title, expanded=is_recent):
                     img_col, det_col = st.columns([2,1])
                     
                     # Always generate and display images (uses cache)
