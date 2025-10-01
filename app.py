@@ -603,14 +603,13 @@ if st.session_state.run_analysis_triggered and \
                 with st.expander(exp_title, expanded=False):
                     img_col, det_col = st.columns([2,1])
                     show_preview = st.toggle("Show preview", value=False, key=f"show_{analysis_result['page_number']}")
-                    orig_b, hl_b = None, None
-                    if show_preview:
-                        print(f"SESSION {current_session_id} DEBUG LIVE DISPLAY Page {analysis_result['page_number']}: Num boxes: {len(analysis_result.get('fence_text_boxes_details', []))}")
-                        wrapper_call_start_time = time.time()
-                        with st.spinner(f"Rendering image for page {analysis_result['page_number']}..."):
-                            orig_b, hl_b = generate_display_images_for_page_wrapper(analysis_result, current_session_id)
-                        wrapper_call_duration = time.time() - wrapper_call_start_time
-                        print(f"SESSION {current_session_id} PERF_LOG: generate_display_images_for_page_wrapper Page {curr_pg_num} took {wrapper_call_duration:.4f}s.")
+                    
+                    # Always generate images (uses cache), but only display when toggle is on
+                    print(f"SESSION {current_session_id} DEBUG LIVE DISPLAY Page {analysis_result['page_number']}: Num boxes: {len(analysis_result.get('fence_text_boxes_details', []))}")
+                    wrapper_call_start_time = time.time()
+                    orig_b, hl_b = generate_display_images_for_page_wrapper(analysis_result, current_session_id)
+                    wrapper_call_duration = time.time() - wrapper_call_start_time
+                    print(f"SESSION {current_session_id} PERF_LOG: generate_display_images_for_page_wrapper Page {curr_pg_num} took {wrapper_call_duration:.4f}s.")
                     
                     if show_preview and (orig_b or hl_b):
                         with img_col: # Image display
@@ -739,10 +738,9 @@ elif st.session_state.processing_complete:
                 with st.expander(exp_title_res, expanded=False):
                     img_col_r, det_col_r = st.columns([2,1])
                     show_preview_r = st.toggle("Show preview", value=False, key=f"show_r_{res_data_item['page_number']}")
-                    orig_b_r, hl_b_r = None, None
-                    if show_preview_r:
-                        with st.spinner(f"Loading image page {res_data_item['page_number']}..."):
-                            orig_b_r, hl_b_r = generate_display_images_for_page_wrapper(res_data_item, session_id_for_display)
+                    
+                    # Always generate images (uses cache), but only display when toggle is on
+                    orig_b_r, hl_b_r = generate_display_images_for_page_wrapper(res_data_item, session_id_for_display)
                     
                     if show_preview_r and (orig_b_r or hl_b_r):
                         with img_col_r: # Image display
