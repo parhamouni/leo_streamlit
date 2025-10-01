@@ -12,11 +12,16 @@ import hashlib # For hashing PDF bytes
 import json
 
 try:
-    import psutil, os
+    import psutil
+    import os
     def _rss_mb():
-        return psutil.Process(os.getpid()).memory_info().rss / (1024**2)
-except Exception:
-    def _rss_mb(): return 0.0
+        try:
+            return psutil.Process(os.getpid()).memory_info().rss / (1024**2)
+        except:
+            return 0.0
+except ImportError:
+    def _rss_mb(): 
+        return 0.0
 
 # --- Highlight Appearance & Performance ---
 HIGHLIGHT_COLOR_UI = (0, 0.9, 0)
@@ -512,7 +517,13 @@ if st.session_state.run_analysis_triggered and \
             curr_pg_num = i + 1; st.session_state.total_pages_processed_count = curr_pg_num
             prog_bar.progress(curr_pg_num / st.session_state.doc_total_pages)
             status_txt_area.text(f"Processing Page {curr_pg_num}/{st.session_state.doc_total_pages}...")
-            print(f"SESSION {current_session_id} LOG: Processing page {curr_pg_num}. RAM: {_rss_mb():.1f} MB")
+            memory_usage = _rss_mb()
+            if memory_usage == 0.0:
+                # Fallback memory monitoring if psutil fails
+                import sys
+                memory_usage = sys.getsizeof(st.session_state) / (1024**2)
+                memory_usage += sum(sys.getsizeof(v) for v in st.session_state.values() if hasattr(v, '__len__')) / (1024**2)
+            print(f"SESSION {current_session_id} LOG: Processing page {curr_pg_num}. RAM: {memory_usage:.1f} MB")
             
             # Memory cleanup between pages
             if i > 0 and i % 5 == 0:  # Every 5 pages
@@ -546,15 +557,26 @@ if st.session_state.run_analysis_triggered and \
             analysis_res_core = {}; fatal_err_page = False
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
-                    analysis_res_core = analyze_page(
-                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
-                        recall_mode="strict"   # or "balanced"/"high"
-                    )
                     try:
-                        jr = json.loads(analysis_res_core["text_response"])
-                        signals = jr.get("signals", [])
-                    except Exception:
-                        pass
+                        analysis_res_core = analyze_page(
+                            page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
+                            recall_mode="strict"   # or "balanced"/"high"
+                        )
+                        try:
+                            jr = json.loads(analysis_res_core["text_response"])
+                            signals = jr.get("signals", [])
+                        except Exception:
+                            signals = []
+                    except MemoryError as me:
+                        print(f"SESSION {current_session_id} ERROR: Memory error on page {curr_pg_num}: {me}")
+                        st.error(f"Memory error processing page {curr_pg_num}. Skipping OCR analysis.")
+                        analysis_res_core = {"fence_found": False, "text_found": False}
+                        signals = []
+                    except Exception as e:
+                        print(f"SESSION {current_session_id} ERROR: Analysis error on page {curr_pg_num}: {e}")
+                        st.warning(f"Analysis error on page {curr_pg_num}: {str(e)[:100]}...")
+                        analysis_res_core = {"fence_found": False, "text_found": False}
+                        signals = []
 
 
             except UnrecoverableRateLimitError as urle:
@@ -572,17 +594,24 @@ if st.session_state.run_analysis_triggered and \
                     if temp_doc_single: temp_doc_single.close()
                 try:
                     with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):   
-                        boxes,_,_ = get_fence_related_text_boxes(
-                            single_pg_bytes_io.getvalue(),
-                            llm_analysis_instance,
-                            FENCE_KEYWORDS_APP,
-                            merge_extra_keywords(signals),         # <— signals + doc-level legend IDs
-                            st.session_state.selected_model_for_analysis,
-                            google_cloud_config
-                        )
-
-
-                        if boxes: analysis_result['fence_text_boxes_details'] = boxes
+                        try:
+                            boxes,_,_ = get_fence_related_text_boxes(
+                                single_pg_bytes_io.getvalue(),
+                                llm_analysis_instance,
+                                FENCE_KEYWORDS_APP,
+                                merge_extra_keywords(signals),         # <— signals + doc-level legend IDs
+                                st.session_state.selected_model_for_analysis,
+                                google_cloud_config
+                            )
+                            if boxes: analysis_result['fence_text_boxes_details'] = boxes
+                        except MemoryError as me:
+                            print(f"SESSION {current_session_id} ERROR: Memory error in OCR on page {curr_pg_num}: {me}")
+                            st.warning(f"Memory error during OCR on page {curr_pg_num}. Skipping highlights.")
+                            analysis_result['fence_text_boxes_details'] = []
+                        except Exception as e:
+                            print(f"SESSION {current_session_id} ERROR: OCR error on page {curr_pg_num}: {e}")
+                            st.warning(f"OCR error on page {curr_pg_num}: {str(e)[:100]}...")
+                            analysis_result['fence_text_boxes_details'] = []
                 except UnrecoverableRateLimitError as urle_hl:
                     msg = f"🛑 API Rate Limit Highlight Pg {curr_pg_num}: {urle_hl}. Halted."; status_txt_area.error(msg); st.error(msg)
                     st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; print(f"SESSION {current_session_id} ERROR: {msg}"); break
