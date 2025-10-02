@@ -662,31 +662,29 @@ if st.session_state.run_analysis_triggered and \
                     try:
                         with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):
                             mem_before_ocr = _rss_mb()
-                            try:
-                                boxes,_,_ = get_fence_related_text_boxes(
-                                    single_pg_bytes_io.getvalue(),
-                                    llm_analysis_instance,
-                                    FENCE_KEYWORDS_APP,
-                                    merge_extra_keywords(signals),         # <— signals + doc-level legend IDs
-                                    st.session_state.selected_model_for_analysis,
-                                    google_cloud_config
-                                )
-                                mem_after_ocr = _rss_mb()
-                                if mem_after_ocr - mem_before_ocr > 10:
-                                    print(f"🔍 MEMORY: get_fence_related_text_boxes() +{mem_after_ocr - mem_before_ocr:.1f}MB (boxes={len(boxes) if boxes else 0})")
-                                if boxes: analysis_result['fence_text_boxes_details'] = boxes
-                        except MemoryError as me:
-                            tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num} (MemoryError)", me)
-                            st.warning(f"💥 Memory error during OCR on page {curr_pg_num}. Skipping highlights.")
-                            analysis_result['fence_text_boxes_details'] = []
-                        except Exception as e:
-                            tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num}", e)
-                            st.warning(f"⚠️ OCR error on page {curr_pg_num}: {str(e)[:100]}...")
-                            analysis_result['fence_text_boxes_details'] = []
-                except UnrecoverableRateLimitError as urle_hl:
-                    msg = f"🛑 API Rate Limit Highlight Pg {curr_pg_num}: {urle_hl}. Halted."; status_txt_area.error(msg); st.error(msg)
-                    st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; print(f"SESSION {current_session_id} ERROR: {msg}"); break
-                except Exception as e_hl: st.warning(f"Highlight error pg {curr_pg_num}: {e_hl}"); print(f"SESSION {current_session_id} WARNING: Highlight error pg {curr_pg_num}: {e_hl}")
+                            boxes,_,_ = get_fence_related_text_boxes(
+                                single_pg_bytes_io.getvalue(),
+                                llm_analysis_instance,
+                                FENCE_KEYWORDS_APP,
+                                merge_extra_keywords(signals),         # <— signals + doc-level legend IDs
+                                st.session_state.selected_model_for_analysis,
+                                google_cloud_config
+                            )
+                            mem_after_ocr = _rss_mb()
+                            if mem_after_ocr - mem_before_ocr > 10:
+                                print(f"🔍 MEMORY: get_fence_related_text_boxes() +{mem_after_ocr - mem_before_ocr:.1f}MB (boxes={len(boxes) if boxes else 0})")
+                            if boxes: analysis_result['fence_text_boxes_details'] = boxes
+                    except MemoryError as me:
+                        tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num} (MemoryError)", me)
+                        st.warning(f"💥 Memory error during OCR on page {curr_pg_num}. Skipping highlights.")
+                        analysis_result['fence_text_boxes_details'] = []
+                    except UnrecoverableRateLimitError as urle_hl:
+                        msg = f"🛑 API Rate Limit Highlight Pg {curr_pg_num}: {urle_hl}. Halted."; status_txt_area.error(msg); st.error(msg)
+                        st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; print(f"SESSION {current_session_id} ERROR: {msg}"); break
+                    except Exception as e_hl: 
+                        tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num}", e_hl)
+                        st.warning(f"⚠️ OCR error on page {curr_pg_num}: {str(e_hl)[:100]}...")
+                        analysis_result['fence_text_boxes_details'] = []
             elif not fatal_err_page and highlight_fence_text_app and analysis_result.get('fence_found'):
                  status_txt_area.text(f"Page {curr_pg_num}: Fence found, no text match for detailed highlighting.")
             if fatal_err_page: break
