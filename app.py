@@ -653,17 +653,14 @@ if st.session_state.run_analysis_triggered and \
                     analysis_result['fence_text_boxes_details'] = []
                 else:
                     status_txt_area.text(f"Page {curr_pg_num}: Highlighting (text match found)...")
-                    single_pg_bytes_io = io.BytesIO(); temp_doc_single = None
-                    try: 
-                        temp_doc_single = fitz.open()
-                        temp_doc_single.insert_pdf(doc_proc_loop, from_page=i, to_page=i); temp_doc_single.save(single_pg_bytes_io)
-                    finally: 
-                        if temp_doc_single: temp_doc_single.close()
+                    # CRITICAL FIX: Reuse the same lightweight PNG wrapper approach
+                    # instead of the memory-intensive insert_pdf() operation
+                    single_page_pdf_bytes_for_ocr = single_page_pdf_bytes  # Reuse from line 595-604!
                     try:
                         with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):
                             mem_before_ocr = _rss_mb()
                             boxes,_,_ = get_fence_related_text_boxes(
-                                single_pg_bytes_io.getvalue(),
+                                single_page_pdf_bytes_for_ocr,
                                 llm_analysis_instance,
                                 FENCE_KEYWORDS_APP,
                                 merge_extra_keywords(signals),         # <— signals + doc-level legend IDs
