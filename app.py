@@ -586,18 +586,28 @@ if st.session_state.run_analysis_triggered and \
             if mem_after_load - mem_before_page > 5:
                 print(f"🔍 MEMORY: Page load +{mem_after_load - mem_before_page:.1f}MB")
             
-            # Create single-page PDF bytes for comprehensive text extraction
+            # OPTIMIZATION: Create lightweight PNG image instead of full PDF
+            # Document AI converts PDF to image anyway, so skip the middleman
             single_page_pdf_bytes = None
             try:
-                temp_doc = fitz.open()
-                temp_doc.insert_pdf(doc_proc_loop, from_page=i, to_page=i)
-                single_page_pdf_bytes = temp_doc.tobytes()
-                temp_doc.close()
+                # Render page as PNG at 72 DPI (what Document AI uses)
+                pix = page_obj.get_pixmap(dpi=72, alpha=False)
+                img_bytes = pix.tobytes("png")
+                
+                # Wrap PNG in minimal PDF wrapper for compatibility
+                from io import BytesIO
+                temp_img_doc = fitz.open()
+                temp_page = temp_img_doc.new_page(width=pix.width, height=pix.height)
+                temp_page.insert_image(temp_page.rect, stream=img_bytes, keep_proportion=False)
+                single_page_pdf_bytes = temp_img_doc.tobytes(deflate=True, garbage=4)
+                temp_img_doc.close()
+                del pix, img_bytes
+                
                 mem_after_pdf = _rss_mb()
                 if mem_after_pdf - mem_after_load > 5:
-                    print(f"🔍 MEMORY: Single page PDF +{mem_after_pdf - mem_after_load:.1f}MB")
+                    print(f"🔍 MEMORY: Page image wrapper +{mem_after_pdf - mem_after_load:.1f}MB")
             except Exception as e:
-                print(f"SESSION {current_session_id} WARNING: Could not create single page PDF for page {curr_pg_num}: {e}")
+                print(f"SESSION {current_session_id} WARNING: Could not create page image for page {curr_pg_num}: {e}")
             
             page_data_an = {"page_number": curr_pg_num, "text": text_content, "page_bytes": single_page_pdf_bytes}
             analysis_res_core = {}; fatal_err_page = False
