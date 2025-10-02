@@ -645,29 +645,36 @@ if st.session_state.run_analysis_triggered and \
             except Exception as e_core: st.error(f"Core analysis error pg {curr_pg_num}: {e_core}"); analysis_res_core = {"fence_found": False}; print(f"SESSION {current_session_id} ERROR: Core analysis pg {curr_pg_num}: {e_core}")
             analysis_result = {**analysis_res_core, 'page_number': curr_pg_num, 'page_index_in_original_doc': i, 'fence_text_boxes_details': [], 'highlight_fence_text_app_setting': highlight_fence_text_app}
             if not fatal_err_page and highlight_fence_text_app and analysis_result.get('text_found'):
-                status_txt_area.text(f"Page {curr_pg_num}: Highlighting (text match found)...")
-                single_pg_bytes_io = io.BytesIO(); temp_doc_single = None
-                try: 
-                    temp_doc_single = fitz.open()
-                    temp_doc_single.insert_pdf(doc_proc_loop, from_page=i, to_page=i); temp_doc_single.save(single_pg_bytes_io)
-                finally: 
-                    if temp_doc_single: temp_doc_single.close()
-                try:
-                    with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):
-                        mem_before_ocr = _rss_mb()
-                        try:
-                            boxes,_,_ = get_fence_related_text_boxes(
-                                single_pg_bytes_io.getvalue(),
-                                llm_analysis_instance,
-                                FENCE_KEYWORDS_APP,
-                                merge_extra_keywords(signals),         # <— signals + doc-level legend IDs
-                                st.session_state.selected_model_for_analysis,
-                                google_cloud_config
-                            )
-                            mem_after_ocr = _rss_mb()
-                            if mem_after_ocr - mem_before_ocr > 10:
-                                print(f"🔍 MEMORY: get_fence_related_text_boxes() +{mem_after_ocr - mem_before_ocr:.1f}MB (boxes={len(boxes) if boxes else 0})")
-                            if boxes: analysis_result['fence_text_boxes_details'] = boxes
+                # MEMORY-AWARE: Skip OCR highlighting if memory is getting high
+                current_mem_before_ocr = _rss_mb()
+                if current_mem_before_ocr > 700:  # Skip OCR if over 700MB
+                    print(f"⚠️ Skipping OCR highlighting on page {curr_pg_num} due to high memory ({current_mem_before_ocr:.1f} MB)")
+                    st.warning(f"⚠️ Page {curr_pg_num}: Skipping detailed highlighting to conserve memory")
+                    analysis_result['fence_text_boxes_details'] = []
+                else:
+                    status_txt_area.text(f"Page {curr_pg_num}: Highlighting (text match found)...")
+                    single_pg_bytes_io = io.BytesIO(); temp_doc_single = None
+                    try: 
+                        temp_doc_single = fitz.open()
+                        temp_doc_single.insert_pdf(doc_proc_loop, from_page=i, to_page=i); temp_doc_single.save(single_pg_bytes_io)
+                    finally: 
+                        if temp_doc_single: temp_doc_single.close()
+                    try:
+                        with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):
+                            mem_before_ocr = _rss_mb()
+                            try:
+                                boxes,_,_ = get_fence_related_text_boxes(
+                                    single_pg_bytes_io.getvalue(),
+                                    llm_analysis_instance,
+                                    FENCE_KEYWORDS_APP,
+                                    merge_extra_keywords(signals),         # <— signals + doc-level legend IDs
+                                    st.session_state.selected_model_for_analysis,
+                                    google_cloud_config
+                                )
+                                mem_after_ocr = _rss_mb()
+                                if mem_after_ocr - mem_before_ocr > 10:
+                                    print(f"🔍 MEMORY: get_fence_related_text_boxes() +{mem_after_ocr - mem_before_ocr:.1f}MB (boxes={len(boxes) if boxes else 0})")
+                                if boxes: analysis_result['fence_text_boxes_details'] = boxes
                         except MemoryError as me:
                             tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num} (MemoryError)", me)
                             st.warning(f"💥 Memory error during OCR on page {curr_pg_num}. Skipping highlights.")
