@@ -647,7 +647,7 @@ if st.session_state.run_analysis_triggered and \
             if not fatal_err_page and highlight_fence_text_app and analysis_result.get('text_found'):
                 # MEMORY-AWARE: Skip OCR highlighting if memory is getting high
                 current_mem_before_ocr = _rss_mb()
-                if current_mem_before_ocr > 700:  # Skip OCR if over 700MB
+                if current_mem_before_ocr > 500:  # Skip OCR if over 500MB (OCR can add 100-300MB!)
                     print(f"⚠️ Skipping OCR highlighting on page {curr_pg_num} due to high memory ({current_mem_before_ocr:.1f} MB)")
                     st.warning(f"⚠️ Page {curr_pg_num}: Skipping detailed highlighting to conserve memory")
                     analysis_result['fence_text_boxes_details'] = []
