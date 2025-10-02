@@ -553,17 +553,17 @@ def get_fence_related_text_boxes(
     PAD_TEXT = 1.8
     MAX_H_MULT_TEXT = 1.6
     GAP_SPLIT_FACTOR_TEXT = 0.9
-    CONTEXT_TOKENS_TEXT = 2
+    CONTEXT_TOKENS_TEXT = 3  # Increased from 2 to 3 for better context capture
 
     # OCR
     PAD_OCR = 1.4
     MAX_H_MULT_OCR = 1.6
     GAP_SPLIT_FACTOR_OCR = 0.9
-    CONTEXT_TOKENS_OCR = 2
+    CONTEXT_TOKENS_OCR = 3  # Increased from 2 to 3 for better context capture
 
-    # OCR “also-run” heuristics (mixed pages)
-    OCR_IF_TEXT_MATCHES_LT = 2
-    OCR_IF_PYMUPDF_TOKENS_LT = 25
+    # OCR "also-run" heuristics (mixed pages)
+    OCR_IF_TEXT_MATCHES_LT = 5  # Increased from 2 to 5: run OCR if <5 text-layer matches
+    OCR_IF_PYMUPDF_TOKENS_LT = 40  # Increased from 25 to 40: run OCR on sparse pages
     IMAGE_AREA_RATIO = 0.05
 
     # Geometric dedup
@@ -756,6 +756,19 @@ def get_fence_related_text_boxes(
     # create variants, then canonicalize for the matcher
     expanded = _augment_keywords([_canon(k) for k in merged_raw])
     norm_kws = list({_canon(k) for k in expanded})
+    
+    # Add common legend ID patterns (F-1, F-2, F1, F2, etc.)
+    # These often appear on engineering drawings for fence callouts
+    fence_legend_patterns = []
+    for prefix in ['f', 'fn', 'fe']:
+        for num in range(1, 20):  # F-1 through F-19
+            fence_legend_patterns.extend([
+                f"{prefix}-{num}",
+                f"{prefix}{num}",
+                f"{prefix} {num}"
+            ])
+    norm_kws.extend(fence_legend_patterns)
+    
     phrase_lists = [k.split() for k in norm_kws if " " in k]
     single_set   = {k for k in norm_kws if " " not in k}
 

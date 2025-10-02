@@ -79,7 +79,11 @@ def initialize_session_state(session_id_val):
         'session_id': session_id_val, 
         'fence_pages': [], 'non_fence_pages': [], 'total_pages_processed_count': 0,
         'doc_total_pages': 0, 'processing_complete': False, 'analysis_halted_due_to_error': False,
-        'fence_keywords_app': ['fence', 'fencing', 'gate', 'barrier', 'guardrail', 'post', 'mesh', 'panel', 'chain link'],
+        'fence_keywords_app': [
+            'fence', 'fencing', 'gate', 'barrier', 'guardrail', 'post', 'mesh', 'panel', 'chain link',
+            'screen wall', 'privacy screen', 'CMU wall', 'masonry wall', 'wall', 'bollard',
+            'railing', 'handrail', 'security barrier', 'perimeter'
+        ],
         'run_analysis_triggered': False, 'uploaded_pdf_name': None, 'original_pdf_bytes': None,
         'current_pdf_hash': None, # NEW: To store hash of current PDF
         'highlighted_pdf_bytes_for_download': None, 'last_uploaded_file_id': None,

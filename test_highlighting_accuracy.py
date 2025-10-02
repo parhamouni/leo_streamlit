@@ -47,8 +47,12 @@ print(f"   Page bytes: {len(page_bytes)/1024:.1f} KB")
 # Initialize LLM
 llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=openai_key)
 
-# Test highlighting
-FENCE_KEYWORDS = ["fence", "fencing", "gate", "barrier", "guardrail", "post", "mesh", "panel", "chain link"]
+# Test highlighting with expanded keywords (matching app.py)
+FENCE_KEYWORDS = [
+    "fence", "fencing", "gate", "barrier", "guardrail", "post", "mesh", "panel", "chain link",
+    "screen wall", "privacy screen", "CMU wall", "masonry wall", "wall", "bollard",
+    "railing", "handrail", "security barrier", "perimeter"
+]
 
 print(f"\n🔍 Running OCR highlighting...")
 try:
