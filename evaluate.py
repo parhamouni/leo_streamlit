@@ -38,18 +38,26 @@ def predict_pages(
     pages_pred = set()
     doc = fitz.open(pdf_path)
     for page_idx, page in enumerate(doc, start=1):
+        # Create single-page PDF bytes (lightweight PNG wrapper)
+        pix = page.get_pixmap(dpi=72, alpha=False)
+        img_bytes = pix.tobytes("png")
+        temp_doc = fitz.open()
+        temp_page = temp_doc.new_page(width=pix.width, height=pix.height)
+        temp_page.insert_image(temp_page.rect, stream=img_bytes, keep_proportion=False)
+        page_bytes = temp_doc.tobytes(deflate=True, garbage=4)
+        temp_doc.close()
+        
         page_dict = {
             "page_number": page_idx,
-            "text": page.get_text("text")
+            "text": page.get_text("text"),
+            "page_bytes": page_bytes
         }
-        if use_vision and llm_vision:
-            pix = page.get_pixmap(dpi=72, alpha=False)
-            page_dict["image_b64"] = base64.b64encode(pix.tobytes("png")).decode()
         res = analyze_page(
             page_dict,
             llm_text,
-            llm_vision if use_vision else None,
-            FENCE_KEYWORDS
+            FENCE_KEYWORDS,
+            google_cloud_config=None,  # Don't use Document AI in evaluation
+            recall_mode="balanced"
         )
         if res["fence_found"]:
             pages_pred.add(page_idx)
