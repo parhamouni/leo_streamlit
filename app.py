@@ -39,6 +39,24 @@ def log_exception(session_id, context, exception):
     print(f"{'='*80}\n")
     return tb_str
 
+# Memory profiling decorator
+def profile_memory(func_name):
+    """Decorator to profile memory usage of a function"""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            import gc
+            gc.collect()  # Clean up before measuring
+            mem_before = _rss_mb()
+            result = func(*args, **kwargs)
+            gc.collect()  # Clean up after
+            mem_after = _rss_mb()
+            delta = mem_after - mem_before
+            if delta > 5:  # Only log if significant memory change
+                print(f"🔍 MEMORY PROFILE [{func_name}]: {mem_before:.1f}MB → {mem_after:.1f}MB (Δ {delta:+.1f}MB)")
+            return result
+        return wrapper
+    return decorator
+
 # --- Highlight Appearance & Performance ---
 HIGHLIGHT_COLOR_UI = (0, 0.9, 0)
 HIGHLIGHT_WIDTH_UI = 1.5
@@ -560,7 +578,13 @@ if st.session_state.run_analysis_triggered and \
                 st.session_state.analysis_halted_due_to_error = True
                 print(f"SESSION {current_session_id} ERROR: {error_msg}")
                 break
+            # Memory checkpoint 1: Before page load
+            mem_before_page = _rss_mb()
+            
             page_obj = doc_proc_loop.load_page(i); text_content = page_obj.get_text("text")
+            mem_after_load = _rss_mb()
+            if mem_after_load - mem_before_page > 5:
+                print(f"🔍 MEMORY: Page load +{mem_after_load - mem_before_page:.1f}MB")
             
             # Create single-page PDF bytes for comprehensive text extraction
             single_page_pdf_bytes = None
@@ -569,6 +593,9 @@ if st.session_state.run_analysis_triggered and \
                 temp_doc.insert_pdf(doc_proc_loop, from_page=i, to_page=i)
                 single_page_pdf_bytes = temp_doc.tobytes()
                 temp_doc.close()
+                mem_after_pdf = _rss_mb()
+                if mem_after_pdf - mem_after_load > 5:
+                    print(f"🔍 MEMORY: Single page PDF +{mem_after_pdf - mem_after_load:.1f}MB")
             except Exception as e:
                 print(f"SESSION {current_session_id} WARNING: Could not create single page PDF for page {curr_pg_num}: {e}")
             
@@ -576,11 +603,15 @@ if st.session_state.run_analysis_triggered and \
             analysis_res_core = {}; fatal_err_page = False
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
+                    mem_before_analysis = _rss_mb()
                     try:
                         analysis_res_core = analyze_page(
                             page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
                             recall_mode="strict"   # or "balanced"/"high"
                         )
+                        mem_after_analysis = _rss_mb()
+                        if mem_after_analysis - mem_before_analysis > 10:
+                            print(f"🔍 MEMORY: analyze_page() +{mem_after_analysis - mem_before_analysis:.1f}MB")
                         try:
                             jr = json.loads(analysis_res_core["text_response"])
                             signals = jr.get("signals", [])
@@ -612,7 +643,8 @@ if st.session_state.run_analysis_triggered and \
                 finally: 
                     if temp_doc_single: temp_doc_single.close()
                 try:
-                    with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):   
+                    with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):
+                        mem_before_ocr = _rss_mb()
                         try:
                             boxes,_,_ = get_fence_related_text_boxes(
                                 single_pg_bytes_io.getvalue(),
@@ -622,6 +654,9 @@ if st.session_state.run_analysis_triggered and \
                                 st.session_state.selected_model_for_analysis,
                                 google_cloud_config
                             )
+                            mem_after_ocr = _rss_mb()
+                            if mem_after_ocr - mem_before_ocr > 10:
+                                print(f"🔍 MEMORY: get_fence_related_text_boxes() +{mem_after_ocr - mem_before_ocr:.1f}MB (boxes={len(boxes) if boxes else 0})")
                             if boxes: analysis_result['fence_text_boxes_details'] = boxes
                         except MemoryError as me:
                             tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num} (MemoryError)", me)
@@ -638,8 +673,15 @@ if st.session_state.run_analysis_triggered and \
             elif not fatal_err_page and highlight_fence_text_app and analysis_result.get('fence_found'):
                  status_txt_area.text(f"Page {curr_pg_num}: Fence found, no text match for detailed highlighting.")
             if fatal_err_page: break
+            
+            # Memory checkpoint: Storing result in session state
+            mem_before_store = _rss_mb()
             target_col = col_f if analysis_result.get('fence_found') else col_nf
             (st.session_state.fence_pages if analysis_result.get('fence_found') else st.session_state.non_fence_pages).append(analysis_result)
+            mem_after_store = _rss_mb()
+            if mem_after_store - mem_before_store > 5:
+                result_size = len(str(analysis_result))
+                print(f"🔍 MEMORY: Session state append +{mem_after_store - mem_before_store:.1f}MB (result size: {result_size/1024:.1f}KB)")
             with target_col: # Display Logic (copied from display_page_result_expander for consistency)
                 exp_title = f"Page {analysis_result['page_number']}"
                 if analysis_result.get('fence_found'):
