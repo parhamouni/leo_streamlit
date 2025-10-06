@@ -511,9 +511,17 @@ if st.session_state.run_analysis_triggered and \
                 st.cache_data.clear()
                 profiler.record_step("2. Cache clear")
             
-            # Check memory usage and halt if too high
+            # Check memory usage and halt if too high (adaptive based on pages processed)
             current_memory = _rss_mb()
-            if current_memory > 850:  # Halt if RAM usage exceeds 850MB (we freed 150MB by removing PDF from session)
+            # Start conservative, allow more memory as we process more pages (proves stability)
+            if i < 10:
+                memory_limit = 750  # First 10 pages: strict 750MB limit
+            elif i < 30:
+                memory_limit = 800  # Pages 11-30: allow 800MB
+            else:
+                memory_limit = 850  # After 30 pages: allow 850MB
+            
+            if current_memory > memory_limit:
                 error_msg = f"⚠️ Memory usage too high ({current_memory:.1f} MB). Stopping analysis to prevent crash."
                 st.error(error_msg)
                 st.warning("💡 Tip: You can download the partial results below and resume processing later.")
@@ -636,12 +644,20 @@ if st.session_state.run_analysis_triggered and \
                  status_txt_area.text(f"Page {curr_pg_num}: Fence found, no text match for detailed highlighting.")
             if fatal_err_page: break
             
-            # Store result in session state (minimize what we store)
-            # Don't store page_bytes to save memory
-            analysis_result_compact = {k: v for k, v in analysis_result.items() if k != 'page_bytes'}
+            # Store result in session state (ULTRA minimal - only essential fields)
+            # Remove ALL large data structures to save memory
+            analysis_result_minimal = {
+                'page_number': analysis_result.get('page_number'),
+                'page_index_in_original_doc': analysis_result.get('page_index_in_original_doc'),
+                'fence_found': analysis_result.get('fence_found'),
+                'text_found': analysis_result.get('text_found'),
+                'text_snippet': analysis_result.get('text_snippet', '')[:200] if analysis_result.get('text_snippet') else '',  # Limit snippet
+                'fence_text_boxes_details': analysis_result.get('fence_text_boxes_details', [])[:50],  # Limit to 50 boxes max
+                'highlight_fence_text_app_setting': analysis_result.get('highlight_fence_text_app_setting')
+            }
             target_col = col_f if analysis_result.get('fence_found') else col_nf
-            (st.session_state.fence_pages if analysis_result.get('fence_found') else st.session_state.non_fence_pages).append(analysis_result_compact)
-            profiler.record_step("12. Store result", f"size={len(str(analysis_result_compact))/(1024):.1f}KB")
+            (st.session_state.fence_pages if analysis_result.get('fence_found') else st.session_state.non_fence_pages).append(analysis_result_minimal)
+            profiler.record_step("12. Store result (minimal)", f"size={len(str(analysis_result_minimal))/(1024):.1f}KB")
             with target_col: # Display Logic (copied from display_page_result_expander for consistency)
                 exp_title = f"Page {analysis_result['page_number']}"
                 if analysis_result.get('fence_found'):
@@ -686,22 +702,34 @@ if st.session_state.run_analysis_triggered and \
                                 if count_live >=15 and len(details_list) > 17: st.markdown(f"- ...& {len(details_list)-count_live} more."); break
             summary_placeholder.markdown(f"### Summary (Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages})\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}")
             
-            # AGGRESSIVE memory cleanup after each page
+            # ULTRA-AGGRESSIVE memory cleanup after each page
             try:
                 # Delete everything from this page
-                del page_obj, text_content, single_page_pdf_bytes, page_data_an, analysis_res_core, analysis_result, analysis_result_compact
+                del page_obj, text_content, single_page_pdf_bytes, page_data_an, analysis_res_core, analysis_result, analysis_result_minimal
+                if 'analysis_result_compact' in locals():
+                    del analysis_result_compact
                 if 'single_pg_bytes_io' in locals():
                     del single_pg_bytes_io
                 if 'temp_doc_single' in locals():
                     del temp_doc_single
                 if 'boxes' in locals():
                     del boxes  # OCR boxes can be large
-                # Force AGGRESSIVE garbage collection
+                if 'signals' in locals():
+                    del signals
+                # Force ULTRA-AGGRESSIVE garbage collection
                 gc.collect()
-                gc.collect()  # Call twice to ensure cleanup of circular refs
-                profiler.record_step("13. Cleanup variables (aggressive)")
+                gc.collect()  # Call twice
+                gc.collect()  # Call THREE times to ensure cleanup
+                profiler.record_step("13. Cleanup variables (ultra-aggressive)")
             except Exception as cleanup_err:
                 print(f"Warning: cleanup error: {cleanup_err}")
+            
+            # Clear Streamlit's internal cache more aggressively
+            if i % 1 == 0:  # EVERY PAGE
+                try:
+                    st.cache_data.clear()
+                except:
+                    pass
             
             # End page profiling
             net_change = profiler.end_page()
