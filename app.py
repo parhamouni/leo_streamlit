@@ -608,34 +608,30 @@ if st.session_state.run_analysis_triggered and \
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
                     try:
-                    analysis_res_core = analyze_page(
-                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
-                        recall_mode="strict"   # or "balanced"/"high"
-                    )
+                        analysis_res_core = analyze_page(
+                            page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
+                            recall_mode="strict"   # or "balanced"/"high"
+                        )
                         profiler.record_step("9. analyze_page()", f"fence={analysis_res_core.get('fence_found')}")
                         
-                    try:
                         jr = json.loads(analysis_res_core["text_response"])
                         signals = jr.get("signals", [])
                     except Exception:
-                            signals = []
-                        profiler.record_step("10. Extract signals", f"count={len(signals)}")
-                    except MemoryError as me:
-                        tb = log_exception(current_session_id, f"Core Analysis Page {curr_pg_num} (MemoryError)", me)
-                        st.error(f"💥 Memory error processing page {curr_pg_num}. Skipping OCR analysis.")
-                        analysis_res_core = {"fence_found": False, "text_found": False}
                         signals = []
-                    except Exception as e:
-                        tb = log_exception(current_session_id, f"Core Analysis Page {curr_pg_num}", e)
-                        st.warning(f"⚠️ Analysis error on page {curr_pg_num}: {str(e)[:100]}...")
-                        analysis_res_core = {"fence_found": False, "text_found": False}
-                        signals = []
-
-
+                    profiler.record_step("10. Extract signals", f"count={len(signals)}")
+            except MemoryError as me:
+                tb = log_exception(current_session_id, f"Core Analysis Page {curr_pg_num} (MemoryError)", me)
+                st.error(f"💥 Memory error processing page {curr_pg_num}. Skipping OCR analysis.")
+                analysis_res_core = {"fence_found": False, "text_found": False}
+                signals = []
             except UnrecoverableRateLimitError as urle:
                 msg = f"🛑 API Rate Limit Pg {curr_pg_num}: {urle}. Analysis halted."; status_txt_area.error(msg); st.error(msg)
                 st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; print(f"SESSION {current_session_id} ERROR: {msg}"); break
-            except Exception as e_core: st.error(f"Core analysis error pg {curr_pg_num}: {e_core}"); analysis_res_core = {"fence_found": False}; print(f"SESSION {current_session_id} ERROR: Core analysis pg {curr_pg_num}: {e_core}")
+            except Exception as e:
+                tb = log_exception(current_session_id, f"Core Analysis Page {curr_pg_num}", e)
+                st.warning(f"⚠️ Analysis error on page {curr_pg_num}: {str(e)[:100]}...")
+                analysis_res_core = {"fence_found": False, "text_found": False}
+                signals = []
             analysis_result = {**analysis_res_core, 'page_number': curr_pg_num, 'page_index_in_original_doc': i, 'fence_text_boxes_details': [], 'highlight_fence_text_app_setting': highlight_fence_text_app}
             # OCR HIGHLIGHTING (ALWAYS RUN - no memory-based skipping per user request)
             if not fatal_err_page and highlight_fence_text_app and analysis_result.get('text_found'):
