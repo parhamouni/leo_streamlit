@@ -440,8 +440,8 @@ if uploaded_pdf_file_obj:
         # Restore user prefs
         st.session_state.selected_model_for_analysis = current_selected_model
         st.session_state.fence_keywords_app = current_keywords
-
-        st.cache_data.clear()
+        
+        st.cache_data.clear() 
         print(f"SESSION {current_session_id} LOG: Cleared all @st.cache_data caches due to new file.")
         st.rerun() 
 
@@ -533,13 +533,16 @@ if st.session_state.run_analysis_triggered and \
             
             # Check memory usage and halt if too high (adaptive based on pages processed)
             current_memory = _rss_mb()
-            # Start conservative, allow more memory as we process more pages (proves stability)
-            if i < 10:
-                memory_limit = 750  # First 10 pages: strict 750MB limit
-            elif i < 30:
-                memory_limit = 800  # Pages 11-30: allow 800MB
+            # Adaptive memory limits based on Streamlit Cloud constraints
+            # Note: Cloud baseline is ~730MB (vs ~270MB locally) due to container overhead
+            if i < 5:
+                memory_limit = 850  # First 5 pages: allow initial stabilization
+            elif i < 20:
+                memory_limit = 900  # Pages 6-20: normal processing
+            elif i < 50:
+                memory_limit = 950  # Pages 21-50: allow moderate growth
             else:
-                memory_limit = 850  # After 30 pages: allow 850MB
+                memory_limit = 1000  # Pages 51+: maximum (Streamlit Cloud limit is ~1GB)
             
             if current_memory > memory_limit:
                 error_msg = f"⚠️ Memory usage too high ({current_memory:.1f} MB). Stopping analysis to prevent crash."
@@ -605,16 +608,16 @@ if st.session_state.run_analysis_triggered and \
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
                     try:
-                        analysis_res_core = analyze_page(
-                            page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
-                            recall_mode="strict"   # or "balanced"/"high"
-                        )
+                    analysis_res_core = analyze_page(
+                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
+                        recall_mode="strict"   # or "balanced"/"high"
+                    )
                         profiler.record_step("9. analyze_page()", f"fence={analysis_res_core.get('fence_found')}")
                         
-                        try:
-                            jr = json.loads(analysis_res_core["text_response"])
-                            signals = jr.get("signals", [])
-                        except Exception:
+                    try:
+                        jr = json.loads(analysis_res_core["text_response"])
+                        signals = jr.get("signals", [])
+                    except Exception:
                             signals = []
                         profiler.record_step("10. Extract signals", f"count={len(signals)}")
                     except MemoryError as me:
@@ -638,7 +641,7 @@ if st.session_state.run_analysis_triggered and \
             if not fatal_err_page and highlight_fence_text_app and analysis_result.get('text_found'):
                 status_txt_area.text(f"Page {curr_pg_num}: Highlighting (text match found)...")
                 try:
-                    with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):
+                    with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):   
                         boxes,_,_ = get_fence_related_text_boxes(
                             single_page_pdf_bytes,  # Use PNG wrapper from earlier
                             llm_analysis_instance,
@@ -757,7 +760,7 @@ if st.session_state.run_analysis_triggered and \
             # End page profiling
             net_change = profiler.end_page()
             
-            time.sleep(0.05)
+            time.sleep(0.05) 
     except Exception as fatal_error:
         # Catch any unhandled exceptions in the main loop
         tb = log_exception(current_session_id, f"FATAL ERROR in main processing loop at page {st.session_state.total_pages_processed_count}", fatal_error)
@@ -769,7 +772,7 @@ if st.session_state.run_analysis_triggered and \
         if doc_proc_loop:
             doc_proc_loop.close()
             print(f"SESSION {current_session_id} LOG: Closed main processing PDF document in finally block.")
-        doc_proc_loop = None
+        doc_proc_loop = None 
         print(f"SESSION {current_session_id} LOG: Processing loop ended. Final memory: {_rss_mb():.1f} MB")
         
         # PRINT PROFILING SUMMARY
