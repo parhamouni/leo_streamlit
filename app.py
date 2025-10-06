@@ -577,9 +577,11 @@ if st.session_state.run_analysis_triggered and \
                 
                 # Convert to PNG bytes and FREE pixmap immediately
                 img_bytes = pix.tobytes("png")
+                pix_size_mb = len(img_bytes) / (1024*1024)
                 del pix  # Free pixmap memory NOW (30MB for large pages)
                 gc.collect()  # Force immediate garbage collection
-                profiler.record_step("6. tobytes() + free pixmap", f"{len(img_bytes)/(1024*1024):.2f}MB")
+                gc.collect()  # Call TWICE for large objects
+                profiler.record_step("6. tobytes() + free pixmap", f"{pix_size_mb:.2f}MB PNG")
                 
                 # Wrap PNG in minimal PDF wrapper for compatibility
                 from io import BytesIO
@@ -593,6 +595,7 @@ if st.session_state.run_analysis_triggered and \
                 # Cleanup img_bytes immediately
                 del img_bytes  # Free PNG bytes NOW (15MB for large pages)
                 gc.collect()  # Force immediate garbage collection
+                gc.collect()  # Call TWICE for large objects
                 profiler.record_step("8. Cleanup img_bytes")
             except Exception as e:
                 print(f"SESSION {current_session_id} WARNING: Could not create page image for page {curr_pg_num}: {e}")
