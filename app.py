@@ -39,6 +39,46 @@ def log_exception(session_id, context, exception):
     print(f"{'='*80}\n")
     return tb_str
 
+# ============================================
+# MEMORY PROFILER - Track every function call
+# ============================================
+class MemoryProfiler:
+    """Track memory per function to find leaks"""
+    def __init__(self):
+        self.page_data = []
+        self.current_page = None
+    
+    def start_page(self, page_num):
+        self.current_page = {'page': page_num, 'steps': [], 'start_mem': _rss_mb()}
+        print(f"\n📄 Page {page_num} START: {self.current_page['start_mem']:.1f}MB")
+    
+    def record_step(self, step_name, details=""):
+        if not self.current_page:
+            return
+        mem_now = _rss_mb()
+        last_mem = self.current_page['steps'][-1]['mem'] if self.current_page['steps'] else self.current_page['start_mem']
+        delta = mem_now - last_mem
+        self.current_page['steps'].append({
+            'name': step_name,
+            'mem': mem_now,
+            'delta': delta,
+            'details': details
+        })
+        sign = "+" if delta >= 0 else ""
+        print(f"      {step_name}: {mem_now:.1f}MB ({sign}{delta:.1f}MB) {details}")
+    
+    def end_page(self):
+        if not self.current_page:
+            return 0
+        end_mem = _rss_mb()
+        net = end_mem - self.current_page['start_mem']
+        self.page_data.append(self.current_page)
+        print(f"   📊 Page {self.current_page['page']} NET: {net:+.1f}MB (start={self.current_page['start_mem']:.1f}MB, end={end_mem:.1f}MB)")
+        return net
+
+# Global profiler instance
+profiler = MemoryProfiler()
+
 # Memory profiling decorator
 def profile_memory(func_name):
     """Decorator to profile memory usage of a function"""
@@ -183,7 +223,7 @@ def get_image_download_link_html(img_bytes, filename, text):
     return f'<a href="data:{mime};base64,{b64}" download="{filename}" class="download-button">{text}</a>'
 
 @time_it
-@st.cache_data(ttl=180, show_spinner=False, max_entries=18)  # 3 min, ~18 pages cached
+@st.cache_data(ttl=180, show_spinner=False, max_entries=10)  # 3 min, ~10 pages cached (reduced from 18 to save 120MB)
 def _generate_display_images_for_page_cached(page_idx,
                                             pdf_hash_for_cache_key,
                                             fence_text_boxes_details_tuple,
@@ -324,146 +364,14 @@ def generate_combined_highlighted_pdf(original_pdf_bytes, fence_pages_results_li
     print(f"SESSION {session_id} LOG: Finished generating combined PDF. Success: {pdf_bytes is not None}")
     return (pdf_bytes, fname) if pdf_bytes else (None, fname)
 
-def compute_doc_legend_and_refs_compact(
-    pdf_bytes: bytes,
-    llm,
-    google_cloud_config=None,
-    max_pages: int = 60,
-    char_budget_per_page: int = 2400,
-    max_workers: int = 4,
-):
-    """
-    Low-memory, document-level pass:
-      1) Discover legend-like items per page (LLM).
-      2) Merge to a canonical legend index (LLM).
-      3) Detect references to those identifiers on pages (LLM).
 
-    Returns:
-      {
-        "id_list": ["F1", "F-2A", "0113", ...],
-        "page_refs": { 3: [{"identifier":"F1","confidence":0.8,"evidence":"F1 CHAIN LINK..."}], ... },
-        "index_compact": [ {"identifier":"F1","title":"8' CL FENCE","short_description":"...","definition_pages":[1,2]}, ... ]
-      }
-
-    Notes:
-      - Uses only the PDF text layer for speed/memory; this is usually enough to
-        build a useful identifier pool. You can extend to OCR later if needed.
-      - Limits pages and per-page text length to keep both token usage and RAM low.
-    """
-    import io, json, os
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from langchain_core.messages import HumanMessage
-    from llm_utils import (
-        json_invoke,
-        make_legend_discovery_prompt,
-        make_legend_merge_prompt,
-        make_page_ref_prompt,
-    )
-    import fitz  # PyMuPDF
-
-    # --- Collect small per-page texts (sequential, very cheap) ---
-    page_texts = []
-    total_pages = 0
-    with fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf") as doc:
-        total_pages = len(doc)
-        n = min(total_pages, int(os.getenv("MAX_PAGES_FOR_LEGEND", str(max_pages))))
-        for i in range(n):
-            try:
-                p = doc.load_page(i)
-                t = p.get_text("text") or ""
-                if len(t) > char_budget_per_page:
-                    t = t[:char_budget_per_page]
-                page_texts.append(t)
-            except Exception as e:
-                print(f"[legend] text read failed on page {i+1}: {e}")
-                page_texts.append("")
-
-    # --- 1) Legend discovery per page (in parallel) ---
-    candidates = []
-    if page_texts:
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = {}
-            for i, text in enumerate(page_texts):
-                pnum = i + 1
-                prompt = make_legend_discovery_prompt(pnum, text)
-                futures[ex.submit(json_invoke, llm, [HumanMessage(content=prompt)])] = pnum
-
-            for fut in as_completed(futures):
-                pnum = futures[fut]
-                try:
-                    resp = fut.result()
-                    content = resp.content if hasattr(resp, "content") else str(resp)
-                    data = json.loads(content)
-                    items = data.get("legend_items", []) or []
-                    for it in items:
-                        it.setdefault("page", pnum)
-                    candidates.extend(items)
-                except Exception as e:
-                    print(f"[legend] page {pnum} failed: {e}")
-
-    # --- 2) Merge candidates to canonical index ---
-    index = []
-    id_list = []
-    try:
-        cjson = json.dumps(candidates, separators=(",", ":"))
-        merge_prompt = make_legend_merge_prompt(cjson)  # <-- correct builder
-        merge_resp = json_invoke(llm, [HumanMessage(content=merge_prompt)])
-        mc = merge_resp.content if hasattr(merge_resp, "content") else str(merge_resp)
-        merged = json.loads(mc)
-        index = merged.get("index", []) or []
-        id_list = [x.get("identifier") for x in index if x.get("identifier")]
-    except Exception as e:
-        print(f"[legend-merge] failed: {e}")
-
-    # --- 3) Detect per-page references to identifiers (in parallel) ---
-    page_refs = {}
-    if id_list and page_texts:
-        id_list_preview = ", ".join(id_list[:60]) + (" …" if len(id_list) > 60 else "")
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = {}
-            for i, text in enumerate(page_texts):
-                pnum = i + 1
-                prompt = make_page_ref_prompt(id_list_preview, text)
-                futures[ex.submit(json_invoke, llm, [HumanMessage(content=prompt)])] = pnum
-
-            for fut in as_completed(futures):
-                pnum = futures[fut]
-                try:
-                    resp = fut.result()
-                    content = resp.content if hasattr(resp, "content") else str(resp)
-                    data = json.loads(content)
-                    refs = data.get("references", []) or []
-                    if refs:
-                        page_refs[pnum] = [
-                            {
-                                "identifier": r.get("identifier"),
-                                "confidence": float(r.get("confidence", 0.0)),
-                                "evidence": r.get("evidence", ""),
-                            }
-                            for r in refs
-                            if r.get("identifier")
-                        ]
-                except Exception as e:
-                    print(f"[xref] page {pnum} failed: {e}")
-
-    # compact index to keep memory tiny
-    index_compact = [
-        {k: v for k, v in item.items() if k in ("identifier", "title", "short_description", "definition_pages")}
-        for item in (index or [])
-    ]
-
-    return {"id_list": id_list, "page_refs": page_refs, "index_compact": index_compact}
-
+# DELETED: compute_doc_legend_and_refs_compact() function (lines 367-495)
+# This was 130 lines of dead code for cross-reference analysis (never called)
 
 def merge_extra_keywords(signals: list) -> list:
-    """
-    Return page-local signals only (cross-reference analysis disabled for memory optimization).
-    """
-    merged = list(signals or [])
-    # Limit size to prevent memory issues
-    if len(merged) > 30:
-        merged = merged[:30]
-    return merged
+    """Return page-local signals only (cross-refs deleted)."""
+    return list(signals or [])
+
 
 
 # --- Main App Flow ---
@@ -565,12 +473,18 @@ if st.session_state.run_analysis_triggered and \
                 memory_usage += sum(sys.getsizeof(v) for v in st.session_state.values() if hasattr(v, '__len__')) / (1024**2)
             print(f"SESSION {current_session_id} LOG: Processing page {curr_pg_num}. RAM: {memory_usage:.1f} MB")
             
-            # Memory cleanup between pages (aggressive for Streamlit Cloud)
-            if i > 0 and i % 3 == 0:  # Every 3 pages
-                import gc
-                gc.collect()
-                st.cache_data.clear()  # Clear cache periodically
-                print(f"SESSION {current_session_id} LOG: Memory cleanup at page {curr_pg_num}. RAM: {_rss_mb():.1f} MB")
+            # START PROFILING THIS PAGE
+            profiler.start_page(curr_pg_num)
+            
+            # GC AFTER EVERY PAGE (not every 3) - based on profiling
+            import gc
+            gc.collect()
+            profiler.record_step("1. GC cleanup")
+            
+            # Clear cache every 3 pages (more aggressive to prevent buildup)
+            if i % 3 == 0 and i > 0:
+                st.cache_data.clear()
+                profiler.record_step("2. Cache clear")
             
             # Check memory usage and halt if too high
             current_memory = _rss_mb()
@@ -582,34 +496,51 @@ if st.session_state.run_analysis_triggered and \
                 st.session_state.analysis_halted_due_to_error = True
                 print(f"SESSION {current_session_id} ERROR: {error_msg}")
                 break
-            # Memory checkpoint 1: Before page load
-            mem_before_page = _rss_mb()
+            # Load page
+            page_obj = doc_proc_loop.load_page(i)
+            profiler.record_step("3. load_page()")
             
-            page_obj = doc_proc_loop.load_page(i); text_content = page_obj.get_text("text")
-            mem_after_load = _rss_mb()
-            if mem_after_load - mem_before_page > 5:
-                print(f"🔍 MEMORY: Page load +{mem_after_load - mem_before_page:.1f}MB")
+            # Extract text
+            text_content = page_obj.get_text("text")
+            profiler.record_step("4. get_text()", f"len={len(text_content)}")
             
             # OPTIMIZATION: Create lightweight PNG image instead of full PDF
             # Document AI converts PDF to image anyway, so skip the middleman
             single_page_pdf_bytes = None
             try:
-                # Render page as PNG at 72 DPI (what Document AI uses)
-                pix = page_obj.get_pixmap(dpi=72, alpha=False)
+                # Adaptive DPI: use lower DPI for large pages to save memory
+                page_width = page_obj.rect.width
+                page_height = page_obj.rect.height
+                if page_width > 2000 or page_height > 2000:
+                    dpi = 60  # Large pages: 60 DPI (saves ~40% memory)
+                    profiler.record_step("→ Large page detected", f"{page_width:.0f}×{page_height:.0f}, using DPI=60")
+                else:
+                    dpi = 72  # Normal pages: 72 DPI
+                
+                # Render page as PNG
+                pix = page_obj.get_pixmap(dpi=dpi, alpha=False)
+                pix_width, pix_height = pix.width, pix.height
+                profiler.record_step("5. get_pixmap()", f"size={pix_width}x{pix_height}")
+                
+                # Convert to PNG bytes and FREE pixmap immediately
                 img_bytes = pix.tobytes("png")
+                del pix  # Free pixmap memory NOW (30MB for large pages)
+                gc.collect()  # Force immediate garbage collection
+                profiler.record_step("6. tobytes() + free pixmap", f"{len(img_bytes)/(1024*1024):.2f}MB")
                 
                 # Wrap PNG in minimal PDF wrapper for compatibility
                 from io import BytesIO
                 temp_img_doc = fitz.open()
-                temp_page = temp_img_doc.new_page(width=pix.width, height=pix.height)
+                temp_page = temp_img_doc.new_page(width=pix_width, height=pix_height)
                 temp_page.insert_image(temp_page.rect, stream=img_bytes, keep_proportion=False)
                 single_page_pdf_bytes = temp_img_doc.tobytes(deflate=True, garbage=4)
                 temp_img_doc.close()
-                del pix, img_bytes
+                profiler.record_step("7. PDF wrapper", f"{len(single_page_pdf_bytes)/(1024*1024):.2f}MB")
                 
-                mem_after_pdf = _rss_mb()
-                if mem_after_pdf - mem_after_load > 5:
-                    print(f"🔍 MEMORY: Page image wrapper +{mem_after_pdf - mem_after_load:.1f}MB")
+                # Cleanup img_bytes immediately
+                del img_bytes  # Free PNG bytes NOW (15MB for large pages)
+                gc.collect()  # Force immediate garbage collection
+                profiler.record_step("8. Cleanup img_bytes")
             except Exception as e:
                 print(f"SESSION {current_session_id} WARNING: Could not create page image for page {curr_pg_num}: {e}")
             
@@ -617,20 +548,19 @@ if st.session_state.run_analysis_triggered and \
             analysis_res_core = {}; fatal_err_page = False
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
-                    mem_before_analysis = _rss_mb()
                     try:
                         analysis_res_core = analyze_page(
                             page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
                             recall_mode="strict"   # or "balanced"/"high"
                         )
-                        mem_after_analysis = _rss_mb()
-                        if mem_after_analysis - mem_before_analysis > 10:
-                            print(f"🔍 MEMORY: analyze_page() +{mem_after_analysis - mem_before_analysis:.1f}MB")
+                        profiler.record_step("9. analyze_page()", f"fence={analysis_res_core.get('fence_found')}")
+                        
                         try:
                             jr = json.loads(analysis_res_core["text_response"])
                             signals = jr.get("signals", [])
                         except Exception:
                             signals = []
+                        profiler.record_step("10. Extract signals", f"count={len(signals)}")
                     except MemoryError as me:
                         tb = log_exception(current_session_id, f"Core Analysis Page {curr_pg_num} (MemoryError)", me)
                         st.error(f"💥 Memory error processing page {curr_pg_num}. Skipping OCR analysis.")
@@ -648,56 +578,43 @@ if st.session_state.run_analysis_triggered and \
                 st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; print(f"SESSION {current_session_id} ERROR: {msg}"); break
             except Exception as e_core: st.error(f"Core analysis error pg {curr_pg_num}: {e_core}"); analysis_res_core = {"fence_found": False}; print(f"SESSION {current_session_id} ERROR: Core analysis pg {curr_pg_num}: {e_core}")
             analysis_result = {**analysis_res_core, 'page_number': curr_pg_num, 'page_index_in_original_doc': i, 'fence_text_boxes_details': [], 'highlight_fence_text_app_setting': highlight_fence_text_app}
+            # OCR HIGHLIGHTING (ALWAYS RUN - no memory-based skipping per user request)
             if not fatal_err_page and highlight_fence_text_app and analysis_result.get('text_found'):
-                # MEMORY-AWARE: Skip OCR highlighting if memory is getting high
-                current_mem_before_ocr = _rss_mb()
-                if current_mem_before_ocr > 500:  # Skip OCR if over 500MB (OCR can add 100-300MB!)
-                    print(f"⚠️ Skipping OCR highlighting on page {curr_pg_num} due to high memory ({current_mem_before_ocr:.1f} MB)")
-                    st.warning(f"⚠️ Page {curr_pg_num}: Skipping detailed highlighting to conserve memory")
+                status_txt_area.text(f"Page {curr_pg_num}: Highlighting (text match found)...")
+                try:
+                    with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):
+                        boxes,_,_ = get_fence_related_text_boxes(
+                            single_page_pdf_bytes,  # Use PNG wrapper from earlier
+                            llm_analysis_instance,
+                            FENCE_KEYWORDS_APP,
+                            merge_extra_keywords(signals),
+                            st.session_state.selected_model_for_analysis,
+                            google_cloud_config
+                        )
+                        if boxes:
+                            analysis_result['fence_text_boxes_details'] = boxes
+                        profiler.record_step("11. OCR highlighting", f"boxes={len(boxes) if boxes else 0}")
+                except MemoryError as me:
+                    tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num} (MemoryError)", me)
+                    st.warning(f"💥 Memory error during OCR on page {curr_pg_num}. Skipping highlights.")
                     analysis_result['fence_text_boxes_details'] = []
-                else:
-                    status_txt_area.text(f"Page {curr_pg_num}: Highlighting (text match found)...")
-                    # CRITICAL FIX: Reuse the same lightweight PNG wrapper approach
-                    # instead of the memory-intensive insert_pdf() operation
-                    single_page_pdf_bytes_for_ocr = single_page_pdf_bytes  # Reuse from line 595-604!
-                    try:
-                        with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):
-                            mem_before_ocr = _rss_mb()
-                            boxes,_,_ = get_fence_related_text_boxes(
-                                single_page_pdf_bytes_for_ocr,
-                                llm_analysis_instance,
-                                FENCE_KEYWORDS_APP,
-                                merge_extra_keywords(signals),         # <— signals + doc-level legend IDs
-                                st.session_state.selected_model_for_analysis,
-                                google_cloud_config
-                            )
-                            mem_after_ocr = _rss_mb()
-                            if mem_after_ocr - mem_before_ocr > 10:
-                                print(f"🔍 MEMORY: get_fence_related_text_boxes() +{mem_after_ocr - mem_before_ocr:.1f}MB (boxes={len(boxes) if boxes else 0})")
-                            if boxes: analysis_result['fence_text_boxes_details'] = boxes
-                    except MemoryError as me:
-                        tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num} (MemoryError)", me)
-                        st.warning(f"💥 Memory error during OCR on page {curr_pg_num}. Skipping highlights.")
-                        analysis_result['fence_text_boxes_details'] = []
-                    except UnrecoverableRateLimitError as urle_hl:
-                        msg = f"🛑 API Rate Limit Highlight Pg {curr_pg_num}: {urle_hl}. Halted."; status_txt_area.error(msg); st.error(msg)
-                        st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; print(f"SESSION {current_session_id} ERROR: {msg}"); break
-                    except Exception as e_hl: 
-                        tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num}", e_hl)
-                        st.warning(f"⚠️ OCR error on page {curr_pg_num}: {str(e_hl)[:100]}...")
-                        analysis_result['fence_text_boxes_details'] = []
+                    profiler.record_step("11. OCR highlighting (FAILED)", "MemoryError")
+                except UnrecoverableRateLimitError as urle_hl:
+                    msg = f"🛑 API Rate Limit Highlight Pg {curr_pg_num}: {urle_hl}. Halted."; status_txt_area.error(msg); st.error(msg)
+                    st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; print(f"SESSION {current_session_id} ERROR: {msg}"); break
+                except Exception as e_hl: 
+                    tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num}", e_hl)
+                    st.warning(f"⚠️ OCR error on page {curr_pg_num}: {str(e_hl)[:100]}...")
+                    analysis_result['fence_text_boxes_details'] = []
+                    profiler.record_step("11. OCR highlighting (FAILED)", str(e_hl)[:50])
             elif not fatal_err_page and highlight_fence_text_app and analysis_result.get('fence_found'):
                  status_txt_area.text(f"Page {curr_pg_num}: Fence found, no text match for detailed highlighting.")
             if fatal_err_page: break
             
-            # Memory checkpoint: Storing result in session state
-            mem_before_store = _rss_mb()
+            # Store result in session state
             target_col = col_f if analysis_result.get('fence_found') else col_nf
             (st.session_state.fence_pages if analysis_result.get('fence_found') else st.session_state.non_fence_pages).append(analysis_result)
-            mem_after_store = _rss_mb()
-            if mem_after_store - mem_before_store > 5:
-                result_size = len(str(analysis_result))
-                print(f"🔍 MEMORY: Session state append +{mem_after_store - mem_before_store:.1f}MB (result size: {result_size/1024:.1f}KB)")
+            profiler.record_step("12. Store result", f"size={len(str(analysis_result))/(1024):.1f}KB")
             with target_col: # Display Logic (copied from display_page_result_expander for consistency)
                 exp_title = f"Page {analysis_result['page_number']}"
                 if analysis_result.get('fence_found'):
@@ -749,8 +666,14 @@ if st.session_state.run_analysis_triggered and \
                     del single_pg_bytes_io
                 if 'temp_doc_single' in locals():
                     del temp_doc_single
-            except:
-                pass
+                gc.collect()
+                profiler.record_step("13. Cleanup variables")
+            except Exception as cleanup_err:
+                print(f"Warning: cleanup error: {cleanup_err}")
+            
+            # End page profiling
+            net_change = profiler.end_page()
+            
             time.sleep(0.05)
     except Exception as fatal_error:
         # Catch any unhandled exceptions in the main loop
@@ -764,7 +687,41 @@ if st.session_state.run_analysis_triggered and \
             doc_proc_loop.close()
             print(f"SESSION {current_session_id} LOG: Closed main processing PDF document in finally block.")
         doc_proc_loop = None
-        print(f"SESSION {current_session_id} LOG: Processing loop ended. Final memory: {_rss_mb():.1f} MB") 
+        print(f"SESSION {current_session_id} LOG: Processing loop ended. Final memory: {_rss_mb():.1f} MB")
+        
+        # PRINT PROFILING SUMMARY
+        print("\n" + "="*80)
+        print("PROFILING SUMMARY - Memory Delta Per Function")
+        print("="*80)
+        if profiler.page_data:
+            summary = {}
+            for page_data in profiler.page_data:
+                for step in page_data['steps']:
+                    name = step['name']
+                    if name not in summary:
+                        summary[name] = {'count': 0, 'total': 0, 'max': 0, 'min': 999}
+                    summary[name]['count'] += 1
+                    summary[name]['total'] += step['delta']
+                    summary[name]['max'] = max(summary[name]['max'], step['delta'])
+                    summary[name]['min'] = min(summary[name]['min'], step['delta'])
+            
+            print(f"\n{'Step':<35} {'Calls':<8} {'Avg Δ':<10} {'Max Δ':<10} {'Min Δ':<10}")
+            print("-"*80)
+            for name in sorted(summary.keys()):
+                s = summary[name]
+                avg = s['total'] / s['count'] if s['count'] > 0 else 0
+                print(f"{name:<35} {s['count']:<8} {avg:>+9.1f}MB {s['max']:>+9.1f}MB {s['min']:>+9.1f}MB")
+            
+            total_net = sum((p['steps'][-1]['mem'] if p['steps'] else p['start_mem']) - p['start_mem'] for p in profiler.page_data)
+            avg_net = total_net / len(profiler.page_data) if profiler.page_data else 0
+            print(f"\nTotal pages profiled: {len(profiler.page_data)}")
+            print(f"Total NET memory change: {total_net:+.1f}MB")
+            print(f"Average NET per page: {avg_net:+.1f}MB")
+            print("="*80 + "\n")
+        else:
+            print("No profiling data collected")
+            print("="*80 + "\n")
+    
     st.session_state.processing_complete = True 
     if not st.session_state.analysis_halted_due_to_error:
         prog_bar.empty(); status_txt_area.success("All pages processed!")
