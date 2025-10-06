@@ -252,7 +252,9 @@ def _generate_display_images_for_page_cached(page_idx,
         For backward-compatibility, if items look like dict-items we try to
         reconstruct x0..y1 from them.
     """
-    if 'original_pdf_bytes' not in st.session_state or st.session_state.original_pdf_bytes is None:
+    # Try backup first (processing), then original (before processing started)
+    pdf_bytes_source = st.session_state.get('original_pdf_bytes_backup') or st.session_state.get('original_pdf_bytes')
+    if not pdf_bytes_source:
         print(f"SESSION {session_id_for_log} ERROR (_cached): original_pdf_bytes missing for hash {pdf_hash_for_cache_key}")
         return None, None
 
@@ -275,7 +277,7 @@ def _generate_display_images_for_page_cached(page_idx,
     except Exception as e:
         print(f"SESSION {session_id_for_log} WARNING: could not parse rects for cache key: {e}")
 
-    current_pdf_bytes = st.session_state.original_pdf_bytes
+    current_pdf_bytes = pdf_bytes_source
     original_image_bytes, highlighted_image_bytes = None, None
 
     func_call_id = str(uuid.uuid4())[:4]
@@ -457,6 +459,14 @@ if st.session_state.run_analysis_triggered and \
         doc_proc_loop = fitz.open(stream=io.BytesIO(st.session_state.original_pdf_bytes), filetype="pdf")
         st.session_state.doc_total_pages = len(doc_proc_loop)
         print(f"SESSION {current_session_id} LOG: PDF opened, {st.session_state.doc_total_pages} pages.")
+        
+        # CRITICAL: Free the 150MB PDF from session state NOW - we only need the open doc_proc_loop
+        # Keep a backup for generating final PDF later
+        st.session_state.original_pdf_bytes_backup = st.session_state.original_pdf_bytes
+        st.session_state.original_pdf_bytes = None
+        import gc
+        gc.collect()
+        print(f"SESSION {current_session_id} LOG: Freed original PDF from session state. RAM: {_rss_mb():.1f} MB")
     except Exception as e:
         st.error(f"Failed to open PDF: {e}"); st.session_state.processing_complete = True; st.session_state.analysis_halted_due_to_error = True
         if doc_proc_loop: doc_proc_loop.close()
@@ -503,7 +513,7 @@ if st.session_state.run_analysis_triggered and \
             
             # Check memory usage and halt if too high
             current_memory = _rss_mb()
-            if current_memory > 700:  # Halt if RAM usage exceeds 700MB (AGGRESSIVE for Streamlit Cloud)
+            if current_memory > 850:  # Halt if RAM usage exceeds 850MB (we freed 150MB by removing PDF from session)
                 error_msg = f"⚠️ Memory usage too high ({current_memory:.1f} MB). Stopping analysis to prevent crash."
                 st.error(error_msg)
                 st.warning("💡 Tip: You can download the partial results below and resume processing later.")
@@ -747,9 +757,9 @@ if st.session_state.run_analysis_triggered and \
     st.session_state.processing_complete = True 
     if not st.session_state.analysis_halted_due_to_error:
         prog_bar.empty(); status_txt_area.success("All pages processed!")
-        if st.session_state.fence_pages and st.session_state.original_pdf_bytes:
+        if st.session_state.fence_pages and st.session_state.original_pdf_bytes_backup:
             pdf_b, pdf_n = generate_combined_highlighted_pdf(
-                st.session_state.original_pdf_bytes,
+                st.session_state.original_pdf_bytes_backup,
                 st.session_state.fence_pages,
                 st.session_state.uploaded_pdf_name,
                 current_session_id
