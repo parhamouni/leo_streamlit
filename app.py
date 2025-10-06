@@ -464,30 +464,29 @@ if st.session_state.run_analysis_triggered and \
    not st.session_state.processing_complete:
     
     print(f"SESSION {current_session_id} LOG: Starting PDF processing loop.")
+    print(f"SESSION {current_session_id} LOG: Memory BEFORE temp file: {_rss_mb():.1f} MB")
+    
+    # CRITICAL: Write PDF to temp file FIRST, then open from file (not from memory!)
+    import tempfile
+    temp_pdf_path = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+    temp_pdf_path.write(st.session_state.original_pdf_bytes)
+    temp_pdf_path.close()
+    st.session_state.temp_pdf_path = temp_pdf_path.name
+    print(f"SESSION {current_session_id} LOG: Wrote PDF to temp file: {st.session_state.temp_pdf_path}")
+    
+    # NOW free the 149MB from session state BEFORE opening
+    st.session_state.original_pdf_bytes = None
+    import gc
+    gc.collect()
+    gc.collect()  # Call twice
+    print(f"SESSION {current_session_id} LOG: Freed 149MB from session state. RAM: {_rss_mb():.1f} MB")
+    
+    # OPEN PDF FROM FILE (not from memory!)
     doc_proc_loop = None
     try:
-        doc_proc_loop = fitz.open(stream=io.BytesIO(st.session_state.original_pdf_bytes), filetype="pdf")
+        doc_proc_loop = fitz.open(st.session_state.temp_pdf_path)  # Open from FILE, not memory!
         st.session_state.doc_total_pages = len(doc_proc_loop)
-        print(f"SESSION {current_session_id} LOG: PDF opened, {st.session_state.doc_total_pages} pages.")
-        
-        # CRITICAL: DON'T store PDF in session state at all during processing!
-        # The doc_proc_loop keeps the PDF open, we don't need it in session state
-        # We'll re-open from disk for final PDF generation if needed
-        print(f"SESSION {current_session_id} LOG: PDF opened. Memory BEFORE freeing PDF: {_rss_mb():.1f} MB")
-        
-        # Save PDF to temp file for later use (if needed for final combined PDF)
-        import tempfile
-        temp_pdf_path = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
-        temp_pdf_path.write(st.session_state.original_pdf_bytes)
-        temp_pdf_path.close()
-        st.session_state.temp_pdf_path = temp_pdf_path.name
-        
-        # NOW free the 149MB from session state completely
-        st.session_state.original_pdf_bytes = None
-        import gc
-        gc.collect()
-        gc.collect()  # Call twice to ensure it's freed
-        print(f"SESSION {current_session_id} LOG: Freed 149MB PDF from session state. RAM AFTER: {_rss_mb():.1f} MB")
+        print(f"SESSION {current_session_id} LOG: PDF opened from file, {st.session_state.doc_total_pages} pages. RAM: {_rss_mb():.1f} MB")
     except Exception as e:
         st.error(f"Failed to open PDF: {e}"); st.session_state.processing_complete = True; st.session_state.analysis_halted_due_to_error = True
         if doc_proc_loop: doc_proc_loop.close()
