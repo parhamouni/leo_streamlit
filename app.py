@@ -481,14 +481,14 @@ if st.session_state.run_analysis_triggered and \
             gc.collect()
             profiler.record_step("1. GC cleanup")
             
-            # Clear cache every 3 pages (more aggressive to prevent buildup)
-            if i % 3 == 0 and i > 0:
+            # Clear cache EVERY 2 pages (very aggressive to prevent buildup)
+            if i % 2 == 0 and i > 0:
                 st.cache_data.clear()
                 profiler.record_step("2. Cache clear")
             
             # Check memory usage and halt if too high
             current_memory = _rss_mb()
-            if current_memory > 900:  # Halt if RAM usage exceeds 900MB (for Streamlit Cloud)
+            if current_memory > 700:  # Halt if RAM usage exceeds 700MB (AGGRESSIVE for Streamlit Cloud)
                 error_msg = f"⚠️ Memory usage too high ({current_memory:.1f} MB). Stopping analysis to prevent crash."
                 st.error(error_msg)
                 st.warning("💡 Tip: You can download the partial results below and resume processing later.")
@@ -508,14 +508,14 @@ if st.session_state.run_analysis_triggered and \
             # Document AI converts PDF to image anyway, so skip the middleman
             single_page_pdf_bytes = None
             try:
-                # Adaptive DPI: use lower DPI for large pages to save memory
+                # AGGRESSIVE DPI: use even lower DPI for large pages to save memory
                 page_width = page_obj.rect.width
                 page_height = page_obj.rect.height
                 if page_width > 2000 or page_height > 2000:
-                    dpi = 60  # Large pages: 60 DPI (saves ~40% memory)
-                    profiler.record_step("→ Large page detected", f"{page_width:.0f}×{page_height:.0f}, using DPI=60")
+                    dpi = 50  # Large pages: 50 DPI (saves ~50% memory) - AGGRESSIVE
+                    profiler.record_step("→ Large page detected", f"{page_width:.0f}×{page_height:.0f}, using DPI=50")
                 else:
-                    dpi = 72  # Normal pages: 72 DPI
+                    dpi = 60  # Normal pages: 60 DPI (reduced from 72)
                 
                 # Render page as PNG
                 pix = page_obj.get_pixmap(dpi=dpi, alpha=False)
@@ -611,10 +611,12 @@ if st.session_state.run_analysis_triggered and \
                  status_txt_area.text(f"Page {curr_pg_num}: Fence found, no text match for detailed highlighting.")
             if fatal_err_page: break
             
-            # Store result in session state
+            # Store result in session state (minimize what we store)
+            # Don't store page_bytes to save memory
+            analysis_result_compact = {k: v for k, v in analysis_result.items() if k != 'page_bytes'}
             target_col = col_f if analysis_result.get('fence_found') else col_nf
-            (st.session_state.fence_pages if analysis_result.get('fence_found') else st.session_state.non_fence_pages).append(analysis_result)
-            profiler.record_step("12. Store result", f"size={len(str(analysis_result))/(1024):.1f}KB")
+            (st.session_state.fence_pages if analysis_result.get('fence_found') else st.session_state.non_fence_pages).append(analysis_result_compact)
+            profiler.record_step("12. Store result", f"size={len(str(analysis_result_compact))/(1024):.1f}KB")
             with target_col: # Display Logic (copied from display_page_result_expander for consistency)
                 exp_title = f"Page {analysis_result['page_number']}"
                 if analysis_result.get('fence_found'):
@@ -659,15 +661,20 @@ if st.session_state.run_analysis_triggered and \
                                 if count_live >=15 and len(details_list) > 17: st.markdown(f"- ...& {len(details_list)-count_live} more."); break
             summary_placeholder.markdown(f"### Summary (Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages})\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}")
             
-            # Memory cleanup after each page
+            # AGGRESSIVE memory cleanup after each page
             try:
-                del page_obj, text_content, single_page_pdf_bytes
+                # Delete everything from this page
+                del page_obj, text_content, single_page_pdf_bytes, page_data_an, analysis_res_core, analysis_result, analysis_result_compact
                 if 'single_pg_bytes_io' in locals():
                     del single_pg_bytes_io
                 if 'temp_doc_single' in locals():
                     del temp_doc_single
+                if 'boxes' in locals():
+                    del boxes  # OCR boxes can be large
+                # Force AGGRESSIVE garbage collection
                 gc.collect()
-                profiler.record_step("13. Cleanup variables")
+                gc.collect()  # Call twice to ensure cleanup of circular refs
+                profiler.record_step("13. Cleanup variables (aggressive)")
             except Exception as cleanup_err:
                 print(f"Warning: cleanup error: {cleanup_err}")
             
