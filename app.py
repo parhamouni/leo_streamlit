@@ -538,23 +538,11 @@ if st.session_state.run_analysis_triggered and \
                 st.cache_data.clear()
                 profiler.record_step("2. Cache clear")
             
-            # Check memory usage and halt if too high (adaptive based on pages processed)
+            # Check memory usage and halt if too high
             current_memory = _rss_mb()
-            # Adaptive memory limits based on Streamlit Cloud constraints
-            # Note: Cloud baseline is ~730MB (vs ~270MB locally) due to container overhead
-            # Local testing with DPI=35 shows:
-            #   - Pages 19-23 have 97-99MB spikes (GC backlog)
-            #   - Cloud would hit 1156MB at page 23 (730+426 cumulative)
-            if i < 5:
-                memory_limit = 950  # First 5 pages: allow initial stabilization
-            elif i < 18:
-                memory_limit = 1000  # Pages 6-18: before spike zone
-            elif i < 26:
-                memory_limit = 1200  # Pages 19-26: SPIKE ZONE (allow 97MB spikes)
-            elif i < 50:
-                memory_limit = 1100  # Pages 27-50: after spikes, lower again
-            else:
-                memory_limit = 1150  # Pages 51+: maximum
+            # Streamlit Cloud has 1GB (1024MB) hard limit
+            # With text-only for large pages, memory should stay under 1000MB
+            memory_limit = 1000  # Stay under 1GB Cloud limit with 24MB safety margin
             
             if current_memory > memory_limit:
                 error_msg = f"⚠️ Memory usage too high ({current_memory:.1f} MB). Stopping analysis to prevent crash."
@@ -572,48 +560,55 @@ if st.session_state.run_analysis_triggered and \
             text_content = page_obj.get_text("text")
             profiler.record_step("4. get_text()", f"len={len(text_content)}")
             
-            # OPTIMIZATION: Create lightweight PNG image instead of full PDF
-            # Document AI converts PDF to image anyway, so skip the middleman
+            # CRITICAL FIX: For large pages, skip page_bytes entirely to prevent memory accumulation
+            # Testing shows memory grows from 730MB → 1427MB peak (memory leak!)
+            # Solution: Use text-only analysis for large pages (Document AI doesn't need images)
             single_page_pdf_bytes = None
+            page_width = page_obj.rect.width
+            page_height = page_obj.rect.height
+            is_large_page = page_width > 2000 or page_height > 2000
+            
+            if is_large_page:
+                # Large page: Skip image generation entirely (text-only analysis)
+                profiler.record_step("→ Large page", f"{page_width:.0f}×{page_height:.0f}, TEXT-ONLY (no image)")
+            else:
+                # Normal page: Generate image at low DPI
+                dpi = 45
+                profiler.record_step("→ Normal page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi}")
+            
             try:
-                # ULTRA-AGGRESSIVE DPI: use very low DPI for large pages to prevent memory spikes
-                # Cloud testing shows pages 19-20 still hitting 1020MB with DPI=40
-                # Further reducing to DPI=35 to prevent spikes
-                page_width = page_obj.rect.width
-                page_height = page_obj.rect.height
-                if page_width > 2000 or page_height > 2000:
-                    dpi = 35  # Large pages: 35 DPI (was 40, further reduced after Cloud testing)
-                    profiler.record_step("→ Large page detected", f"{page_width:.0f}×{page_height:.0f}, using DPI=35")
+                if not is_large_page:
+                    # Only generate images for normal pages to prevent memory leak
+                    # Render page as PNG
+                    pix = page_obj.get_pixmap(dpi=dpi, alpha=False)
+                    pix_width, pix_height = pix.width, pix.height
+                    profiler.record_step("5. get_pixmap()", f"size={pix_width}x{pix_height}")
+                    
+                    # Convert to PNG bytes and FREE pixmap immediately
+                    img_bytes = pix.tobytes("png")
+                    pix_size_mb = len(img_bytes) / (1024*1024)
+                    del pix
+                    gc.collect()
+                    gc.collect()
+                    profiler.record_step("6. tobytes() + free pixmap", f"{pix_size_mb:.2f}MB PNG")
+                    
+                    # Wrap PNG in minimal PDF wrapper
+                    from io import BytesIO
+                    temp_img_doc = fitz.open()
+                    temp_page = temp_img_doc.new_page(width=pix_width, height=pix_height)
+                    temp_page.insert_image(temp_page.rect, stream=img_bytes, keep_proportion=False)
+                    single_page_pdf_bytes = temp_img_doc.tobytes(deflate=True, garbage=4)
+                    temp_img_doc.close()
+                    profiler.record_step("7. PDF wrapper", f"{len(single_page_pdf_bytes)/(1024*1024):.2f}MB")
+                    
+                    # Cleanup img_bytes
+                    del img_bytes
+                    gc.collect()
+                    gc.collect()
+                    profiler.record_step("8. Cleanup img_bytes")
                 else:
-                    dpi = 45  # Normal pages: 45 DPI (reduced from 50)
-                
-                # Render page as PNG
-                pix = page_obj.get_pixmap(dpi=dpi, alpha=False)
-                pix_width, pix_height = pix.width, pix.height
-                profiler.record_step("5. get_pixmap()", f"size={pix_width}x{pix_height}")
-                
-                # Convert to PNG bytes and FREE pixmap immediately
-                img_bytes = pix.tobytes("png")
-                pix_size_mb = len(img_bytes) / (1024*1024)
-                del pix  # Free pixmap memory NOW (30MB for large pages)
-                gc.collect()  # Force immediate garbage collection
-                gc.collect()  # Call TWICE for large objects
-                profiler.record_step("6. tobytes() + free pixmap", f"{pix_size_mb:.2f}MB PNG")
-                
-                # Wrap PNG in minimal PDF wrapper for compatibility
-                from io import BytesIO
-                temp_img_doc = fitz.open()
-                temp_page = temp_img_doc.new_page(width=pix_width, height=pix_height)
-                temp_page.insert_image(temp_page.rect, stream=img_bytes, keep_proportion=False)
-                single_page_pdf_bytes = temp_img_doc.tobytes(deflate=True, garbage=4)
-                temp_img_doc.close()
-                profiler.record_step("7. PDF wrapper", f"{len(single_page_pdf_bytes)/(1024*1024):.2f}MB")
-                
-                # Cleanup img_bytes immediately
-                del img_bytes  # Free PNG bytes NOW (15MB for large pages)
-                gc.collect()  # Force immediate garbage collection
-                gc.collect()  # Call TWICE for large objects
-                profiler.record_step("8. Cleanup img_bytes")
+                    # Large page: No image generation
+                    profiler.record_step("5-8. Skipped (large page, text-only)")
             except Exception as e:
                 print(f"SESSION {current_session_id} WARNING: Could not create page image for page {curr_pg_num}: {e}")
             
@@ -622,10 +617,10 @@ if st.session_state.run_analysis_triggered and \
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
                     try:
-                        analysis_res_core = analyze_page(
-                            page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
-                            recall_mode="strict"   # or "balanced"/"high"
-                        )
+                    analysis_res_core = analyze_page(
+                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
+                        recall_mode="strict"   # or "balanced"/"high"
+                    )
                         profiler.record_step("9. analyze_page()", f"fence={analysis_res_core.get('fence_found')}")
                         
                         jr = json.loads(analysis_res_core["text_response"])
