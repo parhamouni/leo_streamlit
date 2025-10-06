@@ -521,13 +521,20 @@ if st.session_state.run_analysis_triggered and \
             # START PROFILING THIS PAGE
             profiler.start_page(curr_pg_num)
             
-            # GC AFTER EVERY PAGE (not every 3) - based on profiling
+            # ULTRA-AGGRESSIVE GC - Call 3× to force immediate cleanup
+            # Testing showed 97MB spikes on pages 19-23 even with 2× GC
             import gc
             gc.collect()
-            profiler.record_step("1. GC cleanup")
+            gc.collect()
+            gc.collect()  # Triple GC to handle large backlog
+            profiler.record_step("1. GC cleanup (3×)")
             
-            # Clear cache EVERY 2 pages (very aggressive to prevent buildup)
-            if i % 2 == 0 and i > 0:
+            # Clear cache EVERY PAGE for pages 15-30 (spike zone)
+            # Normal: every 2 pages, Spike zone: every page
+            if i >= 14 and i < 30:
+                st.cache_data.clear()
+                profiler.record_step("2. Cache clear (spike zone)")
+            elif i % 2 == 0 and i > 0:
                 st.cache_data.clear()
                 profiler.record_step("2. Cache clear")
             
@@ -535,15 +542,19 @@ if st.session_state.run_analysis_triggered and \
             current_memory = _rss_mb()
             # Adaptive memory limits based on Streamlit Cloud constraints
             # Note: Cloud baseline is ~730MB (vs ~270MB locally) due to container overhead
-            # Cloud testing showed 1020MB at page 20 with DPI=40, now using DPI=35
+            # Local testing with DPI=35 shows:
+            #   - Pages 19-23 have 97-99MB spikes (GC backlog)
+            #   - Cloud would hit 1156MB at page 23 (730+426 cumulative)
             if i < 5:
                 memory_limit = 950  # First 5 pages: allow initial stabilization
-            elif i < 25:
-                memory_limit = 1050  # Pages 6-25: handle large page spikes (page 20 hit 1020MB)
+            elif i < 18:
+                memory_limit = 1000  # Pages 6-18: before spike zone
+            elif i < 26:
+                memory_limit = 1200  # Pages 19-26: SPIKE ZONE (allow 97MB spikes)
             elif i < 50:
-                memory_limit = 1100  # Pages 26-50: allow moderate growth
+                memory_limit = 1100  # Pages 27-50: after spikes, lower again
             else:
-                memory_limit = 1150  # Pages 51+: maximum (near Streamlit Cloud's ~1.2GB limit)
+                memory_limit = 1150  # Pages 51+: maximum
             
             if current_memory > memory_limit:
                 error_msg = f"⚠️ Memory usage too high ({current_memory:.1f} MB). Stopping analysis to prevent crash."
@@ -611,10 +622,10 @@ if st.session_state.run_analysis_triggered and \
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
                     try:
-                        analysis_res_core = analyze_page(
-                            page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
-                            recall_mode="strict"   # or "balanced"/"high"
-                        )
+                    analysis_res_core = analyze_page(
+                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
+                        recall_mode="strict"   # or "balanced"/"high"
+                    )
                         profiler.record_step("9. analyze_page()", f"fence={analysis_res_core.get('fence_found')}")
                         
                         jr = json.loads(analysis_res_core["text_response"])
