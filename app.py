@@ -564,14 +564,15 @@ if st.session_state.run_analysis_triggered and \
             # Document AI converts PDF to image anyway, so skip the middleman
             single_page_pdf_bytes = None
             try:
-                # AGGRESSIVE DPI: use even lower DPI for large pages to save memory
+                # ULTRA-AGGRESSIVE DPI: use very low DPI for large pages to prevent memory spikes
+                # On pages 19-23, get_pixmap() causes +80-100MB temporary spikes
                 page_width = page_obj.rect.width
                 page_height = page_obj.rect.height
                 if page_width > 2000 or page_height > 2000:
-                    dpi = 50  # Large pages: 50 DPI (saves ~50% memory) - AGGRESSIVE
-                    profiler.record_step("→ Large page detected", f"{page_width:.0f}×{page_height:.0f}, using DPI=50")
+                    dpi = 40  # Large pages: 40 DPI (was 50, further reduced to prevent spikes)
+                    profiler.record_step("→ Large page detected", f"{page_width:.0f}×{page_height:.0f}, using DPI=40")
                 else:
-                    dpi = 60  # Normal pages: 60 DPI (reduced from 72)
+                    dpi = 50  # Normal pages: 50 DPI (reduced from 60)
                 
                 # Render page as PNG
                 pix = page_obj.get_pixmap(dpi=dpi, alpha=False)
@@ -608,10 +609,10 @@ if st.session_state.run_analysis_triggered and \
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
                     try:
-                        analysis_res_core = analyze_page(
-                            page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
-                            recall_mode="strict"   # or "balanced"/"high"
-                        )
+                    analysis_res_core = analyze_page(
+                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
+                        recall_mode="strict"   # or "balanced"/"high"
+                    )
                         profiler.record_step("9. analyze_page()", f"fence={analysis_res_core.get('fence_found')}")
                         
                         jr = json.loads(analysis_res_core["text_response"])
