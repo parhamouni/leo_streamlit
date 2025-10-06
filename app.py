@@ -535,15 +535,15 @@ if st.session_state.run_analysis_triggered and \
             current_memory = _rss_mb()
             # Adaptive memory limits based on Streamlit Cloud constraints
             # Note: Cloud baseline is ~730MB (vs ~270MB locally) due to container overhead
-            # Increased limits after profiling showed DPI=40 keeps memory spikes manageable
+            # Cloud testing showed 1020MB at page 20 with DPI=40, now using DPI=35
             if i < 5:
-                memory_limit = 900  # First 5 pages: allow initial stabilization (was 850)
+                memory_limit = 950  # First 5 pages: allow initial stabilization
             elif i < 25:
-                memory_limit = 950  # Pages 6-25: handle large page spikes (was 900 for 6-20)
+                memory_limit = 1050  # Pages 6-25: handle large page spikes (page 20 hit 1020MB)
             elif i < 50:
-                memory_limit = 1000  # Pages 26-50: allow moderate growth (was 950)
+                memory_limit = 1100  # Pages 26-50: allow moderate growth
             else:
-                memory_limit = 1050  # Pages 51+: maximum (was 1000)
+                memory_limit = 1150  # Pages 51+: maximum (near Streamlit Cloud's ~1.2GB limit)
             
             if current_memory > memory_limit:
                 error_msg = f"⚠️ Memory usage too high ({current_memory:.1f} MB). Stopping analysis to prevent crash."
@@ -566,14 +566,15 @@ if st.session_state.run_analysis_triggered and \
             single_page_pdf_bytes = None
             try:
                 # ULTRA-AGGRESSIVE DPI: use very low DPI for large pages to prevent memory spikes
-                # On pages 19-23, get_pixmap() causes +80-100MB temporary spikes
+                # Cloud testing shows pages 19-20 still hitting 1020MB with DPI=40
+                # Further reducing to DPI=35 to prevent spikes
                 page_width = page_obj.rect.width
                 page_height = page_obj.rect.height
                 if page_width > 2000 or page_height > 2000:
-                    dpi = 40  # Large pages: 40 DPI (was 50, further reduced to prevent spikes)
-                    profiler.record_step("→ Large page detected", f"{page_width:.0f}×{page_height:.0f}, using DPI=40")
+                    dpi = 35  # Large pages: 35 DPI (was 40, further reduced after Cloud testing)
+                    profiler.record_step("→ Large page detected", f"{page_width:.0f}×{page_height:.0f}, using DPI=35")
                 else:
-                    dpi = 50  # Normal pages: 50 DPI (reduced from 60)
+                    dpi = 45  # Normal pages: 45 DPI (reduced from 50)
                 
                 # Render page as PNG
                 pix = page_obj.get_pixmap(dpi=dpi, alpha=False)
@@ -610,10 +611,10 @@ if st.session_state.run_analysis_triggered and \
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
                     try:
-                        analysis_res_core = analyze_page(
-                            page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
-                            recall_mode="strict"   # or "balanced"/"high"
-                        )
+                    analysis_res_core = analyze_page(
+                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
+                        recall_mode="strict"   # or "balanced"/"high"
+                    )
                         profiler.record_step("9. analyze_page()", f"fence={analysis_res_core.get('fence_found')}")
                         
                         jr = json.loads(analysis_res_core["text_response"])
