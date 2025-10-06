@@ -14,3 +14,4 @@ google-oauth2-tool>=0.0.3
 pandas>=1.5.0
 rich>=13.0.0
 toml>=0.10.2
+psutil>=5.9.0

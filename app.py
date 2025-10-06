@@ -16,14 +16,29 @@ import sys
 try:
     import psutil
     import os
+    import resource
     def _rss_mb():
         try:
+            # Try psutil first
             return psutil.Process(os.getpid()).memory_info().rss / (1024**2)
         except:
-            return 0.0
+            try:
+                # Fallback to resource module (works on Linux/Unix)
+                return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KB to MB on Linux
+            except:
+                return 0.0
 except ImportError:
-    def _rss_mb(): 
-        return 0.0
+    try:
+        import resource
+        def _rss_mb():
+            try:
+                # resource.getrusage works on Unix systems
+                return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KB to MB
+            except:
+                return 0.0
+    except ImportError:
+        def _rss_mb(): 
+            return 0.0
 
 # Setup comprehensive error logging
 def log_exception(session_id, context, exception):
