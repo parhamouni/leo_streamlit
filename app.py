@@ -252,10 +252,20 @@ def _generate_display_images_for_page_cached(page_idx,
         For backward-compatibility, if items look like dict-items we try to
         reconstruct x0..y1 from them.
     """
-    # Try backup first (processing), then original (before processing started)
-    pdf_bytes_source = st.session_state.get('original_pdf_bytes_backup') or st.session_state.get('original_pdf_bytes')
+    # Get PDF bytes from temp file (during processing) or session state (before processing)
+    pdf_bytes_source = None
+    if st.session_state.get('temp_pdf_path'):
+        # Read from temp file
+        try:
+            with open(st.session_state.temp_pdf_path, 'rb') as f:
+                pdf_bytes_source = f.read()
+        except:
+            pass
     if not pdf_bytes_source:
-        print(f"SESSION {session_id_for_log} ERROR (_cached): original_pdf_bytes missing for hash {pdf_hash_for_cache_key}")
+        pdf_bytes_source = st.session_state.get('original_pdf_bytes')
+    
+    if not pdf_bytes_source:
+        print(f"SESSION {session_id_for_log} ERROR (_cached): PDF not available for hash {pdf_hash_for_cache_key}")
         return None, None
 
     # Parse rectangles defensively
@@ -460,13 +470,24 @@ if st.session_state.run_analysis_triggered and \
         st.session_state.doc_total_pages = len(doc_proc_loop)
         print(f"SESSION {current_session_id} LOG: PDF opened, {st.session_state.doc_total_pages} pages.")
         
-        # CRITICAL: Free the 150MB PDF from session state NOW - we only need the open doc_proc_loop
-        # Keep a backup for generating final PDF later
-        st.session_state.original_pdf_bytes_backup = st.session_state.original_pdf_bytes
+        # CRITICAL: DON'T store PDF in session state at all during processing!
+        # The doc_proc_loop keeps the PDF open, we don't need it in session state
+        # We'll re-open from disk for final PDF generation if needed
+        print(f"SESSION {current_session_id} LOG: PDF opened. Memory BEFORE freeing PDF: {_rss_mb():.1f} MB")
+        
+        # Save PDF to temp file for later use (if needed for final combined PDF)
+        import tempfile
+        temp_pdf_path = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+        temp_pdf_path.write(st.session_state.original_pdf_bytes)
+        temp_pdf_path.close()
+        st.session_state.temp_pdf_path = temp_pdf_path.name
+        
+        # NOW free the 149MB from session state completely
         st.session_state.original_pdf_bytes = None
         import gc
         gc.collect()
-        print(f"SESSION {current_session_id} LOG: Freed original PDF from session state. RAM: {_rss_mb():.1f} MB")
+        gc.collect()  # Call twice to ensure it's freed
+        print(f"SESSION {current_session_id} LOG: Freed 149MB PDF from session state. RAM AFTER: {_rss_mb():.1f} MB")
     except Exception as e:
         st.error(f"Failed to open PDF: {e}"); st.session_state.processing_complete = True; st.session_state.analysis_halted_due_to_error = True
         if doc_proc_loop: doc_proc_loop.close()
@@ -785,9 +806,12 @@ if st.session_state.run_analysis_triggered and \
     st.session_state.processing_complete = True 
     if not st.session_state.analysis_halted_due_to_error:
         prog_bar.empty(); status_txt_area.success("All pages processed!")
-        if st.session_state.fence_pages and st.session_state.original_pdf_bytes_backup:
+        if st.session_state.fence_pages and st.session_state.temp_pdf_path:
+            # Read PDF from temp file
+            with open(st.session_state.temp_pdf_path, 'rb') as f:
+                pdf_bytes_for_final = f.read()
             pdf_b, pdf_n = generate_combined_highlighted_pdf(
-                st.session_state.original_pdf_bytes_backup,
+                pdf_bytes_for_final,
                 st.session_state.fence_pages,
                 st.session_state.uploaded_pdf_name,
                 current_session_id
