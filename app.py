@@ -535,14 +535,15 @@ if st.session_state.run_analysis_triggered and \
             current_memory = _rss_mb()
             # Adaptive memory limits based on Streamlit Cloud constraints
             # Note: Cloud baseline is ~730MB (vs ~270MB locally) due to container overhead
+            # Increased limits after profiling showed DPI=40 keeps memory spikes manageable
             if i < 5:
-                memory_limit = 850  # First 5 pages: allow initial stabilization
-            elif i < 20:
-                memory_limit = 900  # Pages 6-20: normal processing
+                memory_limit = 900  # First 5 pages: allow initial stabilization (was 850)
+            elif i < 25:
+                memory_limit = 950  # Pages 6-25: handle large page spikes (was 900 for 6-20)
             elif i < 50:
-                memory_limit = 950  # Pages 21-50: allow moderate growth
+                memory_limit = 1000  # Pages 26-50: allow moderate growth (was 950)
             else:
-                memory_limit = 1000  # Pages 51+: maximum (Streamlit Cloud limit is ~1GB)
+                memory_limit = 1050  # Pages 51+: maximum (was 1000)
             
             if current_memory > memory_limit:
                 error_msg = f"⚠️ Memory usage too high ({current_memory:.1f} MB). Stopping analysis to prevent crash."
