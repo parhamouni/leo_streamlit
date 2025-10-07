@@ -1,0 +1,130 @@
+================================================================================
+FULL 84-PAGE TEST - Find Generalizable Solution
+================================================================================
+Local baseline: 48.1MB
+Cloud baseline (estimated): 730MB
+Cloud offset: +681.9MB
+
+PDF opened from file: 50.7MB
+Total pages: 84
+
+Processing all 84 pages...
+================================================================================
+✅ Page  5:  103.6MB local (Cloud:   785.5MB) Δ +14.4MB
+✅ Page 10:  137.2MB local (Cloud:   819.0MB) Δ  +3.0MB
+✅ Page 15:  155.1MB local (Cloud:   836.9MB) Δ  +2.7MB
+✅ Page 19:  238.5MB local (Cloud:   920.3MB) Δ +66.0MB
+✅ Page 20:  295.3MB local (Cloud:   977.2MB) Δ +56.8MB
+⚠️ Page 21:  364.9MB local (Cloud:  1046.8MB) Δ +69.6MB
+⚠️ Page 22:  443.4MB local (Cloud:  1125.2MB) Δ +78.5MB
+⚠️ Page 23:  504.7MB local (Cloud:  1186.6MB) Δ +61.3MB
+⚠️ Page 24:  502.1MB local (Cloud:  1184.0MB) Δ  -2.6MB
+⚠️ Page 25:  461.3MB local (Cloud:  1143.2MB) Δ -40.8MB
+⚠️ Page 26:  442.8MB local (Cloud:  1124.6MB) Δ -18.6MB
+⚠️ Page 27:  440.2MB local (Cloud:  1122.1MB) Δ  -2.5MB
+⚠️ Page 28:  439.2MB local (Cloud:  1121.0MB) Δ  -1.1MB
+⚠️ Page 29:  437.6MB local (Cloud:  1119.5MB) Δ  -1.5MB
+⚠️ Page 30:  432.6MB local (Cloud:  1114.5MB) Δ  -5.1MB
+⚠️ Page 31:  525.5MB local (Cloud:  1207.4MB) Δ +93.0MB
+⚠️ Page 32:  529.8MB local (Cloud:  1211.7MB) Δ  +4.3MB
+⚠️ Page 33:  531.0MB local (Cloud:  1212.9MB) Δ  +1.2MB
+⚠️ Page 34:  540.8MB local (Cloud:  1222.6MB) Δ  +9.8MB
+⚠️ Page 35:  575.3MB local (Cloud:  1257.2MB) Δ +34.5MB
+⚠️ Page 36:  594.7MB local (Cloud:  1276.5MB) Δ +19.4MB
+⚠️ Page 37:  597.3MB local (Cloud:  1279.2MB) Δ  +2.7MB
+⚠️ Page 38:  601.1MB local (Cloud:  1283.0MB) Δ  +3.8MB
+⚠️ Page 39:  605.9MB local (Cloud:  1287.8MB) Δ  +4.8MB
+⚠️ Page 40:  617.8MB local (Cloud:  1299.7MB) Δ +12.0MB
+⚠️ Page 41:  635.9MB local (Cloud:  1317.8MB) Δ +18.0MB
+⚠️ Page 42:  636.6MB local (Cloud:  1318.5MB) Δ  +0.7MB
+⚠️ Page 43:  649.0MB local (Cloud:  1330.9MB) Δ +12.4MB
+⚠️ Page 44:  654.1MB local (Cloud:  1336.0MB) Δ  +5.0MB
+⚠️ Page 45:  669.4MB local (Cloud:  1351.3MB) Δ +15.3MB
+⚠️ Page 46:  673.4MB local (Cloud:  1355.3MB) Δ  +4.0MB
+⚠️ Page 47:  678.4MB local (Cloud:  1360.3MB) Δ  +5.0MB
+⚠️ Page 48:  686.1MB local (Cloud:  1368.0MB) Δ  +7.7MB
+⚠️ Page 49:  688.7MB local (Cloud:  1370.6MB) Δ  +2.6MB
+⚠️ Page 50:  689.8MB local (Cloud:  1371.7MB) Δ  +1.1MB
+⚠️ Page 51:  690.2MB local (Cloud:  1372.0MB) Δ  +0.4MB
+⚠️ Page 52:  691.1MB local (Cloud:  1373.0MB) Δ  +0.9MB
+⚠️ Page 53:  694.3MB local (Cloud:  1376.2MB) Δ  +3.2MB
+⚠️ Page 54:  700.0MB local (Cloud:  1381.8MB) Δ  +5.7MB
+⚠️ Page 55:  654.9MB local (Cloud:  1336.8MB) Δ -45.1MB
+⚠️ Page 56:  665.0MB local (Cloud:  1346.9MB) Δ +10.2MB
+⚠️ Page 57:  665.8MB local (Cloud:  1347.7MB) Δ  +0.7MB
+⚠️ Page 58:  665.9MB local (Cloud:  1347.8MB) Δ  +0.2MB
+⚠️ Page 59:  666.0MB local (Cloud:  1347.9MB) Δ  +0.1MB
+⚠️ Page 60:  668.7MB local (Cloud:  1350.5MB) Δ  +2.7MB
+⚠️ Page 61:  662.2MB local (Cloud:  1344.1MB) Δ  -6.4MB
+⚠️ Page 62:  664.8MB local (Cloud:  1346.7MB) Δ  +2.6MB
+⚠️ Page 63:  664.9MB local (Cloud:  1346.8MB) Δ  +0.1MB
+⚠️ Page 64:  660.8MB local (Cloud:  1342.7MB) Δ  -4.1MB
+⚠️ Page 65:  661.5MB local (Cloud:  1343.4MB) Δ  +0.7MB
+⚠️ Page 66:  661.8MB local (Cloud:  1343.7MB) Δ  +0.3MB
+⚠️ Page 67:  650.8MB local (Cloud:  1332.6MB) Δ -11.0MB
+⚠️ Page 68:  653.0MB local (Cloud:  1334.9MB) Δ  +2.3MB
+⚠️ Page 69:  656.7MB local (Cloud:  1338.6MB) Δ  +3.7MB
+⚠️ Page 70:  743.3MB local (Cloud:  1425.1MB) Δ +86.6MB
+⚠️ Page 71:  745.8MB local (Cloud:  1427.6MB) Δ  +2.5MB
+⚠️ Page 72:  732.0MB local (Cloud:  1413.9MB) Δ -13.8MB
+⚠️ Page 73:  715.1MB local (Cloud:  1396.9MB) Δ -17.0MB
+⚠️ Page 74:  715.1MB local (Cloud:  1396.9MB) Δ  +0.0MB
+⚠️ Page 75:  716.4MB local (Cloud:  1398.2MB) Δ  +1.3MB
+⚠️ Page 76:  709.6MB local (Cloud:  1391.5MB) Δ  -6.8MB
+⚠️ Page 77:  707.8MB local (Cloud:  1389.7MB) Δ  -1.8MB
+⚠️ Page 78:  703.4MB local (Cloud:  1385.3MB) Δ  -4.4MB
+⚠️ Page 79:  700.5MB local (Cloud:  1382.4MB) Δ  -2.8MB
+⚠️ Page 80:  685.5MB local (Cloud:  1367.4MB) Δ -15.0MB
+⚠️ Page 81:  672.9MB local (Cloud:  1354.8MB) Δ -12.6MB
+⚠️ Page 82:  666.4MB local (Cloud:  1348.3MB) Δ  -6.5MB
+⚠️ Page 83:  634.8MB local (Cloud:  1316.7MB) Δ -31.6MB
+⚠️ Page 84:  634.9MB local (Cloud:  1316.8MB) Δ  +0.1MB
+
+================================================================================
+ANALYSIS
+================================================================================
+
+Pages exceeding 1024MB on Cloud: 64
+Problem pages:
+  Page 21: 1046.8MB
+  Page 22: 1125.2MB
+  Page 23: 1186.6MB
+  Page 24: 1184.0MB
+  Page 25: 1143.2MB
+  Page 26: 1124.6MB
+  Page 27: 1122.1MB
+  Page 28: 1121.0MB
+  Page 29: 1119.5MB
+  Page 30: 1114.5MB
+
+Top 10 pages by memory increase:
+  Page 31:  +93.0MB (Cloud: 1207.4MB)
+  Page 70:  +86.6MB (Cloud: 1425.1MB)
+  Page 22:  +78.5MB (Cloud: 1125.2MB)
+  Page 21:  +69.6MB (Cloud: 1046.8MB)
+  Page 19:  +66.0MB (Cloud: 920.3MB)
+  Page 23:  +61.3MB (Cloud: 1186.6MB)
+  Page 20:  +56.8MB (Cloud: 977.2MB)
+  Page 35:  +34.5MB (Cloud: 1257.2MB)
+  Page  4:  +23.8MB (Cloud: 771.1MB)
+  Page 36:  +19.4MB (Cloud: 1276.5MB)
+
+Memory pattern:
+  Peak Cloud memory: 1427.6MB at page 71
+  Final Cloud memory: 1316.8MB
+  Average growth: +7.0MB per page
+
+Pages with significant cleanup (Δ<-10MB): 9
+
+================================================================================
+RECOMMENDATION
+================================================================================
+❌ Peak exceeds 1024MB by 403.6MB
+
+Options:
+1. Lower DPI further: 35→30 (would save ~20-30MB)
+2. Skip image generation for pages 66-76 (spike zone)
+3. Use text-only Document AI (no page_bytes)
+4. Process in batches of 40 pages each
+================================================================================
+

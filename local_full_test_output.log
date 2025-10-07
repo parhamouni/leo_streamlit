@@ -1,0 +1,528 @@
+✅ Comprehensive text extraction available
+================================================================================
+LOCAL FULL TEST - Replicating Streamlit Cloud (First 30 Pages)
+================================================================================
+Simulating Cloud baseline: ~730MB
+Starting memory: 182.2MB
+
+Step 1: Load PDF into memory (simulating file upload)
+   After upload: 331.2MB
+
+Step 2: Write to temp file
+   After writing: 331.2MB
+
+Step 3: Free PDF from memory
+   After freeing: 182.2MB
+
+Step 4: Open PDF from file
+   After opening: 183.1MB
+   Total pages: 84
+
+================================================================================
+Processing Pages (with Document AI)
+================================================================================
+
+📄 Page 1 START: 183.2MB
+   1. GC cleanup: 183.2MB (+0.0MB)
+   3. load_page(): 184.0MB (+0.9MB)
+   4. get_text(): 186.1MB (+2.1MB) len=2869
+   5. get_pixmap(): 189.2MB (+3.1MB) size=660x510
+   6. tobytes() + free pixmap: 190.7MB (+1.5MB) 0.07MB PNG
+   7. PDF wrapper: 192.1MB (+1.4MB) 0.07MB
+   8. Cleanup img_bytes: 192.1MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 1: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 192.1MB (+0.0MB) fence=False
+   10. Extract signals: 192.1MB (+0.0MB) count=0
+   📊 Page 1 NET: +8.9MB (start=183.2MB, end=192.1MB)
+
+📄 Page 2 START: 192.1MB
+   1. GC cleanup: 192.1MB (+0.0MB)
+   3. load_page(): 192.1MB (+0.0MB)
+   4. get_text(): 192.5MB (+0.4MB) len=2680
+   5. get_pixmap(): 195.1MB (+2.6MB) size=660x510
+   6. tobytes() + free pixmap: 196.2MB (+1.1MB) 0.06MB PNG
+   7. PDF wrapper: 196.2MB (+0.0MB) 0.06MB
+   8. Cleanup img_bytes: 196.2MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 2: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 196.2MB (+0.0MB) fence=False
+   10. Extract signals: 196.2MB (+0.0MB) count=0
+   📊 Page 2 NET: +4.1MB (start=192.1MB, end=196.2MB)
+
+📄 Page 3 START: 196.2MB
+   1. GC cleanup: 196.2MB (+0.0MB)
+   2. Cache clear: (would clear here)
+   3. load_page(): 196.2MB (+0.0MB)
+   4. get_text(): 196.3MB (+0.1MB) len=449
+   5. get_pixmap(): 198.7MB (+2.3MB) size=660x510
+   6. tobytes() + free pixmap: 199.7MB (+1.0MB) 0.02MB PNG
+   7. PDF wrapper: 199.7MB (+0.0MB) 0.02MB
+   8. Cleanup img_bytes: 199.7MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 3: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 199.7MB (+0.0MB) fence=False
+   10. Extract signals: 199.7MB (+0.0MB) count=0
+   📊 Page 3 NET: +3.5MB (start=196.2MB, end=199.7MB)
+
+📄 Page 4 START: 199.7MB
+   1. GC cleanup: 199.7MB (+0.0MB)
+   3. load_page(): 199.7MB (+0.0MB)
+   4. get_text(): 200.7MB (+1.0MB) len=2008
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 217.4MB (+16.8MB) size=1800x1200
+   6. tobytes() + free pixmap: 224.8MB (+7.4MB) 0.48MB PNG
+   7. PDF wrapper: 231.1MB (+6.2MB) 0.48MB
+   8. Cleanup img_bytes: 231.1MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 4: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 231.1MB (+0.0MB) fence=False
+   10. Extract signals: 231.1MB (+0.0MB) count=0
+   📊 Page 4 NET: +31.3MB (start=199.7MB, end=231.1MB)
+
+📄 Page 5 START: 231.1MB
+   1. GC cleanup: 231.1MB (+0.0MB)
+   2. Cache clear: (would clear here)
+   3. load_page(): 231.1MB (+0.0MB)
+   4. get_text(): 232.4MB (+1.3MB) len=1320
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 238.0MB (+5.6MB) size=1800x1200
+   6. tobytes() + free pixmap: 244.6MB (+6.7MB) 0.48MB PNG
+   7. PDF wrapper: 245.9MB (+1.2MB) 0.48MB
+   8. Cleanup img_bytes: 245.9MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 5: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 245.9MB (+0.0MB) fence=False
+   10. Extract signals: 245.9MB (+0.0MB) count=0
+   📊 Page 5 NET: +14.8MB (start=231.1MB, end=245.9MB)
+
+📄 Page 6 START: 245.9MB
+   1. GC cleanup: 245.9MB (+0.0MB)
+   3. load_page(): 246.0MB (+0.1MB)
+   4. get_text(): 247.4MB (+1.5MB) len=2419
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 249.4MB (+2.0MB) size=1800x1200
+   6. tobytes() + free pixmap: 256.5MB (+7.1MB) 0.52MB PNG
+   7. PDF wrapper: 257.3MB (+0.7MB) 0.52MB
+   8. Cleanup img_bytes: 257.3MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 6: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 257.3MB (+0.0MB) fence=False
+   10. Extract signals: 257.3MB (+0.0MB) count=0
+   📊 Page 6 NET: +11.4MB (start=245.9MB, end=257.3MB)
+
+📄 Page 7 START: 257.3MB
+   1. GC cleanup: 257.3MB (+0.0MB)
+   2. Cache clear: (would clear here)
+   3. load_page(): 257.3MB (+0.0MB)
+   4. get_text(): 259.5MB (+2.2MB) len=6090
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 265.6MB (+6.1MB) size=1800x1200
+   6. tobytes() + free pixmap: 272.1MB (+6.5MB) 0.45MB PNG
+   7. PDF wrapper: 272.1MB (+0.0MB) 0.45MB
+   8. Cleanup img_bytes: 272.1MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 7: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 272.3MB (+0.1MB) fence=False
+   10. Extract signals: 272.3MB (+0.0MB) count=0
+   📊 Page 7 NET: +15.0MB (start=257.3MB, end=272.3MB)
+
+📄 Page 8 START: 272.3MB
+   1. GC cleanup: 272.3MB (+0.0MB)
+   3. load_page(): 272.3MB (+0.0MB)
+   4. get_text(): 273.5MB (+1.2MB) len=6065
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 280.7MB (+7.2MB) size=1800x1200
+   6. tobytes() + free pixmap: 285.6MB (+4.9MB) 0.41MB PNG
+   7. PDF wrapper: 297.5MB (+12.0MB) 0.41MB
+   8. Cleanup img_bytes: 297.5MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 8: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 297.5MB (+0.0MB) fence=False
+   10. Extract signals: 297.5MB (+0.0MB) count=0
+   📊 Page 8 NET: +25.2MB (start=272.3MB, end=297.5MB)
+
+📄 Page 9 START: 297.5MB
+   1. GC cleanup: 297.5MB (+0.0MB)
+   2. Cache clear: (would clear here)
+   3. load_page(): 297.5MB (+0.0MB)
+   4. get_text(): 297.6MB (+0.1MB) len=1259
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 297.8MB (+0.2MB) size=1800x1200
+   6. tobytes() + free pixmap: 304.6MB (+6.8MB) 0.29MB PNG
+   7. PDF wrapper: 304.6MB (+0.0MB) 0.29MB
+   8. Cleanup img_bytes: 304.6MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 9: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 304.6MB (+0.0MB) fence=False
+   10. Extract signals: 304.6MB (+0.0MB) count=0
+   📊 Page 9 NET: +6.5MB (start=297.5MB, end=304.1MB)
+
+📄 Page 10 START: 304.1MB
+   1. GC cleanup: 304.1MB (+0.0MB)
+   3. load_page(): 304.1MB (+0.0MB)
+   4. get_text(): 304.1MB (+0.0MB) len=1074
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 304.1MB (+0.0MB) size=1800x1200
+   6. tobytes() + free pixmap: 304.1MB (+0.0MB) 0.25MB PNG
+   7. PDF wrapper: 308.9MB (+4.8MB) 0.25MB
+   8. Cleanup img_bytes: 308.9MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 10: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 308.9MB (+0.0MB) fence=False
+   10. Extract signals: 308.9MB (+0.0MB) count=0
+   📊 Page 10 NET: +4.8MB (start=304.1MB, end=308.9MB)
+
+📄 Page 11 START: 308.9MB
+   1. GC cleanup: 308.9MB (+0.0MB)
+   2. Cache clear: (would clear here)
+   3. load_page(): 308.9MB (+0.0MB)
+   4. get_text(): 309.2MB (+0.4MB) len=4389
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 310.4MB (+1.2MB) size=1800x1200
+   6. tobytes() + free pixmap: 316.9MB (+6.5MB) 0.72MB PNG
+   7. PDF wrapper: 316.9MB (+0.0MB) 0.72MB
+   8. Cleanup img_bytes: 316.9MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 11: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 316.9MB (+0.0MB) fence=False
+   10. Extract signals: 316.9MB (+0.0MB) count=0
+   📊 Page 11 NET: +8.0MB (start=308.9MB, end=316.9MB)
+
+📄 Page 12 START: 316.9MB
+   1. GC cleanup: 316.9MB (+0.0MB)
+   3. load_page(): 316.9MB (+0.0MB)
+   4. get_text(): 316.9MB (+0.0MB) len=1009
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 317.1MB (+0.2MB) size=1800x1200
+   6. tobytes() + free pixmap: 323.7MB (+6.5MB) 0.24MB PNG
+   7. PDF wrapper: 325.4MB (+1.7MB) 0.24MB
+   8. Cleanup img_bytes: 325.4MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 12: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 325.4MB (+0.0MB) fence=False
+   10. Extract signals: 325.4MB (+0.0MB) count=0
+   📊 Page 12 NET: +8.6MB (start=316.9MB, end=325.4MB)
+
+📄 Page 13 START: 325.4MB
+   1. GC cleanup: 325.4MB (+0.0MB)
+   2. Cache clear: (would clear here)
+   3. load_page(): 325.6MB (+0.2MB)
+   4. get_text(): 327.7MB (+2.1MB) len=1525
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 332.0MB (+4.3MB) size=1800x1200
+   6. tobytes() + free pixmap: 337.1MB (+5.1MB) 0.69MB PNG
+   7. PDF wrapper: 338.5MB (+1.5MB) 0.69MB
+   8. Cleanup img_bytes: 338.5MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 13: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 338.5MB (+0.0MB) fence=False
+   10. Extract signals: 338.5MB (+0.0MB) count=0
+   📊 Page 13 NET: +13.1MB (start=325.4MB, end=338.5MB)
+
+📄 Page 14 START: 338.5MB
+   1. GC cleanup: 338.5MB (+0.0MB)
+   3. load_page(): 338.5MB (+0.0MB)
+   4. get_text(): 338.6MB (+0.1MB) len=1187
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 339.0MB (+0.3MB) size=1800x1200
+   6. tobytes() + free pixmap: 339.9MB (+1.0MB) 0.78MB PNG
+   7. PDF wrapper: 340.0MB (+0.1MB) 0.78MB
+   8. Cleanup img_bytes: 340.0MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 14: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 340.0MB (+0.0MB) fence=False
+   10. Extract signals: 340.0MB (+0.0MB) count=0
+   📊 Page 14 NET: +1.5MB (start=338.5MB, end=340.0MB)
+
+📄 Page 15 START: 340.0MB
+   1. GC cleanup: 340.0MB (+0.0MB)
+   2. Cache clear: (would clear here)
+   3. load_page(): 340.0MB (+0.0MB)
+   4. get_text(): 340.0MB (+0.0MB) len=972
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 340.3MB (+0.2MB) size=1800x1200
+   6. tobytes() + free pixmap: 343.8MB (+3.5MB) 0.47MB PNG
+   7. PDF wrapper: 343.8MB (+0.0MB) 0.47MB
+   8. Cleanup img_bytes: 343.8MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 15: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 343.8MB (+0.0MB) fence=False
+   10. Extract signals: 343.8MB (+0.0MB) count=0
+   📊 Page 15 NET: +3.8MB (start=340.0MB, end=343.8MB)
+
+📄 Page 16 START: 343.8MB
+   1. GC cleanup: 343.8MB (+0.0MB)
+   3. load_page(): 344.1MB (+0.3MB)
+   4. get_text(): 344.4MB (+0.4MB) len=908
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 345.5MB (+1.0MB) size=1800x1200
+   6. tobytes() + free pixmap: 350.0MB (+4.6MB) 0.60MB PNG
+   7. PDF wrapper: 350.1MB (+0.0MB) 0.60MB
+   8. Cleanup img_bytes: 350.1MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 16: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 350.1MB (+0.0MB) fence=False
+   10. Extract signals: 350.1MB (+0.0MB) count=0
+   📊 Page 16 NET: +6.3MB (start=343.8MB, end=350.1MB)
+
+📄 Page 17 START: 350.1MB
+   1. GC cleanup: 350.1MB (+0.0MB)
+   2. Cache clear: (would clear here)
+   3. load_page(): 350.1MB (+0.0MB)
+   4. get_text(): 350.5MB (+0.5MB) len=915
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 350.9MB (+0.4MB) size=1800x1200
+   6. tobytes() + free pixmap: 353.2MB (+2.3MB) 0.31MB PNG
+   7. PDF wrapper: 353.2MB (+0.0MB) 0.31MB
+   8. Cleanup img_bytes: 353.2MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 17: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 353.2MB (+0.0MB) fence=False
+   10. Extract signals: 353.2MB (+0.0MB) count=0
+   📊 Page 17 NET: +3.2MB (start=350.1MB, end=353.2MB)
+
+📄 Page 18 START: 353.2MB
+   1. GC cleanup: 353.2MB (+0.0MB)
+   3. load_page(): 353.3MB (+0.1MB)
+   4. get_text(): 356.6MB (+3.3MB) len=911
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 357.2MB (+0.6MB) size=1800x1200
+   6. tobytes() + free pixmap: 361.3MB (+4.1MB) 0.47MB PNG
+   7. PDF wrapper: 361.3MB (+0.0MB) 0.47MB
+   8. Cleanup img_bytes: 361.3MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 18: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 361.3MB (+0.0MB) fence=False
+   10. Extract signals: 361.3MB (+0.0MB) count=0
+   📊 Page 18 NET: +8.1MB (start=353.2MB, end=361.3MB)
+
+📄 Page 19 START: 361.3MB
+   1. GC cleanup: 361.3MB (+0.0MB)
+   2. Cache clear: (would clear here)
+   3. load_page(): 361.3MB (+0.0MB)
+   4. get_text(): 363.0MB (+1.7MB) len=1087
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 444.3MB (+81.3MB) size=1800x1200
+   6. tobytes() + free pixmap: 451.7MB (+7.5MB) 0.63MB PNG
+   7. PDF wrapper: 450.8MB (-1.0MB) 0.63MB
+   8. Cleanup img_bytes: 450.8MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 19: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 450.8MB (+0.0MB) fence=False
+   10. Extract signals: 450.8MB (+0.0MB) count=0
+   📊 Page 19 NET: +89.4MB (start=361.3MB, end=450.8MB)
+
+📄 Page 20 START: 450.8MB
+   1. GC cleanup: 450.8MB (+0.0MB)
+   3. load_page(): 450.8MB (+0.0MB)
+   4. get_text(): 449.8MB (-0.9MB) len=1405
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 503.4MB (+53.6MB) size=1800x1200
+   6. tobytes() + free pixmap: 510.7MB (+7.3MB) 0.55MB PNG
+   7. PDF wrapper: 517.7MB (+7.0MB) 0.55MB
+   8. Cleanup img_bytes: 517.7MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 20: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 517.7MB (+0.0MB) fence=False
+   10. Extract signals: 517.7MB (+0.0MB) count=0
+   📊 Page 20 NET: +67.0MB (start=450.8MB, end=517.7MB)
+
+📄 Page 21 START: 517.7MB
+   1. GC cleanup: 517.7MB (+0.0MB)
+   2. Cache clear: (would clear here)
+   3. load_page(): 517.7MB (+0.0MB)
+   4. get_text(): 518.7MB (+1.0MB) len=926
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 605.8MB (+87.0MB) size=1800x1200
+   6. tobytes() + free pixmap: 612.9MB (+7.2MB) 0.48MB PNG
+   7. PDF wrapper: 619.1MB (+6.2MB) 0.48MB
+   8. Cleanup img_bytes: 619.1MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 21: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 619.1MB (+0.0MB) fence=False
+   10. Extract signals: 619.1MB (+0.0MB) count=0
+   📊 Page 21 NET: +101.4MB (start=517.7MB, end=619.1MB)
+
+📄 Page 22 START: 619.1MB
+   1. GC cleanup: 619.1MB (+0.0MB)
+   3. load_page(): 619.1MB (+0.0MB)
+   4. get_text(): 619.5MB (+0.3MB) len=1040
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 681.6MB (+62.1MB) size=1800x1200
+   6. tobytes() + free pixmap: 688.7MB (+7.1MB) 0.46MB PNG
+   7. PDF wrapper: 694.8MB (+6.1MB) 0.46MB
+   8. Cleanup img_bytes: 694.8MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 22: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 694.8MB (+0.0MB) fence=False
+   10. Extract signals: 694.8MB (+0.0MB) count=0
+   📊 Page 22 NET: +75.7MB (start=619.1MB, end=694.8MB)
+
+📄 Page 23 START: 694.8MB
+   1. GC cleanup: 694.8MB (+0.0MB)
+   2. Cache clear: (would clear here)
+   3. load_page(): 694.8MB (+0.0MB)
+   4. get_text(): 694.9MB (+0.1MB) len=924
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 796.4MB (+101.4MB) size=1800x1200
+   6. tobytes() + free pixmap: 794.8MB (-1.5MB) 0.39MB PNG
+   7. PDF wrapper: 797.4MB (+2.6MB) 0.39MB
+   8. Cleanup img_bytes: 797.4MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 23: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 797.4MB (+0.0MB) fence=False
+   10. Extract signals: 797.4MB (+0.0MB) count=0
+   📊 Page 23 NET: +102.6MB (start=694.8MB, end=797.4MB)
+
+📄 Page 24 START: 797.4MB
+   1. GC cleanup: 797.4MB (+0.0MB)
+   3. load_page(): 797.4MB (+0.0MB)
+   4. get_text(): 797.6MB (+0.2MB) len=890
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 797.7MB (+0.1MB) size=1800x1200
+   6. tobytes() + free pixmap: 797.7MB (+0.0MB) 0.18MB PNG
+   7. PDF wrapper: 799.0MB (+1.3MB) 0.18MB
+   8. Cleanup img_bytes: 799.0MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 24: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 799.0MB (+0.0MB) fence=False
+   10. Extract signals: 799.0MB (+0.0MB) count=0
+   📊 Page 24 NET: +1.6MB (start=797.4MB, end=799.0MB)
+
+📄 Page 25 START: 799.0MB
+   1. GC cleanup: 799.0MB (+0.0MB)
+   2. Cache clear: (would clear here)
+   3. load_page(): 799.0MB (+0.0MB)
+   4. get_text(): 799.3MB (+0.3MB) len=1593
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 800.7MB (+1.4MB) size=1800x1200
+   6. tobytes() + free pixmap: 800.7MB (+0.0MB) 0.65MB PNG
+   7. PDF wrapper: 802.7MB (+2.0MB) 0.65MB
+   8. Cleanup img_bytes: 802.7MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 25: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 802.7MB (+0.0MB) fence=False
+   10. Extract signals: 802.7MB (+0.0MB) count=0
+   📊 Page 25 NET: +3.7MB (start=799.0MB, end=802.7MB)
+
+📄 Page 26 START: 802.7MB
+   1. GC cleanup: 802.7MB (+0.0MB)
+   3. load_page(): 802.7MB (+0.0MB)
+   4. get_text(): 803.1MB (+0.4MB) len=1061
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 803.6MB (+0.5MB) size=1800x1200
+   6. tobytes() + free pixmap: 810.3MB (+6.7MB) 0.62MB PNG
+   7. PDF wrapper: 815.7MB (+5.4MB) 0.62MB
+   8. Cleanup img_bytes: 815.7MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 26: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 815.7MB (+0.0MB) fence=False
+   10. Extract signals: 815.7MB (+0.0MB) count=0
+   📊 Page 26 NET: +13.0MB (start=802.7MB, end=815.7MB)
+
+📄 Page 27 START: 815.7MB
+   1. GC cleanup: 815.7MB (+0.0MB)
+   2. Cache clear: (would clear here)
+   3. load_page(): 815.7MB (+0.0MB)
+   4. get_text(): 815.0MB (-0.7MB) len=956
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 815.9MB (+0.9MB) size=1800x1200
+   6. tobytes() + free pixmap: 816.0MB (+0.0MB) 0.42MB PNG
+   7. PDF wrapper: 818.3MB (+2.4MB) 0.42MB
+   8. Cleanup img_bytes: 818.3MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 27: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 818.3MB (+0.0MB) fence=False
+   10. Extract signals: 818.3MB (+0.0MB) count=0
+   📊 Page 27 NET: +2.6MB (start=815.7MB, end=818.3MB)
+
+📄 Page 28 START: 818.3MB
+   1. GC cleanup: 818.3MB (+0.0MB)
+   3. load_page(): 818.3MB (+0.0MB)
+   4. get_text(): 818.7MB (+0.4MB) len=1604
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 825.6MB (+6.9MB) size=1800x1200
+   6. tobytes() + free pixmap: 827.7MB (+2.1MB) 0.65MB PNG
+   7. PDF wrapper: 828.6MB (+0.9MB) 0.65MB
+   8. Cleanup img_bytes: 828.6MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 28: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 828.6MB (+0.0MB) fence=False
+   10. Extract signals: 828.6MB (+0.0MB) count=0
+   📊 Page 28 NET: +10.2MB (start=818.3MB, end=828.6MB)
+
+📄 Page 29 START: 828.6MB
+   1. GC cleanup: 828.6MB (+0.0MB)
+   2. Cache clear: (would clear here)
+   3. load_page(): 828.6MB (+0.0MB)
+   4. get_text(): 829.2MB (+0.7MB) len=1109
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 829.2MB (+0.0MB) size=1800x1200
+   6. tobytes() + free pixmap: 832.9MB (+3.7MB) 0.78MB PNG
+   7. PDF wrapper: 833.0MB (+0.0MB) 0.78MB
+   8. Cleanup img_bytes: 833.0MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 29: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 833.0MB (+0.0MB) fence=False
+   10. Extract signals: 833.0MB (+0.0MB) count=0
+   📊 Page 29 NET: +4.4MB (start=828.6MB, end=833.0MB)
+
+📄 Page 30 START: 833.0MB
+   1. GC cleanup: 833.0MB (+0.0MB)
+   3. load_page(): 833.0MB (+0.0MB)
+   4. get_text(): 834.9MB (+1.9MB) len=970
+   → Large page: 2592×1728, using DPI=50
+   5. get_pixmap(): 835.2MB (+0.4MB) size=1800x1200
+   6. tobytes() + free pixmap: 835.2MB (+0.0MB) 0.50MB PNG
+   7. PDF wrapper: 835.2MB (+0.0MB) 0.50MB
+   8. Cleanup img_bytes: 835.2MB (+0.0MB)
+⚠️ No Google Cloud configuration provided.
+analyze_page JSON parse failed pg 30: 'NoneType' object has no attribute 'invoke'
+   9. analyze_page(): 835.2MB (+0.0MB) fence=False
+   10. Extract signals: 835.2MB (+0.0MB) count=0
+   📊 Page 30 NET: +2.3MB (start=833.0MB, end=835.2MB)
+
+================================================================================
+SUMMARY
+================================================================================
+
+Pages processed: 30/30
+  Page  1:  183.2→ 192.1MB (Δ  +8.9MB) limit=850MB ✅
+  Page  2:  192.1→ 196.2MB (Δ  +4.1MB) limit=850MB ✅
+  Page  3:  196.2→ 199.7MB (Δ  +3.5MB) limit=850MB ✅
+  Page  4:  199.7→ 231.1MB (Δ +31.3MB) limit=850MB ✅
+  Page  5:  231.1→ 245.9MB (Δ +14.8MB) limit=850MB ✅
+  Page  6:  245.9→ 257.3MB (Δ +11.4MB) limit=900MB ✅
+  Page  7:  257.3→ 272.3MB (Δ +15.0MB) limit=900MB ✅
+  Page  8:  272.3→ 297.5MB (Δ +25.2MB) limit=900MB ✅
+  Page  9:  297.5→ 304.1MB (Δ  +6.5MB) limit=900MB ✅
+  Page 10:  304.1→ 308.9MB (Δ  +4.8MB) limit=900MB ✅
+  Page 11:  308.9→ 316.9MB (Δ  +8.0MB) limit=900MB ✅
+  Page 12:  316.9→ 325.4MB (Δ  +8.6MB) limit=900MB ✅
+  Page 13:  325.4→ 338.5MB (Δ +13.1MB) limit=900MB ✅
+  Page 14:  338.5→ 340.0MB (Δ  +1.5MB) limit=900MB ✅
+  Page 15:  340.0→ 343.8MB (Δ  +3.8MB) limit=900MB ✅
+  Page 16:  343.8→ 350.1MB (Δ  +6.3MB) limit=900MB ✅
+  Page 17:  350.1→ 353.2MB (Δ  +3.2MB) limit=900MB ✅
+  Page 18:  353.2→ 361.3MB (Δ  +8.1MB) limit=900MB ✅
+  Page 19:  361.3→ 450.8MB (Δ +89.4MB) limit=900MB ✅
+  Page 20:  450.8→ 517.7MB (Δ +67.0MB) limit=900MB ✅
+  Page 21:  517.7→ 619.1MB (Δ+101.4MB) limit=950MB ✅
+  Page 22:  619.1→ 694.8MB (Δ +75.7MB) limit=950MB ✅
+  Page 23:  694.8→ 797.4MB (Δ+102.6MB) limit=950MB ✅
+  Page 24:  797.4→ 799.0MB (Δ  +1.6MB) limit=950MB ✅
+  Page 25:  799.0→ 802.7MB (Δ  +3.7MB) limit=950MB ✅
+  Page 26:  802.7→ 815.7MB (Δ +13.0MB) limit=950MB ✅
+  Page 27:  815.7→ 818.3MB (Δ  +2.6MB) limit=950MB ✅
+  Page 28:  818.3→ 828.6MB (Δ +10.2MB) limit=950MB ✅
+  Page 29:  828.6→ 833.0MB (Δ  +4.4MB) limit=950MB ✅
+  Page 30:  833.0→ 835.2MB (Δ  +2.3MB) limit=950MB ✅
+
+Total memory growth: +652.1MB
+Average per page: +21.7MB
+Final memory: 835.2MB
+
+✅ SUCCESS: Completed 30 pages without halting
+================================================================================
+

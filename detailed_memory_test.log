@@ -1,0 +1,400 @@
+✅ Comprehensive text extraction available
+
+================================================================================
+🧪 COMPREHENSIVE MEMORY AND ACCURACY TEST
+================================================================================
+PDF: Combined_TO.pdf
+Size: 149.0MB
+================================================================================
+
+
+🧪 TEST 1: First 20 pages (with highlighting)
+
+================================================================================
+🧪 FULL DOCUMENT PROCESSING TEST
+================================================================================
+PDF: /Users/parhamhamouni/Desktop/leo/data/Marked up plans 2/Takeoff/Combined_TO.pdf
+Max pages: 20
+Highlighting: ON
+================================================================================
+
+📄 PDF has 84 pages
+🎯 Processing 20 pages
+💾 Initial memory: 214.0MB
+
+📄 Page 1/20 | Memory: 214.0MB
+    📊 Image wrapper: +9.4MB
+✅ Document AI client created (will be reused across pages)
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 103210 bytes, dimensions: 792x612
+📄 Document AI response: 2851 chars, 1 pages
+📝 Document AI found 435 valid text elements via OCR
+    📊 Analysis: +13.3MB
+    ⚪ No fence
+
+📄 Page 2/20 | Memory: 237.8MB
+    📊 Image wrapper: +9.7MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 95949 bytes, dimensions: 792x612
+📄 Document AI response: 2652 chars, 1 pages
+📝 Document AI found 431 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 3/20 | Memory: 251.8MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 31625 bytes, dimensions: 792x612
+📄 Document AI response: 450 chars, 1 pages
+📝 Document AI found 83 valid text elements via OCR
+    ⚪ No fence
+    🧹 Cleanup: 251.8MB → 255.3MB (freed -3.5MB)
+
+📄 Page 4/20 | Memory: 255.3MB
+    📊 Image wrapper: +57.7MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 869808 bytes, dimensions: 2592x1728
+📄 Document AI response: 9500 chars, 1 pages
+📝 Document AI found 1693 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 5/20 | Memory: 304.1MB
+    📊 Image wrapper: +17.4MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 862923 bytes, dimensions: 2592x1728
+📄 Document AI response: 8206 chars, 1 pages
+📝 Document AI found 1621 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 6/20 | Memory: 322.0MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 927403 bytes, dimensions: 2592x1728
+📄 Document AI response: 10489 chars, 1 pages
+📝 Document AI found 2078 valid text elements via OCR
+    ⚪ No fence
+    🧹 Cleanup: 322.0MB → 309.5MB (freed 12.5MB)
+
+📄 Page 7/20 | Memory: 309.5MB
+    📊 Image wrapper: +37.5MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 734250 bytes, dimensions: 2592x1728
+📄 Document AI response: 5624 chars, 1 pages
+📝 Document AI found 1176 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 8/20 | Memory: 350.2MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 684017 bytes, dimensions: 2592x1728
+📄 Document AI response: 5629 chars, 1 pages
+📝 Document AI found 1167 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 9/20 | Memory: 344.5MB
+    📊 Image wrapper: +5.1MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 506719 bytes, dimensions: 2592x1728
+📄 Document AI response: 3703 chars, 1 pages
+📝 Document AI found 921 valid text elements via OCR
+TIMER LOG: (get_fence_related_text_boxes) v14-hybrid-ocr-signals
+[HL DEBUG] Running OCR in addition to text-layer (mixed page).
+[HL DEBUG] final_boxes=30  page=(2592.0x1728.0)
+TIMER LOG: v14-hybrid-ocr-signals done. Boxes=30 in 1.395s
+    📊 OCR: +63.1MB (boxes=30)
+    ✅ Fence detected (boxes=30)
+    🧹 Cleanup: 344.5MB → 258.1MB (freed 86.5MB)
+
+📄 Page 10/20 | Memory: 258.1MB
+    📊 Image wrapper: +33.7MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 435024 bytes, dimensions: 2592x1728
+📄 Document AI response: 2878 chars, 1 pages
+📝 Document AI found 585 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 11/20 | Memory: 256.0MB
+    📊 Image wrapper: +41.6MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 1308261 bytes, dimensions: 2592x1728
+📄 Document AI response: 11043 chars, 1 pages
+📝 Document AI found 2328 valid text elements via OCR
+    📊 Analysis: +16.9MB
+TIMER LOG: (get_fence_related_text_boxes) v14-hybrid-ocr-signals
+[HL DEBUG] Running OCR in addition to text-layer (mixed page).
+[HL DEBUG] final_boxes=24  page=(2592.0x1728.0)
+TIMER LOG: v14-hybrid-ocr-signals done. Boxes=24 in 3.043s
+    📊 OCR: +19.9MB (boxes=24)
+    ✅ Fence detected (boxes=24)
+
+📄 Page 12/20 | Memory: 334.6MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 424322 bytes, dimensions: 2592x1728
+📄 Document AI response: 2934 chars, 1 pages
+📝 Document AI found 722 valid text elements via OCR
+    ⚪ No fence
+    🧹 Cleanup: 334.6MB → 337.4MB (freed -2.8MB)
+
+📄 Page 13/20 | Memory: 337.4MB
+    📊 Image wrapper: +7.6MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 1283604 bytes, dimensions: 2592x1728
+📄 Document AI response: 15208 chars, 1 pages
+📝 Document AI found 2939 valid text elements via OCR
+TIMER LOG: (get_fence_related_text_boxes) v14-hybrid-ocr-signals
+[HL DEBUG] Running OCR in addition to text-layer (mixed page).
+[HL DEBUG] final_boxes=17  page=(2592.0x1728.0)
+TIMER LOG: v14-hybrid-ocr-signals done. Boxes=17 in 2.689s
+    ✅ Fence detected (boxes=17)
+
+📄 Page 14/20 | Memory: 235.9MB
+    📊 Image wrapper: +13.5MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 1480996 bytes, dimensions: 2592x1728
+📄 Document AI response: 21438 chars, 1 pages
+📝 Document AI found 3807 valid text elements via OCR
+TIMER LOG: (get_fence_related_text_boxes) v14-hybrid-ocr-signals
+[HL DEBUG] Running OCR in addition to text-layer (mixed page).
+[HL DEBUG] final_boxes=23  page=(2592.0x1728.0)
+TIMER LOG: v14-hybrid-ocr-signals done. Boxes=23 in 3.260s
+    📊 OCR: +13.4MB (boxes=23)
+    ✅ Fence detected (boxes=23)
+
+📄 Page 15/20 | Memory: 259.8MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 829578 bytes, dimensions: 2592x1728
+📄 Document AI response: 4836 chars, 1 pages
+📝 Document AI found 1026 valid text elements via OCR
+    ⚪ No fence
+    🧹 Cleanup: 259.8MB → 359.5MB (freed -99.6MB)
+
+📄 Page 16/20 | Memory: 359.5MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 1081357 bytes, dimensions: 2592x1728
+📄 Document AI response: 5885 chars, 1 pages
+📝 Document AI found 1658 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 17/20 | Memory: 369.4MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 544833 bytes, dimensions: 2592x1728
+📄 Document AI response: 2794 chars, 1 pages
+📝 Document AI found 619 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 18/20 | Memory: 370.7MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 847423 bytes, dimensions: 2592x1728
+📄 Document AI response: 5559 chars, 1 pages
+📝 Document AI found 1590 valid text elements via OCR
+    ⚪ No fence
+    🧹 Cleanup: 370.7MB → 377.2MB (freed -6.5MB)
+
+📄 Page 19/20 | Memory: 377.2MB
+    📊 Image wrapper: +113.4MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 1153060 bytes, dimensions: 2592x1728
+📄 Document AI response: 9021 chars, 1 pages
+📝 Document AI found 1853 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 20/20 | Memory: 492.8MB
+    📊 Image wrapper: +68.6MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 1016732 bytes, dimensions: 2592x1728
+📄 Document AI response: 8409 chars, 1 pages
+📝 Document AI found 1810 valid text elements via OCR
+    ⚪ No fence
+
+
+================================================================================
+📊 TEST RESULTS
+================================================================================
+Status: ✅ COMPLETED
+
+Pages processed: 20/20
+Fence pages: 4
+Non-fence pages: 16
+
+Memory Stats:
+  Initial: 214.0MB
+  Final:   573.1MB
+  Peak:    492.8MB
+  Average: 312.0MB
+  Limit:   900MB
+
+Timing:
+  Total time: 128.0s
+  Per page: 6.4s
+================================================================================
+
+✅ Fence Pages Detected:
+   Page 9: 30 boxes, confidence=0.00
+   Page 11: 24 boxes, confidence=0.00
+   Page 13: 17 boxes, confidence=0.00
+   Page 14: 23 boxes, confidence=0.00
+
+📈 Memory Trend (every 10 pages):
+   Page   1:  214.0MB █████████████████████
+   Page  11:  256.0MB █████████████████████████
+
+🧪 TEST 2: All 84 pages (with highlighting)
+
+================================================================================
+🧪 FULL DOCUMENT PROCESSING TEST
+================================================================================
+PDF: /Users/parhamhamouni/Desktop/leo/data/Marked up plans 2/Takeoff/Combined_TO.pdf
+Max pages: ALL
+Highlighting: ON
+================================================================================
+
+📄 PDF has 84 pages
+🎯 Processing 84 pages
+💾 Initial memory: 575.0MB
+
+📄 Page 1/84 | Memory: 575.0MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 103210 bytes, dimensions: 792x612
+📄 Document AI response: 2851 chars, 1 pages
+📝 Document AI found 435 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 2/84 | Memory: 537.5MB
+    📊 Image wrapper: +7.1MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 95949 bytes, dimensions: 792x612
+📄 Document AI response: 2652 chars, 1 pages
+📝 Document AI found 431 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 3/84 | Memory: 547.0MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 31625 bytes, dimensions: 792x612
+📄 Document AI response: 450 chars, 1 pages
+📝 Document AI found 83 valid text elements via OCR
+    ⚪ No fence
+    🧹 Cleanup: 547.0MB → 341.5MB (freed 205.5MB)
+
+📄 Page 4/84 | Memory: 341.5MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 869808 bytes, dimensions: 2592x1728
+📄 Document AI response: 9500 chars, 1 pages
+📝 Document AI found 1693 valid text elements via OCR
+    📊 Analysis: +18.1MB
+    ⚪ No fence
+
+📄 Page 5/84 | Memory: 340.8MB
+    📊 Image wrapper: +15.6MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 862923 bytes, dimensions: 2592x1728
+📄 Document AI response: 8206 chars, 1 pages
+📝 Document AI found 1621 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 6/84 | Memory: 363.2MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 927403 bytes, dimensions: 2592x1728
+📄 Document AI response: 10489 chars, 1 pages
+📝 Document AI found 2078 valid text elements via OCR
+    ⚪ No fence
+    🧹 Cleanup: 363.2MB → 370.1MB (freed -6.9MB)
+
+📄 Page 7/84 | Memory: 370.1MB
+    📊 Image wrapper: +5.4MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 734250 bytes, dimensions: 2592x1728
+📄 Document AI response: 5624 chars, 1 pages
+📝 Document AI found 1176 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 8/84 | Memory: 371.7MB
+    📊 Image wrapper: +13.4MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 684017 bytes, dimensions: 2592x1728
+📄 Document AI response: 5629 chars, 1 pages
+📝 Document AI found 1167 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 9/84 | Memory: 391.1MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 506719 bytes, dimensions: 2592x1728
+📄 Document AI response: 3703 chars, 1 pages
+📝 Document AI found 921 valid text elements via OCR
+TIMER LOG: (get_fence_related_text_boxes) v14-hybrid-ocr-signals
+[HL DEBUG] Running OCR in addition to text-layer (mixed page).
+[HL DEBUG] final_boxes=22  page=(2592.0x1728.0)
+TIMER LOG: v14-hybrid-ocr-signals done. Boxes=22 in 1.921s
+    ✅ Fence detected (boxes=22)
+    🧹 Cleanup: 391.1MB → 403.1MB (freed -12.0MB)
+
+📄 Page 10/84 | Memory: 403.1MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 435024 bytes, dimensions: 2592x1728
+📄 Document AI response: 2878 chars, 1 pages
+📝 Document AI found 585 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 11/84 | Memory: 390.9MB
+    📊 Image wrapper: +15.3MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 1308261 bytes, dimensions: 2592x1728
+📄 Document AI response: 11043 chars, 1 pages
+📝 Document AI found 2328 valid text elements via OCR
+TIMER LOG: (get_fence_related_text_boxes) v14-hybrid-ocr-signals
+[HL DEBUG] Running OCR in addition to text-layer (mixed page).
+[HL DEBUG] final_boxes=25  page=(2592.0x1728.0)
+TIMER LOG: v14-hybrid-ocr-signals done. Boxes=25 in 2.987s
+    ✅ Fence detected (boxes=25)
+
+📄 Page 12/84 | Memory: 394.8MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 424322 bytes, dimensions: 2592x1728
+📄 Document AI response: 2934 chars, 1 pages
+📝 Document AI found 722 valid text elements via OCR
+    ⚪ No fence
+    🧹 Cleanup: 394.8MB → 396.9MB (freed -2.0MB)
+
+📄 Page 13/84 | Memory: 396.9MB
+    📊 Image wrapper: +5.8MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 1283604 bytes, dimensions: 2592x1728
+📄 Document AI response: 15208 chars, 1 pages
+📝 Document AI found 2939 valid text elements via OCR
+TIMER LOG: (get_fence_related_text_boxes) v14-hybrid-ocr-signals
+[HL DEBUG] Running OCR in addition to text-layer (mixed page).
+[HL DEBUG] final_boxes=15  page=(2592.0x1728.0)
+TIMER LOG: v14-hybrid-ocr-signals done. Boxes=15 in 3.475s
+    📊 OCR: +72.8MB (boxes=15)
+    ✅ Fence detected (boxes=15)
+
+📄 Page 14/84 | Memory: 176.7MB
+    📊 Image wrapper: +29.4MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 1480996 bytes, dimensions: 2592x1728
+📄 Document AI response: 21438 chars, 1 pages
+📝 Document AI found 3807 valid text elements via OCR
+TIMER LOG: (get_fence_related_text_boxes) v14-hybrid-ocr-signals
+[HL DEBUG] Running OCR in addition to text-layer (mixed page).
+[HL DEBUG] final_boxes=23  page=(2592.0x1728.0)
+TIMER LOG: v14-hybrid-ocr-signals done. Boxes=23 in 3.846s
+    ✅ Fence detected (boxes=23)
+
+📄 Page 15/84 | Memory: 154.9MB
+    📊 Image wrapper: +27.6MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 829578 bytes, dimensions: 2592x1728
+📄 Document AI response: 4836 chars, 1 pages
+📝 Document AI found 1026 valid text elements via OCR
+    📊 Analysis: +28.0MB
+    ⚪ No fence
+    🧹 Cleanup: 154.9MB → 301.0MB (freed -146.1MB)
+
+📄 Page 16/84 | Memory: 301.0MB
+    📊 Image wrapper: +24.6MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 1081357 bytes, dimensions: 2592x1728
+📄 Document AI response: 5885 chars, 1 pages
+📝 Document AI found 1658 valid text elements via OCR
+    ⚪ No fence
+
+📄 Page 17/84 | Memory: 331.4MB
+🔍 Using working DPI: 72 (based on debug results)
+📷 Image size: 544833 bytes, dimensions: 2592x1728
+📄 Document AI response: 2794 chars, 1 pages
+📝 Document AI found 619 valid text elements via OCR

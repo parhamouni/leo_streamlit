@@ -1,0 +1,190 @@
+✅ Loaded API key
+✅ Comprehensive text extraction available
+⚠️  No Google Cloud config: 'google_cloud'
+================================================================================
+QUICK MEMORY PROFILING TEST (First 5 Pages Only)
+================================================================================
+
+PDF: /Users/parhamhamouni/Desktop/leo/data/Marked up plans 2/Takeoff/Combined_TO.pdf
+Max pages: 5
+Start memory: 210.9MB
+
+✅ LLM initialized
+Opening PDF...
+✅ PDF opened: 84 pages (will process 5)
+Memory after opening: 216.4MB
+
+================================================================================
+PROCESSING PAGES 1-5
+================================================================================
+
+📄 Page 1 START: 216.4MB
+      1. GC cleanup: 216.4MB (+0.0MB) 
+      3. load_page(): 217.5MB (+1.1MB) 
+      4. get_text(): 220.5MB (+2.9MB) len=2869
+      5. get_pixmap(): 224.5MB (+4.0MB) size=792x612
+      6. tobytes() + free pixmap: 226.2MB (+1.7MB) 0.10MB
+      7. PDF wrapper: 229.4MB (+3.2MB) 0.10MB
+      8. Cleanup img_bytes: 229.4MB (+0.0MB) 
+      → Calling LLM API for page 1...
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 1/5 in 2.09s. Error: Connection error.
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 2/5 in 4.04s. Error: Connection error.
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 3/5 in 8.04s. Error: Connection error.
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 4/5 in 16.34s. Error: Connection error.
+TIMER LOG: Max retries for 'BaseChatModel.invoke' (APIError/Timeout). Last error: Connection error.
+analyze_page JSON parse failed pg 1: Connection error.
+      9. analyze_page(): 231.4MB (+2.0MB) fence=False
+      10. Extract signals: 231.4MB (+0.0MB) count=0
+      11. OCR highlighting: 231.4MB (+0.0MB) skipped (no text or no config)
+      12. Store result: 231.4MB (+0.0MB) size=0.5KB
+      13. Cleanup variables: 231.4MB (+0.0MB) 
+   📊 Page 1 NET: +15.0MB (start=216.4MB, end=231.4MB)
+
+📄 Page 2 START: 231.4MB
+      1. GC cleanup: 231.4MB (+0.0MB) 
+      3. load_page(): 231.4MB (+0.0MB) 
+      4. get_text(): 231.5MB (+0.0MB) len=2680
+      5. get_pixmap(): 233.6MB (+2.2MB) size=792x612
+      6. tobytes() + free pixmap: 235.2MB (+1.6MB) 0.09MB
+      7. PDF wrapper: 238.2MB (+3.0MB) 0.09MB
+      8. Cleanup img_bytes: 238.2MB (+0.0MB) 
+      → Calling LLM API for page 2...
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 1/5 in 2.17s. Error: Connection error.
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 2/5 in 4.39s. Error: Connection error.
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 3/5 in 8.24s. Error: Connection error.
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 4/5 in 17.00s. Error: Connection error.
+TIMER LOG: Max retries for 'BaseChatModel.invoke' (APIError/Timeout). Last error: Connection error.
+analyze_page JSON parse failed pg 2: Connection error.
+      9. analyze_page(): 171.7MB (-66.5MB) fence=False
+      10. Extract signals: 171.7MB (+0.0MB) count=0
+      11. OCR highlighting: 171.7MB (+0.0MB) skipped (no text or no config)
+      12. Store result: 171.7MB (+0.0MB) size=0.5KB
+      13. Cleanup variables: 201.9MB (+30.2MB) 
+   📊 Page 2 NET: -29.5MB (start=231.4MB, end=201.9MB)
+
+📄 Page 3 START: 201.9MB
+      1. GC cleanup: 201.9MB (+0.0MB) 
+      3. load_page(): 202.0MB (+0.1MB) 
+      4. get_text(): 203.8MB (+1.8MB) len=449
+      5. get_pixmap(): 205.3MB (+1.5MB) size=792x612
+      6. tobytes() + free pixmap: 206.9MB (+1.6MB) 0.03MB
+      7. PDF wrapper: 208.4MB (+1.5MB) 0.03MB
+      8. Cleanup img_bytes: 208.4MB (+0.0MB) 
+      → Calling LLM API for page 3...
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 1/5 in 2.01s. Error: Connection error.
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 2/5 in 4.96s. Error: Connection error.
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 3/5 in 8.20s. Error: Connection error.
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 4/5 in 16.85s. Error: Connection error.
+TIMER LOG: Max retries for 'BaseChatModel.invoke' (APIError/Timeout). Last error: Connection error.
+analyze_page JSON parse failed pg 3: Connection error.
+      9. analyze_page(): 198.7MB (-9.7MB) fence=False
+      10. Extract signals: 198.7MB (+0.0MB) count=0
+      11. OCR highlighting: 198.7MB (+0.0MB) skipped (no text or no config)
+      12. Store result: 198.7MB (+0.0MB) size=0.5KB
+      13. Cleanup variables: 198.7MB (+0.0MB) 
+   📊 Page 3 NET: -3.1MB (start=201.9MB, end=198.7MB)
+
+📄 Page 4 START: 198.7MB
+      1. GC cleanup: 198.7MB (+0.0MB) 
+      3. load_page(): 198.9MB (+0.2MB) 
+      4. get_text(): 201.2MB (+2.3MB) len=2008
+      → Large page: 201.2MB (+0.0MB) 2592×1728, DPI=60
+      5. get_pixmap(): 225.1MB (+23.9MB) size=2160x1440
+      6. tobytes() + free pixmap: 235.6MB (+10.5MB) 0.63MB
+      7. PDF wrapper: 238.8MB (+3.2MB) 0.63MB
+      8. Cleanup img_bytes: 238.8MB (+0.0MB) 
+      → Calling LLM API for page 4...
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 1/5 in 2.75s. Error: Connection error.
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 2/5 in 4.43s. Error: Connection error.
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 3/5 in 8.64s. Error: Connection error.
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 4/5 in 16.23s. Error: Connection error.
+TIMER LOG: Max retries for 'BaseChatModel.invoke' (APIError/Timeout). Last error: Connection error.
+analyze_page JSON parse failed pg 4: Connection error.
+      9. analyze_page(): 87.8MB (-151.0MB) fence=False
+      10. Extract signals: 87.9MB (+0.1MB) count=0
+      11. OCR highlighting: 87.9MB (+0.0MB) skipped (no text or no config)
+      12. Store result: 87.9MB (+0.0MB) size=0.5KB
+      13. Cleanup variables: 189.8MB (+101.9MB) 
+   📊 Page 4 NET: -9.0MB (start=198.7MB, end=189.8MB)
+
+📄 Page 5 START: 189.8MB
+      1. GC cleanup: 189.8MB (+0.0MB) 
+      3. load_page(): 190.1MB (+0.3MB) 
+      4. get_text(): 193.9MB (+3.8MB) len=1320
+      → Large page: 193.9MB (+0.0MB) 2592×1728, DPI=60
+      5. get_pixmap(): 219.0MB (+25.0MB) size=2160x1440
+      6. tobytes() + free pixmap: 228.5MB (+9.5MB) 0.62MB
+      7. PDF wrapper: 238.5MB (+10.0MB) 0.62MB
+      8. Cleanup img_bytes: 238.5MB (+0.0MB) 
+      → Calling LLM API for page 5...
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 1/5 in 2.13s. Error: Connection error.
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 2/5 in 4.92s. Error: Connection error.
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 3/5 in 8.60s. Error: Connection error.
+TIMER LOG: API Error/Timeout for 'BaseChatModel.invoke'. Retry 4/5 in 16.94s. Error: Connection error.
+TIMER LOG: Max retries for 'BaseChatModel.invoke' (APIError/Timeout). Last error: Connection error.
+analyze_page JSON parse failed pg 5: Connection error.
+      9. analyze_page(): 238.6MB (+0.1MB) fence=False
+      10. Extract signals: 238.6MB (+0.0MB) count=0
+      11. OCR highlighting: 238.6MB (+0.0MB) skipped (no text or no config)
+      12. Store result: 238.6MB (+0.0MB) size=0.5KB
+      13. Cleanup variables: 238.6MB (+0.0MB) 
+   📊 Page 5 NET: +48.9MB (start=189.8MB, end=238.6MB)
+
+✅ PDF closed
+Final memory: 242.3MB
+
+================================================================================
+PROFILING SUMMARY - Memory Delta Per Function
+================================================================================
+
+Step                                     Calls    Avg Δ        Max Δ        Min Δ       
+----------------------------------------------------------------------------------------
+9. analyze_page()                        5              -45.0MB        +2.0MB      -151.0MB
+13. Cleanup variables                    5              +26.4MB      +101.9MB        +0.0MB
+5. get_pixmap()                          5              +11.3MB       +25.0MB        +1.5MB
+6. tobytes() + free pixmap               5               +5.0MB       +10.5MB        +1.6MB
+7. PDF wrapper                           5               +4.2MB       +10.0MB        +1.5MB
+4. get_text()                            5               +2.2MB        +3.8MB        +0.0MB
+3. load_page()                           5               +0.3MB        +1.1MB        +0.0MB
+10. Extract signals                      5               +0.0MB        +0.1MB        +0.0MB
+1. GC cleanup                            5               +0.0MB        +0.0MB        +0.0MB
+8. Cleanup img_bytes                     5               +0.0MB        +0.0MB        +0.0MB
+11. OCR highlighting                     5               +0.0MB        +0.0MB        +0.0MB
+12. Store result                         5               +0.0MB        +0.0MB        +0.0MB
+→ Large page                             2               +0.0MB        +0.0MB        +0.0MB
+
+========================================================================================
+Pages profiled: 5
+Fence pages: 0
+Non-fence pages: 5
+Total NET memory: +22.2MB
+Avg NET per page: +4.4MB
+========================================================================================
+
+🔍 MEMORY LEAK ANALYSIS:
+----------------------------------------------------------------------------------------
+🥇 #1 CULPRIT: 13. Cleanup variables
+   Average: +26.4MB per call
+   Max spike: +101.9MB
+   Total impact: +132.0MB
+
+🥈 #2 CULPRIT: 5. get_pixmap()
+   Average: +11.3MB per call
+   Total impact: +56.6MB
+
+🥉 #3 CULPRIT: 6. tobytes() + free pixmap
+   Average: +5.0MB per call
+   Total impact: +24.8MB
+
+🧹 CLEANUP EFFECTIVENESS:
+   13. Cleanup variables: +26.4MB avg (❌ NOT working)
+   1. GC cleanup: +0.0MB avg (❌ NOT working)
+   8. Cleanup img_bytes: +0.0MB avg (❌ NOT working)
+
+📊 PROJECTION FOR 84 PAGES:
+   At +4.4MB per page × 84 pages = +372.8MB total
+   ✅ Should be OK (under 800MB)
+========================================================================================
+
+✅ Quick test complete!
+
