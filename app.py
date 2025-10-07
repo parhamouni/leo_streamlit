@@ -646,15 +646,45 @@ if st.session_state.run_analysis_triggered and \
             if not fatal_err_page and highlight_fence_text_app and analysis_result.get('text_found'):
                 status_txt_area.text(f"Page {curr_pg_num}: Highlighting (text match found)...")
                 try:
-                    with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):   
-                        boxes,_,_ = get_fence_related_text_boxes(
-                            single_page_pdf_bytes,  # Use PNG wrapper from earlier
-                            llm_analysis_instance,
-                            FENCE_KEYWORDS_APP,
-                            merge_extra_keywords(signals),
-                            st.session_state.selected_model_for_analysis,
-                            google_cloud_config
-                        )
+                    with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):
+                        # If large page and no page_bytes, generate one at VERY low DPI for OCR only
+                        ocr_page_bytes = single_page_pdf_bytes
+                        if ocr_page_bytes is None and is_large_page:
+                            # Generate minimal page_bytes just for OCR highlighting
+                            try:
+                                pix_ocr = page_obj.get_pixmap(dpi=30, alpha=False)  # Ultra-low DPI for OCR
+                                img_bytes_ocr = pix_ocr.tobytes("png")
+                                del pix_ocr
+                                gc.collect()
+                                
+                                temp_img_doc_ocr = fitz.open()
+                                temp_page_ocr = temp_img_doc_ocr.new_page(width=1000, height=1000)
+                                temp_page_ocr.insert_image(temp_page_ocr.rect, stream=img_bytes_ocr, keep_proportion=False)
+                                ocr_page_bytes = temp_img_doc_ocr.tobytes(deflate=True, garbage=4)
+                                temp_img_doc_ocr.close()
+                                
+                                del img_bytes_ocr
+                                gc.collect()
+                                profiler.record_step("→ Generated OCR page_bytes", f"DPI=30, {len(ocr_page_bytes)/(1024*1024):.2f}MB")
+                            except Exception as e_ocr_gen:
+                                print(f"SESSION {current_session_id} WARNING: Could not generate OCR page_bytes: {e_ocr_gen}")
+                                ocr_page_bytes = None
+                        
+                        if ocr_page_bytes:
+                            boxes,_,_ = get_fence_related_text_boxes(
+                                ocr_page_bytes,  # Use OCR-specific page_bytes
+                                llm_analysis_instance,
+                                FENCE_KEYWORDS_APP,
+                                merge_extra_keywords(signals),
+                                st.session_state.selected_model_for_analysis,
+                                google_cloud_config
+                            )
+                            # Cleanup OCR page_bytes if it was generated separately
+                            if ocr_page_bytes != single_page_pdf_bytes:
+                                del ocr_page_bytes
+                                gc.collect()
+                        else:
+                            boxes = []  # No page_bytes available, skip highlighting
                         if boxes:
                             analysis_result['fence_text_boxes_details'] = boxes
                         profiler.record_step("11. OCR highlighting", f"boxes={len(boxes) if boxes else 0}")
