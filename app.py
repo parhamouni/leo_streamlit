@@ -159,7 +159,12 @@ initialize_session_state(current_session_id)
 with st.sidebar:
     # ... (Your existing sidebar code) ...
     st.header("⚙️ Configuration") # Copied for completeness
+    try:
     openai_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+    except Exception as e:
+        print(f"SESSION {current_session_id} WARNING: Could not load OPENAI_API_KEY from secrets: {e}")
+        openai_key = os.getenv("OPENAI_API_KEY")
+    
     if not openai_key:
         openai_key_input = st.text_input("Enter OpenAI API Key", type="password", key="api_key_input_sidebar")
         if openai_key_input: openai_key = openai_key_input; st.rerun()
