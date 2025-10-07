@@ -707,26 +707,26 @@ if st.session_state.run_analysis_triggered and \
                             google_cloud_config
                         )
 
-                            # Scale boxes if OCR was done at different DPI
-                            if boxes and ocr_scale_factor != 1.0:
-                                scaled_boxes = []
-                                for box in boxes:
-                                    scaled_box = {
-                                        'x0': box['x0'] * ocr_scale_factor,
-                                        'y0': box['y0'] * ocr_scale_factor,
-                                        'x1': box['x1'] * ocr_scale_factor,
-                                        'y1': box['y1'] * ocr_scale_factor,
-                                        'text': box.get('text', ''),
-                                        'confidence': box.get('confidence', 0)
-                                    }
-                                    scaled_boxes.append(scaled_box)
-                                boxes = scaled_boxes
-                                print(f"SESSION {current_session_id} LOG: Scaled {len(boxes)} boxes by factor {ocr_scale_factor:.2f}")
-                            
-                            # Cleanup OCR page_bytes if it was generated separately
-                            if ocr_page_bytes != single_page_pdf_bytes:
-                                del ocr_page_bytes
-                                gc.collect()
+                        # Scale boxes if OCR was done at different DPI
+                        if boxes and ocr_scale_factor != 1.0:
+                            scaled_boxes = []
+                            for box in boxes:
+                                scaled_box = {
+                                    'x0': box['x0'] * ocr_scale_factor,
+                                    'y0': box['y0'] * ocr_scale_factor,
+                                    'x1': box['x1'] * ocr_scale_factor,
+                                    'y1': box['y1'] * ocr_scale_factor,
+                                    'text': box.get('text', ''),
+                                    'confidence': box.get('confidence', 0)
+                                }
+                                scaled_boxes.append(scaled_box)
+                            boxes = scaled_boxes
+                            print(f"SESSION {current_session_id} LOG: Scaled {len(boxes)} boxes by factor {ocr_scale_factor:.2f}")
+                        
+                        # Cleanup OCR page_bytes if it was generated separately
+                        if ocr_page_bytes != single_page_pdf_bytes:
+                            del ocr_page_bytes
+                            gc.collect()
                         else:
                             boxes = []  # No page_bytes available, skip highlighting
                         if boxes:
