@@ -530,11 +530,11 @@ if st.session_state.run_analysis_triggered and \
             profiler.record_step("1. GC cleanup (3×)")
             
             # Clear cache EVERY PAGE for pages 15-30 (spike zone)
-            # Normal: every 2 pages, Spike zone: every page
+            # Normal: every 10 pages (was 2, reduced churn), Spike zone: every page
             if i >= 14 and i < 30:
                 st.cache_data.clear()
                 profiler.record_step("2. Cache clear (spike zone)")
-            elif i % 2 == 0 and i > 0:
+            elif i % 10 == 0 and i > 0:
                 st.cache_data.clear()
                 profiler.record_step("2. Cache clear")
             
@@ -617,10 +617,10 @@ if st.session_state.run_analysis_triggered and \
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
                     try:
-                        analysis_res_core = analyze_page(
-                            page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
-                            recall_mode="strict"   # or "balanced"/"high"
-                        )
+                    analysis_res_core = analyze_page(
+                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
+                        recall_mode="strict"   # or "balanced"/"high"
+                    )
                         profiler.record_step("9. analyze_page()", f"fence={analysis_res_core.get('fence_found')}")
                         
                         jr = json.loads(analysis_res_core["text_response"])
@@ -646,39 +646,78 @@ if st.session_state.run_analysis_triggered and \
             if not fatal_err_page and highlight_fence_text_app and analysis_result.get('text_found'):
                 status_txt_area.text(f"Page {curr_pg_num}: Highlighting (text match found)...")
                 try:
-                    with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):
+                    with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):   
                         # If large page and no page_bytes, generate one at VERY low DPI for OCR only
                         ocr_page_bytes = single_page_pdf_bytes
+                        ocr_scale_factor = 1.0  # Track scale for coordinate mapping
                         if ocr_page_bytes is None and is_large_page:
                             # Generate minimal page_bytes just for OCR highlighting
                             try:
-                                pix_ocr = page_obj.get_pixmap(dpi=30, alpha=False)  # Ultra-low DPI for OCR
+                                # Calculate scale factor for coordinate mapping
+                                target_dpi = 30
+                                original_width = page_width
+                                original_height = page_height
+                                
+                                pix_ocr = page_obj.get_pixmap(dpi=target_dpi, alpha=False)  # Ultra-low DPI for OCR
+                                ocr_width = pix_ocr.width
+                                ocr_height = pix_ocr.height
+                                
+                                # Scale factor to map OCR coords back to original page space
+                                ocr_scale_factor = original_width / ocr_width if ocr_width > 0 else 1.0
+                                
                                 img_bytes_ocr = pix_ocr.tobytes("png")
                                 del pix_ocr
                                 gc.collect()
                                 
                                 temp_img_doc_ocr = fitz.open()
-                                temp_page_ocr = temp_img_doc_ocr.new_page(width=1000, height=1000)
+                                temp_page_ocr = temp_img_doc_ocr.new_page(width=ocr_width, height=ocr_height)
                                 temp_page_ocr.insert_image(temp_page_ocr.rect, stream=img_bytes_ocr, keep_proportion=False)
                                 ocr_page_bytes = temp_img_doc_ocr.tobytes(deflate=True, garbage=4)
                                 temp_img_doc_ocr.close()
                                 
                                 del img_bytes_ocr
                                 gc.collect()
-                                profiler.record_step("→ Generated OCR page_bytes", f"DPI=30, {len(ocr_page_bytes)/(1024*1024):.2f}MB")
+                                profiler.record_step("→ Generated OCR page_bytes", f"DPI={target_dpi}, scale={ocr_scale_factor:.2f}, {len(ocr_page_bytes)/(1024*1024):.2f}MB")
                             except Exception as e_ocr_gen:
                                 print(f"SESSION {current_session_id} WARNING: Could not generate OCR page_bytes: {e_ocr_gen}")
                                 ocr_page_bytes = None
+                                ocr_scale_factor = 1.0
                         
                         if ocr_page_bytes:
-                            boxes,_,_ = get_fence_related_text_boxes(
+                            # Validate signals against page text before using as keywords
+                            validated_signals = []
+                            page_text_lower = text_content.lower()
+                            for sig in signals:
+                                if sig and sig.lower() in page_text_lower:
+                                    validated_signals.append(sig)
+                            if len(validated_signals) < len(signals):
+                                print(f"SESSION {current_session_id} LOG: Filtered signals {len(signals)}→{len(validated_signals)} (only those in page text)")
+                            
+                        boxes,_,_ = get_fence_related_text_boxes(
                                 ocr_page_bytes,  # Use OCR-specific page_bytes
-                                llm_analysis_instance,
-                                FENCE_KEYWORDS_APP,
-                                merge_extra_keywords(signals),
-                                st.session_state.selected_model_for_analysis,
-                                google_cloud_config
-                            )
+                            llm_analysis_instance,
+                            FENCE_KEYWORDS_APP,
+                                merge_extra_keywords(validated_signals),  # Use validated signals
+                            st.session_state.selected_model_for_analysis,
+                            google_cloud_config
+                        )
+
+                            # Scale boxes if OCR was done at different DPI
+                            if boxes and ocr_scale_factor != 1.0:
+                                scaled_boxes = []
+                                for box in boxes:
+                                    scaled_box = {
+                                        'x0': box['x0'] * ocr_scale_factor,
+                                        'y0': box['y0'] * ocr_scale_factor,
+                                        'x1': box['x1'] * ocr_scale_factor,
+                                        'y1': box['y1'] * ocr_scale_factor,
+                                        'text': box.get('text', ''),
+                                        'confidence': box.get('confidence', 0)
+                                    }
+                                    scaled_boxes.append(scaled_box)
+                                boxes = scaled_boxes
+                                print(f"SESSION {current_session_id} LOG: Scaled {len(boxes)} boxes by factor {ocr_scale_factor:.2f}")
+                            
                             # Cleanup OCR page_bytes if it was generated separately
                             if ocr_page_bytes != single_page_pdf_bytes:
                                 del ocr_page_bytes
@@ -808,6 +847,16 @@ if st.session_state.run_analysis_triggered and \
             doc_proc_loop.close()
             print(f"SESSION {current_session_id} LOG: Closed main processing PDF document in finally block.")
         doc_proc_loop = None 
+        
+        # CLEANUP: Delete temp file to prevent leaks
+        if st.session_state.get('temp_pdf_path') and os.path.exists(st.session_state.temp_pdf_path):
+            try:
+                os.unlink(st.session_state.temp_pdf_path)
+                print(f"SESSION {current_session_id} LOG: Cleaned up temp file: {st.session_state.temp_pdf_path}")
+                st.session_state.temp_pdf_path = None
+            except Exception as e_cleanup:
+                print(f"SESSION {current_session_id} WARNING: Could not delete temp file: {e_cleanup}")
+        
         print(f"SESSION {current_session_id} LOG: Processing loop ended. Final memory: {_rss_mb():.1f} MB")
         
         # PRINT PROFILING SUMMARY
