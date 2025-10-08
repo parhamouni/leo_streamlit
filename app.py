@@ -571,7 +571,7 @@ if st.session_state.run_analysis_triggered and \
             
             # Set DPI based on page size (lower DPI for large pages to save memory)
             if is_large_page:
-                dpi = 30  # Very low DPI for large pages (memory efficient)
+                dpi = 20  # Ultra-low DPI for large pages (maximum memory efficiency for Streamlit Cloud)
                 profiler.record_step("→ Large page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi} (OCR enabled)")
             else:
                 dpi = 45  # Normal DPI for small pages
