@@ -561,6 +561,19 @@ if st.session_state.run_analysis_triggered and \
                 gc.collect()
                 gc.collect()
             
+            # Step 4: CRITICAL - Close and reopen PDF document every 5 pages
+            # PyMuPDF keeps loaded pages in C-level memory that Python GC can't free
+            if i > 0 and i % 5 == 0:
+                try:
+                    doc_proc_loop.close()
+                    doc_proc_loop = fitz.open(st.session_state.temp_pdf_path)
+                    profiler.record_step("2b. Close/Reopen PDF", f"page {i} (free C memory)")
+                    # Force GC after document reload
+                    for _ in range(3):
+                        gc.collect()
+                except Exception as e:
+                    print(f"SESSION {current_session_id} WARNING: Could not reopen PDF: {e}")
+            
             # Check memory usage and halt if too high
             current_memory = _rss_mb()
             # Streamlit Cloud has 1GB (1024MB) hard limit
