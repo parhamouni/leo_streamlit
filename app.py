@@ -571,70 +571,65 @@ if st.session_state.run_analysis_triggered and \
             page_height = page_obj.rect.height
             is_large_page = page_width > 2000 or page_height > 2000
             
-            # Set DPI based on page size (OPTIMAL balance: recall vs memory)
+            # Set DPI based on page size and current memory (OPTIMAL balance: recall vs memory)
             # Testing showed DPI=30 for large pages gives 233% better recall vs text-only
-            # with only 7.7MB total memory cost across all large pages
-            # DYNAMIC: Skip OCR on large pages if memory is getting critical
-            skip_ocr_for_memory = False
+            # DYNAMIC: Reduce DPI when memory is high to keep Document AI responses smaller
             current_memory = _rss_mb()
             
             if is_large_page:
-                # Check if memory is approaching danger zone
-                # If we're above 750 MB and this is a large page, skip OCR to prevent crash
-                if current_memory > 750:
-                    skip_ocr_for_memory = True
-                    profiler.record_step("→ Large page (HIGH MEMORY)", f"{page_width:.0f}×{page_height:.0f}, OCR SKIPPED (RAM={current_memory:.0f}MB)")
+                # Adaptive DPI based on memory pressure
+                if current_memory > 850:
+                    dpi = 20  # Very low DPI when memory is critical
+                    profiler.record_step("→ Large page (CRITICAL)", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi} (RAM={current_memory:.0f}MB)")
+                elif current_memory > 750:
+                    dpi = 25  # Low DPI when memory is high
+                    profiler.record_step("→ Large page (HIGH)", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi} (RAM={current_memory:.0f}MB)")
                 else:
-                    dpi = 30  # OPTIMAL DPI for large pages (balance: good OCR + low memory)
-                    profiler.record_step("→ Large page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi} (OCR enabled)")
+                    dpi = 30  # Normal DPI for large pages when memory is OK
+                    profiler.record_step("→ Large page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi}")
             else:
                 dpi = 45  # Normal DPI for small pages
                 profiler.record_step("→ Normal page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi}")
             
-            # Skip page_bytes generation if memory is critical
-            if skip_ocr_for_memory:
-                single_page_pdf_bytes = None
-                profiler.record_step("5-8. OCR skipped", f"memory={current_memory:.0f}MB (critical)")
-            else:
-                try:
-                    # Generate page_bytes for OCR
-                    pix = page_obj.get_pixmap(dpi=dpi, alpha=False)
-                    pix_width, pix_height = pix.width, pix.height
-                    profiler.record_step("5. get_pixmap()", f"size={pix_width}x{pix_height}")
-                    
-                    # Convert to PNG bytes and FREE pixmap immediately
-                    img_bytes = pix.tobytes("png")
-                    pix_size_mb = len(img_bytes) / (1024*1024)
-                    del pix
+            try:
+                # Generate page_bytes for ALL pages with adaptive DPI
+                pix = page_obj.get_pixmap(dpi=dpi, alpha=False)
+                pix_width, pix_height = pix.width, pix.height
+                profiler.record_step("5. get_pixmap()", f"size={pix_width}x{pix_height}")
+                
+                # Convert to PNG bytes and FREE pixmap immediately
+                img_bytes = pix.tobytes("png")
+                pix_size_mb = len(img_bytes) / (1024*1024)
+                del pix
+                gc.collect()
+                gc.collect()
+                profiler.record_step("6. tobytes() + free pixmap", f"{pix_size_mb:.2f}MB PNG")
+                
+                # Wrap PNG in minimal PDF wrapper
+                from io import BytesIO
+                temp_img_doc = fitz.open()
+                temp_page = temp_img_doc.new_page(width=pix_width, height=pix_height)
+                temp_page.insert_image(temp_page.rect, stream=img_bytes, keep_proportion=False)
+                single_page_pdf_bytes = temp_img_doc.tobytes(deflate=True, garbage=4)
+                temp_img_doc.close()
+                profiler.record_step("7. PDF wrapper", f"{len(single_page_pdf_bytes)/(1024*1024):.2f}MB")
+                
+                # Cleanup img_bytes
+                del img_bytes
+                gc.collect()
+                gc.collect()
+                profiler.record_step("8. Cleanup img_bytes")
+                
+                # EXTRA aggressive cleanup for large pages to prevent memory accumulation
+                if is_large_page:
+                    del temp_page
                     gc.collect()
                     gc.collect()
-                    profiler.record_step("6. tobytes() + free pixmap", f"{pix_size_mb:.2f}MB PNG")
-                    
-                    # Wrap PNG in minimal PDF wrapper
-                    from io import BytesIO
-                    temp_img_doc = fitz.open()
-                    temp_page = temp_img_doc.new_page(width=pix_width, height=pix_height)
-                    temp_page.insert_image(temp_page.rect, stream=img_bytes, keep_proportion=False)
-                    single_page_pdf_bytes = temp_img_doc.tobytes(deflate=True, garbage=4)
-                    temp_img_doc.close()
-                    profiler.record_step("7. PDF wrapper", f"{len(single_page_pdf_bytes)/(1024*1024):.2f}MB")
-                    
-                    # Cleanup img_bytes
-                    del img_bytes
                     gc.collect()
-                    gc.collect()
-                    profiler.record_step("8. Cleanup img_bytes")
-                    
-                    # EXTRA aggressive cleanup for large pages to prevent memory accumulation
-                    if is_large_page:
-                        del temp_page
-                        gc.collect()
-                        gc.collect()
-                        gc.collect()
-                        profiler.record_step("8b. Extra cleanup (large page)")
-                except Exception as e:
-                    print(f"SESSION {current_session_id} WARNING: Could not create page image for page {curr_pg_num}: {e}")
-                    single_page_pdf_bytes = None  # Fallback to text-only if image generation fails
+                    profiler.record_step("8b. Extra cleanup (large page)")
+            except Exception as e:
+                print(f"SESSION {current_session_id} WARNING: Could not create page image for page {curr_pg_num}: {e}")
+                single_page_pdf_bytes = None  # Fallback to text-only if image generation fails
             
             page_data_an = {"page_number": curr_pg_num, "text": text_content, "page_bytes": single_page_pdf_bytes}
             analysis_res_core = {}; fatal_err_page = False
