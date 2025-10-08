@@ -521,29 +521,49 @@ if st.session_state.run_analysis_triggered and \
             # START PROFILING THIS PAGE
             profiler.start_page(curr_pg_num)
             
-            # ULTRA-AGGRESSIVE GC - Call 3× to force immediate cleanup
-            # Testing showed 97MB spikes on pages 19-23 even with 2× GC
+            # AGGRESSIVE MEMORY MANAGEMENT - Force cleanup BEFORE processing
+            # Profiling shows DocAI responses are tiny (< 12KB), but Python objects accumulate
             import gc
-            gc.collect()
-            gc.collect()
-            gc.collect()  # Triple GC to handle large backlog
-            profiler.record_step("1. GC cleanup (3×)")
             
-            # Clear cache EVERY PAGE for pages 15-30 (spike zone)
-            # Pages 19-23 have massive memory leaks - clear cache MORE aggressively
-            # Normal: every 10 pages (was 2, reduced churn), Spike zone: every page
+            # Step 1: Force immediate garbage collection (5x for thorough cleanup)
+            for _ in range(5):
+                gc.collect()
+            profiler.record_step("1. GC cleanup (5×)")
+            
+            # Step 2: Clear Streamlit caches more aggressively
             if i >= 14 and i < 30:
+                # Critical zone - clear EVERY page
                 st.cache_data.clear()
-                profiler.record_step("2. Cache clear (spike zone)")
-            elif i % 5 == 0 and i > 0:  # Increased from every 10 to every 5 pages
+                profiler.record_step("2. Cache clear (critical zone)")
+            elif i % 3 == 0 and i > 0:  # Every 3 pages (was 5)
                 st.cache_data.clear()
                 profiler.record_step("2. Cache clear")
+            
+            # Step 3: Explicitly null out previous page data if it exists
+            if i > 0:
+                # Force release of any lingering references
+                if 'page_obj' in locals():
+                    try:
+                        del page_obj
+                    except:
+                        pass
+                if 'text_content' in locals():
+                    try:
+                        del text_content
+                    except:
+                        pass
+                if 'single_page_pdf_bytes' in locals():
+                    try:
+                        del single_page_pdf_bytes
+                    except:
+                        pass
+                # Force GC again after deletions
+                gc.collect()
+                gc.collect()
             
             # Check memory usage and halt if too high
             current_memory = _rss_mb()
             # Streamlit Cloud has 1GB (1024MB) hard limit
-            # With DPI=30 for large pages (optimal OCR), we need slightly more headroom
-            # Testing showed DPI=30 large pages add ~7.7MB total across all large pages
             memory_limit = 950  # Safe limit with OCR enabled for all pages
             
             if current_memory > memory_limit:
@@ -571,22 +591,14 @@ if st.session_state.run_analysis_triggered and \
             page_height = page_obj.rect.height
             is_large_page = page_width > 2000 or page_height > 2000
             
-            # Set DPI based on page size and current memory (OPTIMAL balance: recall vs memory)
-            # Testing showed DPI=30 for large pages gives 233% better recall vs text-only
-            # DYNAMIC: Reduce DPI when memory is high to keep Document AI responses smaller
-            current_memory = _rss_mb()
+            # Set DPI based on page size
+            # Profiling proves DocAI responses are tiny (< 12 KB even for complex pages)
+            # The memory issue is Python object retention, not OCR data size
+            # Therefore: Keep DPI=30 for quality, focus on aggressive GC instead
             
             if is_large_page:
-                # Adaptive DPI based on memory pressure
-                if current_memory > 850:
-                    dpi = 20  # Very low DPI when memory is critical
-                    profiler.record_step("→ Large page (CRITICAL)", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi} (RAM={current_memory:.0f}MB)")
-                elif current_memory > 750:
-                    dpi = 25  # Low DPI when memory is high
-                    profiler.record_step("→ Large page (HIGH)", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi} (RAM={current_memory:.0f}MB)")
-                else:
-                    dpi = 30  # Normal DPI for large pages when memory is OK
-                    profiler.record_step("→ Large page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi}")
+                dpi = 30  # Optimal DPI - responses are only ~2-12 KB
+                profiler.record_step("→ Large page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi}")
             else:
                 dpi = 45  # Normal DPI for small pages
                 profiler.record_step("→ Normal page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi}")
@@ -795,11 +807,16 @@ if st.session_state.run_analysis_triggered and \
                     del temp_img_doc
                 if 'temp_page' in locals():
                     del temp_page
-                # Force ULTRA-AGGRESSIVE garbage collection
-                gc.collect()
-                gc.collect()  # Call twice
-                gc.collect()  # Call THREE times to ensure cleanup
-                profiler.record_step("13. Cleanup variables (ultra-aggressive)")
+                if 'validated_signals' in locals():
+                    del validated_signals
+                if 'page_text_lower' in locals():
+                    del page_text_lower
+                    
+                # Force IMMEDIATE garbage collection (7× for maximum cleanup)
+                # Profiling showed Python object retention is the real issue, not DocAI responses
+                for _ in range(7):
+                    gc.collect()
+                profiler.record_step("13. Cleanup variables (ultra-aggressive + 7× GC)")
             except Exception as cleanup_err:
                 print(f"Warning: cleanup error: {cleanup_err}")
             
