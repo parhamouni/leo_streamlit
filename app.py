@@ -655,25 +655,25 @@ if st.session_state.run_analysis_triggered and \
                             if len(validated_signals) < len(signals):
                                 print(f"SESSION {current_session_id} LOG: Filtered signals {len(signals)}→{len(validated_signals)} (only those in page text)")
                             
-                        boxes,_,_ = get_fence_related_text_boxes(
+                            boxes,_,_ = get_fence_related_text_boxes(
                                 single_page_pdf_bytes,
-                            llm_analysis_instance,
-                            FENCE_KEYWORDS_APP,
+                                llm_analysis_instance,
+                                FENCE_KEYWORDS_APP,
                                 merge_extra_keywords(validated_signals),
-                            st.session_state.selected_model_for_analysis,
-                            google_cloud_config
-                        )
+                                st.session_state.selected_model_for_analysis,
+                                google_cloud_config
+                            )
 
-                        # Note: No coordinate scaling needed - page_bytes already at correct DPI
-                        # Large pages use DPI=30, small pages use DPI=45
-                        # OCR coordinates match the page_bytes dimensions, no conversion needed
-                        
-                        if boxes:
-                            analysis_result['fence_text_boxes_details'] = boxes
-                        profiler.record_step("11. OCR highlighting", f"boxes={len(boxes) if boxes else 0}")
-                    else:
-                        # Fallback: no page_bytes available (image generation failed)
-                        profiler.record_step("11. OCR highlighting", "skipped (no page_bytes)")
+                            # Note: No coordinate scaling needed - page_bytes already at correct DPI
+                            # Large pages use DPI=30, small pages use DPI=45
+                            # OCR coordinates match the page_bytes dimensions, no conversion needed
+                            
+                            if boxes:
+                                analysis_result['fence_text_boxes_details'] = boxes
+                            profiler.record_step("11. OCR highlighting", f"boxes={len(boxes) if boxes else 0}")
+                        else:
+                            # Fallback: no page_bytes available (image generation failed)
+                            profiler.record_step("11. OCR highlighting", "skipped (no page_bytes)")
                 except MemoryError as me:
                     tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num} (MemoryError)", me)
                     st.warning(f"💥 Memory error during OCR on page {curr_pg_num}. Skipping highlights.")
