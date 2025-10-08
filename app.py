@@ -574,15 +574,16 @@ if st.session_state.run_analysis_triggered and \
             # Set DPI based on page size (OPTIMAL balance: recall vs memory)
             # Testing showed DPI=30 for large pages gives 233% better recall vs text-only
             # with only 7.7MB total memory cost across all large pages
-            # SPECIAL: Pages 19-23 have massive Document AI responses (~350MB spike)
-            # CRITICAL FIX: Skip OCR entirely on these pages to prevent crash
+            # DYNAMIC: Skip OCR on large pages if memory is getting critical
             skip_ocr_for_memory = False
+            current_memory = _rss_mb()
+            
             if is_large_page:
-                # Pages 19-23 are extremely complex (engineering diagrams)
-                # Skip OCR entirely - text extraction alone is sufficient
-                if i >= 18 and i < 23:  # Zero-indexed: page 19-23
+                # Check if memory is approaching danger zone
+                # If we're above 750 MB and this is a large page, skip OCR to prevent crash
+                if current_memory > 750:
                     skip_ocr_for_memory = True
-                    profiler.record_step("→ Large page (CRITICAL)", f"{page_width:.0f}×{page_height:.0f}, OCR SKIPPED (memory critical)")
+                    profiler.record_step("→ Large page (HIGH MEMORY)", f"{page_width:.0f}×{page_height:.0f}, OCR SKIPPED (RAM={current_memory:.0f}MB)")
                 else:
                     dpi = 30  # OPTIMAL DPI for large pages (balance: good OCR + low memory)
                     profiler.record_step("→ Large page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi} (OCR enabled)")
@@ -590,10 +591,10 @@ if st.session_state.run_analysis_triggered and \
                 dpi = 45  # Normal DPI for small pages
                 profiler.record_step("→ Normal page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi}")
             
-            # Skip page_bytes generation for memory-critical pages
+            # Skip page_bytes generation if memory is critical
             if skip_ocr_for_memory:
                 single_page_pdf_bytes = None
-                profiler.record_step("5-8. OCR skipped", "memory critical pages 19-23")
+                profiler.record_step("5-8. OCR skipped", f"memory={current_memory:.0f}MB (critical)")
             else:
                 try:
                     # Generate page_bytes for OCR
