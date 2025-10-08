@@ -157,7 +157,7 @@ initialize_session_state(current_session_id)
 
 # --- Sidebar (Keep as is) ---
 with st.sidebar:
-    # ... (Your existing sidebar code) ...
+    # Configuration and API key loading
     st.header("⚙️ Configuration") # Copied for completeness
     openai_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
     if not openai_key:
