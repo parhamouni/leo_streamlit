@@ -530,11 +530,12 @@ if st.session_state.run_analysis_triggered and \
             profiler.record_step("1. GC cleanup (3×)")
             
             # Clear cache EVERY PAGE for pages 15-30 (spike zone)
+            # Pages 19-23 have massive memory leaks - clear cache MORE aggressively
             # Normal: every 10 pages (was 2, reduced churn), Spike zone: every page
             if i >= 14 and i < 30:
                 st.cache_data.clear()
                 profiler.record_step("2. Cache clear (spike zone)")
-            elif i % 10 == 0 and i > 0:
+            elif i % 5 == 0 and i > 0:  # Increased from every 10 to every 5 pages
                 st.cache_data.clear()
                 profiler.record_step("2. Cache clear")
             
@@ -774,6 +775,16 @@ if st.session_state.run_analysis_triggered and \
                     del boxes  # OCR boxes can be large
                 if 'signals' in locals():
                     del signals
+                if 'jr' in locals():
+                    del jr
+                if 'pix' in locals():
+                    del pix
+                if 'img_bytes' in locals():
+                    del img_bytes
+                if 'temp_img_doc' in locals():
+                    del temp_img_doc
+                if 'temp_page' in locals():
+                    del temp_page
                 # Force ULTRA-AGGRESSIVE garbage collection
                 gc.collect()
                 gc.collect()  # Call twice
