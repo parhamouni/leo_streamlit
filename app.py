@@ -664,13 +664,13 @@ if st.session_state.run_analysis_triggered and \
                             google_cloud_config
                         )
 
-                            # Note: No coordinate scaling needed - page_bytes already at correct DPI
-                            # Large pages use DPI=30, small pages use DPI=45
-                            # OCR coordinates match the page_bytes dimensions, no conversion needed
-                            
-                            if boxes:
-                                analysis_result['fence_text_boxes_details'] = boxes
-                            profiler.record_step("11. OCR highlighting", f"boxes={len(boxes) if boxes else 0}")
+                        # Note: No coordinate scaling needed - page_bytes already at correct DPI
+                        # Large pages use DPI=30, small pages use DPI=45
+                        # OCR coordinates match the page_bytes dimensions, no conversion needed
+                        
+                        if boxes:
+                            analysis_result['fence_text_boxes_details'] = boxes
+                        profiler.record_step("11. OCR highlighting", f"boxes={len(boxes) if boxes else 0}")
                         else:
                             # Fallback: no page_bytes available (image generation failed)
                             profiler.record_step("11. OCR highlighting", "skipped (no page_bytes)")
