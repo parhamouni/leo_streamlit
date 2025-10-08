@@ -574,9 +574,15 @@ if st.session_state.run_analysis_triggered and \
             # Set DPI based on page size (OPTIMAL balance: recall vs memory)
             # Testing showed DPI=30 for large pages gives 233% better recall vs text-only
             # with only 7.7MB total memory cost across all large pages
+            # SPECIAL: Pages 19-23 have massive Document AI responses - use lower DPI
             if is_large_page:
-                dpi = 30  # OPTIMAL DPI for large pages (balance: good OCR + low memory)
-                profiler.record_step("→ Large page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi} (OCR enabled)")
+                # Pages 19-23 are extremely complex (engineering diagrams) - reduce DPI further
+                if i >= 18 and i < 23:  # Zero-indexed: page 19-23
+                    dpi = 25  # Ultra-low DPI for problem pages (saves ~100MB total)
+                    profiler.record_step("→ Large page (complex)", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi} (memory-critical)")
+                else:
+                    dpi = 30  # OPTIMAL DPI for large pages (balance: good OCR + low memory)
+                    profiler.record_step("→ Large page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi} (OCR enabled)")
             else:
                 dpi = 45  # Normal DPI for small pages
                 profiler.record_step("→ Normal page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi}")
@@ -626,7 +632,7 @@ if st.session_state.run_analysis_triggered and \
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
                     try:
-                        analysis_res_core = analyze_page(
+                    analysis_res_core = analyze_page(
                         page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
                         recall_mode="strict"   # or "balanced"/"high"
                     )
@@ -667,14 +673,14 @@ if st.session_state.run_analysis_triggered and \
                             if len(validated_signals) < len(signals):
                                 print(f"SESSION {current_session_id} LOG: Filtered signals {len(signals)}→{len(validated_signals)} (only those in page text)")
                             
-                            boxes,_,_ = get_fence_related_text_boxes(
+                        boxes,_,_ = get_fence_related_text_boxes(
                                 single_page_pdf_bytes,
-                                llm_analysis_instance,
-                                FENCE_KEYWORDS_APP,
+                            llm_analysis_instance,
+                            FENCE_KEYWORDS_APP,
                                 merge_extra_keywords(validated_signals),
-                                st.session_state.selected_model_for_analysis,
-                                google_cloud_config
-                            )
+                            st.session_state.selected_model_for_analysis,
+                            google_cloud_config
+                        )
 
                             # Note: No coordinate scaling needed - page_bytes already at correct DPI
                             # Large pages use DPI=30, small pages use DPI=45
