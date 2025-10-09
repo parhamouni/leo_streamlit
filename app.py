@@ -717,14 +717,14 @@ if st.session_state.run_analysis_triggered and \
                             if len(validated_signals) < len(signals):
                                 print(f"SESSION {current_session_id} LOG: Filtered signals {len(signals)}→{len(validated_signals)} (only those in page text)")
                             
-                        boxes,_,_ = get_fence_related_text_boxes(
+                            boxes,_,_ = get_fence_related_text_boxes(
                                 single_page_pdf_bytes,
-                            llm_analysis_instance,
-                            FENCE_KEYWORDS_APP,
+                                llm_analysis_instance,
+                                FENCE_KEYWORDS_APP,
                                 merge_extra_keywords(validated_signals),
-                            st.session_state.selected_model_for_analysis,
-                            google_cloud_config
-                        )
+                                st.session_state.selected_model_for_analysis,
+                                google_cloud_config
+                            )
 
                             # Note: No coordinate scaling needed - page_bytes already at correct DPI
                             # Large pages use DPI=30, small pages use DPI=45
