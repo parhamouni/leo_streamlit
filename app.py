@@ -770,9 +770,9 @@ if st.session_state.run_analysis_triggered and \
                             if boxes:
                                 analysis_result['fence_text_boxes_details'] = boxes
                             profiler.record_step("11. OCR highlighting", f"boxes={len(boxes) if boxes else 0}")
-                    else:
-                        # Fallback: no page_bytes available (image generation failed)
-                        profiler.record_step("11. OCR highlighting", "skipped (no page_bytes)")
+                        else:
+                            # Fallback: no page_bytes available (image generation failed)
+                            profiler.record_step("11. OCR highlighting", "skipped (no page_bytes)")
                 except MemoryError as me:
                     tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num} (MemoryError)", me)
                     st.warning(f"💥 Memory error during OCR on page {curr_pg_num}. Skipping highlights.")
