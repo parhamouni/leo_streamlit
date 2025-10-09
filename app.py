@@ -9,108 +9,8 @@ import io
 import time 
 import uuid 
 import hashlib # For hashing PDF bytes
-import json
-import traceback
-import sys
-
-try:
-    import psutil
-    import os
-    import resource
-    def _rss_mb():
-        try:
-            # Try psutil first
-            return psutil.Process(os.getpid()).memory_info().rss / (1024**2)
-        except:
-            try:
-                # Fallback to resource module (works on Linux/Unix)
-                return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KB to MB on Linux
-            except:
-                return 0.0
-except ImportError:
-    try:
-        import resource
-        def _rss_mb():
-            try:
-                # resource.getrusage works on Unix systems
-                return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KB to MB
-            except:
-                return 0.0
-    except ImportError:
-        def _rss_mb(): 
-            return 0.0
-
-# Setup comprehensive error logging
-def log_exception(session_id, context, exception):
-    """Log detailed exception information"""
-    exc_type, exc_value, exc_traceback = sys.exc_info()
-    tb_str = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
-    print(f"\n{'='*80}")
-    print(f"SESSION {session_id} FATAL ERROR in {context}")
-    print(f"Exception Type: {type(exception).__name__}")
-    print(f"Exception Message: {str(exception)}")
-    print(f"Memory Usage: {_rss_mb():.1f} MB")
-    print(f"Traceback:\n{tb_str}")
-    print(f"{'='*80}\n")
-    return tb_str
-
-# ============================================
-# MEMORY PROFILER - Track every function call
-# ============================================
-class MemoryProfiler:
-    """Track memory per function to find leaks"""
-    def __init__(self):
-        self.page_data = []
-        self.current_page = None
-    
-    def start_page(self, page_num):
-        self.current_page = {'page': page_num, 'steps': [], 'start_mem': _rss_mb()}
-        print(f"\n📄 Page {page_num} START: {self.current_page['start_mem']:.1f}MB")
-    
-    def record_step(self, step_name, details=""):
-        if not self.current_page:
-            return
-        mem_now = _rss_mb()
-        last_mem = self.current_page['steps'][-1]['mem'] if self.current_page['steps'] else self.current_page['start_mem']
-        delta = mem_now - last_mem
-        self.current_page['steps'].append({
-            'name': step_name,
-            'mem': mem_now,
-            'delta': delta,
-            'details': details
-        })
-        sign = "+" if delta >= 0 else ""
-        print(f"      {step_name}: {mem_now:.1f}MB ({sign}{delta:.1f}MB) {details}")
-    
-    def end_page(self):
-        if not self.current_page:
-            return 0
-        end_mem = _rss_mb()
-        net = end_mem - self.current_page['start_mem']
-        self.page_data.append(self.current_page)
-        print(f"   📊 Page {self.current_page['page']} NET: {net:+.1f}MB (start={self.current_page['start_mem']:.1f}MB, end={end_mem:.1f}MB)")
-        return net
-
-# Global profiler instance
-profiler = MemoryProfiler()
-
-# Memory profiling decorator
-def profile_memory(func_name):
-    """Decorator to profile memory usage of a function"""
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            import gc
-            gc.collect()  # Clean up before measuring
-            mem_before = _rss_mb()
-            result = func(*args, **kwargs)
-            gc.collect()  # Clean up after
-            mem_after = _rss_mb()
-            delta = mem_after - mem_before
-            if delta > 5:  # Only log if significant memory change
-                print(f"🔍 MEMORY PROFILE [{func_name}]: {mem_before:.1f}MB → {mem_after:.1f}MB (Δ {delta:+.1f}MB)")
-            return result
-        return wrapper
-    return decorator
+import tempfile
+import atexit
 
 # --- Highlight Appearance & Performance ---
 HIGHLIGHT_COLOR_UI = (0, 0.9, 0)
@@ -123,6 +23,34 @@ st.set_page_config(page_title="Fence Detector", layout="wide")
 st.markdown("""<style> /* Your CSS */ </style>""", unsafe_allow_html=True) 
 st.markdown("<h1 class='main-header'>🔍 Fence Detection in Engineering Drawings</h1>", unsafe_allow_html=True)
 
+# --- Temp File Management ---
+def save_uploaded_pdf_to_temp(uploaded_file, session_id):
+    """Save uploaded PDF to temp file and return path"""
+    print(f"SESSION {session_id} LOG: Saving uploaded PDF to temporary file.")
+    try:
+        # Create temp file with a unique name
+        temp_dir = tempfile.gettempdir()
+        temp_filename = f"fence_detector_{session_id}_{uploaded_file.name}"
+        temp_path = os.path.join(temp_dir, temp_filename)
+        
+        with open(temp_path, 'wb') as f:
+            f.write(uploaded_file.getvalue())
+        
+        print(f"SESSION {session_id} LOG: PDF saved to {temp_path}")
+        return temp_path
+    except Exception as e:
+        print(f"SESSION {session_id} ERROR: Failed to save PDF to temp file: {e}")
+        raise
+
+def cleanup_temp_pdf(pdf_path, session_id):
+    """Clean up temporary PDF file"""
+    if pdf_path and os.path.exists(pdf_path):
+        try:
+            os.unlink(pdf_path)
+            print(f"SESSION {session_id} LOG: Cleaned up temp PDF: {pdf_path}")
+        except Exception as e:
+            print(f"SESSION {session_id} WARNING: Could not delete temp PDF {pdf_path}: {e}")
+
 def get_session_id():
     if 'session_id' not in st.session_state:
         st.session_state.session_id = str(uuid.uuid4())[:8]
@@ -134,13 +62,9 @@ def initialize_session_state(session_id_val):
         'session_id': session_id_val, 
         'fence_pages': [], 'non_fence_pages': [], 'total_pages_processed_count': 0,
         'doc_total_pages': 0, 'processing_complete': False, 'analysis_halted_due_to_error': False,
-        'fence_keywords_app': [
-            'fence', 'fencing', 'gate', 'barrier', 'guardrail', 'post', 'mesh', 'panel', 'chain link',
-            'screen wall', 'privacy screen', 'CMU wall', 'masonry wall', 'wall', 'bollard',
-            'railing', 'handrail', 'security barrier', 'perimeter'
-        ],
-        'run_analysis_triggered': False, 'uploaded_pdf_name': None, 'original_pdf_bytes': None,
-        'current_pdf_hash': None, # NEW: To store hash of current PDF
+        'fence_keywords_app': ['fence', 'fencing', 'gate', 'barrier', 'guardrail', 'post', 'mesh', 'panel', 'chain link'],
+        'run_analysis_triggered': False, 'uploaded_pdf_name': None, 'pdf_temp_path': None,
+        'current_pdf_hash': None, # To store hash of current PDF
         'highlighted_pdf_bytes_for_download': None, 'last_uploaded_file_id': None,
         'selected_model_for_analysis': "gpt-4o" 
     }
@@ -274,112 +198,64 @@ def get_image_download_link_html(img_bytes, filename, text):
     b64 = base64.b64encode(img_bytes).decode()
     return f'<a href="data:{mime};base64,{b64}" download="{filename}" class="download-button">{text}</a>'
 
-@time_it
-@st.cache_data(ttl=180, show_spinner=False, max_entries=10)  # 3 min, ~10 pages cached (reduced from 18 to save 120MB)
-def _generate_display_images_for_page_cached(page_idx,
-                                            pdf_hash_for_cache_key,
+@time_it 
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=200) # Increased max_entries
+def _generate_display_images_for_page_cached(page_idx, 
+                                            pdf_hash_for_cache_key, # Use PDF hash as part of key
                                             fence_text_boxes_details_tuple,
                                             ui_color, ui_width, display_dpi,
                                             session_id_for_log="N/A_CACHE"):
-    """
-    Memory-aware preview renderer:
-      - Renders JPEG previews (much smaller than PNG) at a modest DPI.
-      - Cache limited to 60 entries with short TTL to keep RSS low.
-      - The 3rd arg should be a tuple of (x0,y0,x1,y1) rects (geometry-only).
-        For backward-compatibility, if items look like dict-items we try to
-        reconstruct x0..y1 from them.
-    """
-    # Get PDF bytes from temp file (during processing) or session state (before processing)
-    pdf_bytes_source = None
-    if st.session_state.get('temp_pdf_path'):
-        # Read from temp file
-        try:
-            with open(st.session_state.temp_pdf_path, 'rb') as f:
-                pdf_bytes_source = f.read()
-        except:
-            pass
-    if not pdf_bytes_source:
-        pdf_bytes_source = st.session_state.get('original_pdf_bytes')
+    # This function now RELIES on st.session_state.pdf_temp_path being the
+    # correct path for the given pdf_hash_for_cache_key.
     
-    if not pdf_bytes_source:
-        print(f"SESSION {session_id_for_log} ERROR (_cached): PDF not available for hash {pdf_hash_for_cache_key}")
+    if 'pdf_temp_path' not in st.session_state or st.session_state.pdf_temp_path is None:
+        print(f"SESSION {session_id_for_log} ERROR (_cached): pdf_temp_path not in session_state for hash {pdf_hash_for_cache_key}")
+        return None, None
+    
+    if not os.path.exists(st.session_state.pdf_temp_path):
+        print(f"SESSION {session_id_for_log} ERROR (_cached): pdf_temp_path does not exist: {st.session_state.pdf_temp_path}")
         return None, None
 
     # Parse rectangles defensively
     rects = []
     try:
-        for it in (fence_text_boxes_details_tuple or ()):
-            # Already a rect tuple?
-            if isinstance(it, (tuple, list)) and len(it) == 4 and all(isinstance(v, (int, float)) for v in it):
-                x0, y0, x1, y1 = map(float, it)
-                rects.append((x0, y0, x1, y1))
-            else:
-                # Possibly tuple of dict-items
-                try:
-                    d = dict(it)
-                    x0 = float(d.get('x0')); y0 = float(d.get('y0')); x1 = float(d.get('x1')); y1 = float(d.get('y1'))
-                    rects.append((x0, y0, x1, y1))
-                except Exception:
-                    continue
-    except Exception as e:
-        print(f"SESSION {session_id_for_log} WARNING: could not parse rects for cache key: {e}")
+        # Use the PDF file from temp path
+        with fitz.open(st.session_state.pdf_temp_path) as doc_orig:
+            page_orig = doc_orig.load_page(page_idx)
+            pix_orig = page_orig.get_pixmap(dpi=display_dpi); original_image_bytes = pix_orig.tobytes("png"); del pix_orig
 
-    current_pdf_bytes = pdf_bytes_source
-    original_image_bytes, highlighted_image_bytes = None, None
-
-    func_call_id = str(uuid.uuid4())[:4]
-    print(f"SESSION {session_id_for_log} CACHE_CALL ({func_call_id}): _generate_display_images_for_page_cached "
-          f"pg={page_idx}, hash={pdf_hash_for_cache_key[:8]}…, rects={len(rects)}")
-
-    t0 = time.time()
-    try:
-        # Render original preview is disabled by default to reduce memory
-        # If you want it as an option, render on demand in the UI instead.
-        # (Keep original_image_bytes=None)
-
-        # Render highlighted preview only if we actually have rects
-        if rects:
-            with fitz.open(stream=io.BytesIO(current_pdf_bytes), filetype="pdf") as doc_hl:
-                page_hl = doc_hl.load_page(page_idx)
-                derot_matrix = page_hl.derotation_matrix
-                for (x0, y0, x1, y1) in rects:
-                    r = fitz.Rect(x0, y0, x1, y1)
-                    fr = r * derot_matrix if page_hl.rotation != 0 else r
-                    fr.normalize()
-                    if not fr.is_empty and fr.is_valid:
-                        page_hl.draw_rect(fr, color=ui_color, width=ui_width, overlay=True)
-                pix_hl = page_hl.get_pixmap(dpi=display_dpi, alpha=False)
-                highlighted_image_bytes = pix_hl.tobytes("jpg", jpg_quality=58)
-                del pix_hl
-
-    except Exception as e:
-        print(f"SESSION {session_id_for_log} ERROR ({func_call_id}) _generate_display_images_for_page_cached pg {page_idx}: {e}")
-
-    print(f"SESSION {session_id_for_log} CACHE_CALL_RENDER_TIME ({func_call_id}): "
-          f"pg {page_idx} took {time.time() - t0:.4f}s.")
+            if fence_text_boxes_details_tuple: # Check the tuple directly
+                fence_text_boxes_details = [dict(item_tuple) for item_tuple in fence_text_boxes_details_tuple]
+                with fitz.open(st.session_state.pdf_temp_path) as doc_hl:
+                    page_hl = doc_hl.load_page(page_idx)
+                    derot_matrix = page_hl.derotation_matrix
+                    for box_detail in fence_text_boxes_details:
+                        rot_rect = fitz.Rect(box_detail['x0'], box_detail['y0'], box_detail['x1'], box_detail['y1'])
+                        final_rect = rot_rect * derot_matrix if page_hl.rotation != 0 else rot_rect
+                        final_rect.normalize()
+                        if not final_rect.is_empty and final_rect.is_valid:
+                            page_hl.draw_rect(final_rect, color=ui_color, width=ui_width, overlay=True)
+                    pix_hl = page_hl.get_pixmap(dpi=display_dpi); highlighted_image_bytes = pix_hl.tobytes("png"); del pix_hl
+    except Exception as e: print(f"SESSION {session_id_for_log} ERROR ({func_call_id}) in _generate_display_images_for_page_cached for page {page_idx}: {e}")
+    render_duration = time.time() - render_start_time
+    print(f"SESSION {session_id_for_log} CACHE_CALL_RENDER_TIME ({func_call_id}): Page {page_idx} took {render_duration:.4f}s for PyMuPDF rendering.")
     return original_image_bytes, highlighted_image_bytes
 
 
 def generate_display_images_for_page_wrapper(page_result_data, session_id):
-    """
-    Wraps the cached renderer. Converts the page's box list to a geometry-only
-    tuple so the cache key stays small and stable.
-    """
+    # Assumes st.session_state.current_pdf_hash and st.session_state.pdf_temp_path are set
     page_idx = page_result_data.get('page_index_in_original_doc')
     pdf_hash = st.session_state.get('current_pdf_hash')
 
     if page_idx is None or pdf_hash is None:
         print(f"SESSION {session_id} WARNING (wrapper): Missing page_idx or pdf_hash.")
         return None, None
-
-    boxes_details = page_result_data.get('fence_text_boxes_details', []) or []
-    # Geometry-only cache signature: ((x0,y0,x1,y1), ...)
-    box_rects_tuple = tuple(
-        (float(b.get('x0', 0.0)), float(b.get('y0', 0.0)),
-         float(b.get('x1', 0.0)), float(b.get('y1', 0.0)))
-        for b in boxes_details
-    )
-
+        
+    boxes_details = page_result_data.get('fence_text_boxes_details', [])
+    details_tuple = tuple(tuple(sorted(d.items())) for d in sorted(boxes_details, key=lambda x: x.get('id', str(x)))) if boxes_details else tuple()
+    
+    # The cached function now relies on session_state for the PDF path,
+    # but the hash is part of the cache key to differentiate between PDFs.
     return _generate_display_images_for_page_cached(
         page_idx,
         pdf_hash,
@@ -390,14 +266,16 @@ def generate_display_images_for_page_wrapper(page_result_data, session_id):
         session_id
     )
 
-# generate_combined_highlighted_pdf (Keep as is from previous version - it doesn't use this image cache)
-# (Ensure it's present in your file)
-def generate_combined_highlighted_pdf(original_pdf_bytes, fence_pages_results_list, uploaded_pdf_name_base, session_id):
-    # ... (Same as previous full app.py) ...
+# generate_combined_highlighted_pdf
+def generate_combined_highlighted_pdf(pdf_temp_path, fence_pages_results_list, uploaded_pdf_name_base, session_id):
     print(f"SESSION {session_id} LOG: Generating combined highlighted PDF.")
-    if not fence_pages_results_list or not original_pdf_bytes: return None, "No data for PDF."
+    if not fence_pages_results_list or not pdf_temp_path: return None, "No data for PDF."
+    if not os.path.exists(pdf_temp_path):
+        print(f"SESSION {session_id} ERROR: PDF temp path does not exist: {pdf_temp_path}")
+        return None, f"PDF temp file not found: {pdf_temp_path}"
+    
     output_doc = fitz.open(); input_doc = None
-    try: input_doc = fitz.open(stream=io.BytesIO(original_pdf_bytes), filetype="pdf")
+    try: input_doc = fitz.open(pdf_temp_path)
     except Exception as e:
         print(f"SESSION {session_id} ERROR: Opening original PDF for combined: {e}")
         if output_doc: output_doc.close(); return None, f"Error opening original PDF: {e}"
@@ -448,9 +326,19 @@ if uploaded_pdf_file_obj:
     
     if st.session_state.last_uploaded_file_id != current_file_id:
         print(f"SESSION {current_session_id} LOG: New file detected. Resetting state for {current_file_id}.")
-        # Preserve user preferences
-        current_selected_model = st.session_state.get('selected_model_for_analysis', "gpt-4o")
-        current_keywords = st.session_state.get('fence_keywords_app', ['fence'])
+        
+        # Clean up old temp file if exists
+        if st.session_state.get('pdf_temp_path'):
+            cleanup_temp_pdf(st.session_state.pdf_temp_path, current_session_id)
+        
+        # Preserve some settings across resets
+        current_selected_model = st.session_state.selected_model_for_analysis
+        current_keywords = st.session_state.fence_keywords_app
+        
+        initialize_session_state(current_session_id) # Reset to defaults
+        
+        st.session_state.selected_model_for_analysis = current_selected_model # Restore
+        st.session_state.fence_keywords_app = current_keywords # Restore
 
         # Hard reset memory-heavy state
         st.session_state.update({
@@ -478,8 +366,14 @@ if uploaded_pdf_file_obj:
         
         # Store new file bytes & hash
         st.session_state.uploaded_pdf_name = uploaded_pdf_file_obj.name
-        st.session_state.original_pdf_bytes = uploaded_pdf_file_obj.getvalue()
-        st.session_state.current_pdf_hash = hashlib.sha256(st.session_state.original_pdf_bytes).hexdigest()
+        
+        # Save to temp file instead of storing bytes in memory
+        st.session_state.pdf_temp_path = save_uploaded_pdf_to_temp(uploaded_pdf_file_obj, current_session_id)
+        
+        # Generate and store hash of the current PDF (read from temp file for hash)
+        with open(st.session_state.pdf_temp_path, 'rb') as f:
+            st.session_state.current_pdf_hash = hashlib.sha256(f.read()).hexdigest()
+        
         st.session_state.last_uploaded_file_id = current_file_id
 
         # Restore user prefs
@@ -501,9 +395,9 @@ if uploaded_pdf_file_obj:
 # Ensure all calls to generate_display_images_for_page_wrapper(res_data_item, current_session_id)
 # And generate_combined_highlighted_pdf(..., current_session_id)
 
-# --- Analysis Execution Block --- (Copied and adapted from previous version)
+# --- Analysis Execution Block ---
 if st.session_state.run_analysis_triggered and \
-   st.session_state.original_pdf_bytes and \
+   st.session_state.pdf_temp_path and \
    llm_analysis_instance and \
    not st.session_state.analysis_halted_due_to_error and \
    not st.session_state.processing_complete:
@@ -529,7 +423,7 @@ if st.session_state.run_analysis_triggered and \
     # OPEN PDF FROM FILE (not from memory!)
     doc_proc_loop = None
     try:
-        doc_proc_loop = fitz.open(st.session_state.temp_pdf_path)  # Open from FILE, not memory!
+        doc_proc_loop = fitz.open(st.session_state.pdf_temp_path)
         st.session_state.doc_total_pages = len(doc_proc_loop)
         print(f"SESSION {current_session_id} LOG: PDF opened from file, {st.session_state.doc_total_pages} pages. RAM: {_rss_mb():.1f} MB")
     except Exception as e:
@@ -945,119 +839,17 @@ if st.session_state.run_analysis_triggered and \
             print("="*80 + "\n")
     
     st.session_state.processing_complete = True 
-    
-    # Post-processing: Generate combined PDF and display results
-    try:
-        if not st.session_state.analysis_halted_due_to_error:
-            prog_bar.empty(); status_txt_area.success("All pages processed!")
-            
-            # Debug logging
-            print(f"SESSION {current_session_id} LOG: Fence pages found: {len(st.session_state.fence_pages)}")
-            print(f"SESSION {current_session_id} LOG: Temp PDF path: {st.session_state.get('temp_pdf_path')}")
-            print(f"SESSION {current_session_id} LOG: Temp PDF exists: {st.session_state.get('temp_pdf_path') and os.path.exists(st.session_state.temp_pdf_path)}")
-            
-            if st.session_state.fence_pages and st.session_state.temp_pdf_path and os.path.exists(st.session_state.temp_pdf_path):
-                # Always attempt to generate combined PDF with fence pages + highlights
-                current_mem = _rss_mb()
-                print(f"SESSION {current_session_id} LOG: Memory before PDF generation: {current_mem:.1f} MB")
-                
-                try:
-                    # Force aggressive GC before PDF generation
-                    import gc
-                    for _ in range(10):
-                        gc.collect()
-                    
-                    with open(st.session_state.temp_pdf_path, 'rb') as f:
-                        pdf_bytes_for_final = f.read()
-                    print(f"SESSION {current_session_id} LOG: Read {len(pdf_bytes_for_final)} bytes from temp file")
-                    
-                    # Force GC after reading large file
-                    for _ in range(5):
-                        gc.collect()
-                    
-                    print(f"SESSION {current_session_id} LOG: Generating combined PDF with {len(st.session_state.fence_pages)} fence pages...")
-                    pdf_b, pdf_n = generate_combined_highlighted_pdf(
-                        pdf_bytes_for_final,
-                        st.session_state.fence_pages,
-                        st.session_state.uploaded_pdf_name,
-                        current_session_id
-                    )
-                    
-                    # Free the large pdf_bytes_for_final immediately
-                    del pdf_bytes_for_final
-                    for _ in range(5):
-                        gc.collect()
-                    
-                    if pdf_b:
-                        # cache by hash to avoid keeping duplicate big blobs in session
-                        @st.cache_data
-                        def _store_combined_pdf(pdf_hash, pdf_bytes, pdf_name):
-                            return pdf_bytes, pdf_name
-                        st.session_state.combined_pdf_ref = _store_combined_pdf(
-                            st.session_state.current_pdf_hash, pdf_b, pdf_n
-                        )
-                        print(f"SESSION {current_session_id} LOG: Combined PDF generated successfully: {pdf_n}")
-                        print(f"SESSION {current_session_id} LOG: Combined PDF size: {len(pdf_b)} bytes")
-                        print(f"SESSION {current_session_id} LOG: Memory after PDF generation: {_rss_mb():.1f} MB")
-                    else:
-                        st.warning(f"Could not generate PDF: {pdf_n}")
-                        print(f"SESSION {current_session_id} WARNING: PDF generation failed: {pdf_n}")
-                except MemoryError as me:
-                    st.error(f"⚠️ Out of memory generating combined PDF. Try using 'Flush Memory' button and processing again.")
-                    print(f"SESSION {current_session_id} ERROR: MemoryError generating PDF: {me}")
-                    import traceback
-                    traceback.print_exc()
-                except Exception as e_pdf:
-                    st.error(f"Error generating combined PDF: {e_pdf}")
-                    print(f"SESSION {current_session_id} ERROR: Exception generating PDF: {e_pdf}")
-                    import traceback
-                    traceback.print_exc()
-            elif not st.session_state.fence_pages:
-                st.info("ℹ️ No fence-related pages found in this document.")
-                print(f"SESSION {current_session_id} INFO: No fence pages found")
-            elif not st.session_state.temp_pdf_path or not os.path.exists(st.session_state.temp_pdf_path):
-                st.warning("⚠️ Temporary PDF file not found. Cannot generate combined PDF.")
-                print(f"SESSION {current_session_id} WARNING: Temp PDF path missing or file deleted")
-            
-            # NOTE: Keep temp file for image generation in results display
-            # It will be cleaned up when a new file is uploaded or session ends
-            print(f"SESSION {current_session_id} LOG: Keeping temp file for results display: {st.session_state.temp_pdf_path}")
-        else: 
-            prog_bar.empty()
-            # NOTE: Keep temp file even on error for potential results display
-            print(f"SESSION {current_session_id} LOG: Keeping temp file after error (if exists): {st.session_state.get('temp_pdf_path')}")
-    except Exception as e_post:
-        print(f"SESSION {current_session_id} ERROR: Post-processing error: {e_post}")
-        import traceback
-        traceback.print_exc()
-        st.error(f"⚠️ Error during post-processing: {e_post}")
-        st.warning("You can still view the page-by-page results below.") 
-    
-    # Display final summary
-    try:
-        final_summary_text = f"### Final Summary ({'Halted' if st.session_state.analysis_halted_due_to_error else 'Completed'})\n- Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages}\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}"
-        summary_placeholder.markdown(final_summary_text)
-        
-        # Show download button if combined PDF was generated
-        if st.session_state.get('combined_pdf_ref') and not st.session_state.analysis_halted_due_to_error:
-            data, fname = st.session_state.combined_pdf_ref
-            st.download_button(
-                "⬇️ Download Highlighted Fence Pages (PDF)",
-                data,
-                fname,
-                "application/pdf",
-                key="dl_combined_pdf_main"
-            )
-            st.caption(f"📄 {len(st.session_state.fence_pages)} fence page(s) included with highlights")
-        elif len(st.session_state.fence_pages) == 0 and not st.session_state.analysis_halted_due_to_error:
-            st.info("ℹ️ No fence-related pages found. No PDF to download.")
-        elif st.session_state.analysis_halted_due_to_error and len(st.session_state.fence_pages) > 0:
-            st.warning("⚠️ Processing was halted. You can view partial results below, but no combined PDF was generated.")
-    except Exception as e_summary:
-        print(f"SESSION {current_session_id} ERROR: Summary display error: {e_summary}")
-        import traceback
-        traceback.print_exc()
-        st.error(f"Error displaying summary: {e_summary}")
+    if not st.session_state.analysis_halted_due_to_error:
+        prog_bar.empty(); status_txt_area.success("All pages processed!")
+        if st.session_state.fence_pages and st.session_state.pdf_temp_path:
+            pdf_b, pdf_n = generate_combined_highlighted_pdf(st.session_state.pdf_temp_path, st.session_state.fence_pages, st.session_state.uploaded_pdf_name, current_session_id)
+            if pdf_b: st.session_state.highlighted_pdf_bytes_for_download, st.session_state.highlighted_pdf_filename_for_download = pdf_b, pdf_n
+            else: st.warning(f"Could not generate PDF: {pdf_n}")
+    else: prog_bar.empty() 
+    final_summary_text = f"### Final Summary ({'Halted' if st.session_state.analysis_halted_due_to_error else 'Completed'})\n- Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages}\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}"
+    summary_placeholder.markdown(final_summary_text)
+    if st.session_state.get('highlighted_pdf_bytes_for_download') and not st.session_state.analysis_halted_due_to_error:
+        st.download_button("⬇️ Download Highlighted Fence Pages (PDF)", st.session_state.highlighted_pdf_bytes_for_download, st.session_state.highlighted_pdf_filename_for_download, "application/pdf", key="dl_combined_pdf_main")
 
 elif st.session_state.processing_complete: 
     print(f"SESSION {current_session_id} LOG: Displaying previously processed results (rerun).")
@@ -1163,7 +955,7 @@ elif st.session_state.processing_complete:
         traceback.print_exc()
         col_nf_res.error(f"Error displaying non-fence pages: {e_non_fence_display}")
 
-elif not st.session_state.original_pdf_bytes : st.info("Upload PDF.")
+elif not st.session_state.pdf_temp_path : st.info("Upload PDF.")
 elif not (openai_key and llm_analysis_instance): st.error("OpenAI models not initialized. Check API key.")
 elif st.session_state.analysis_halted_due_to_error: st.error("Analysis was halted. Upload file again or try a different one.")
 
