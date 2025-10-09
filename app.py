@@ -17,7 +17,7 @@ HIGHLIGHT_COLOR_UI = (0, 0.9, 0)
 HIGHLIGHT_WIDTH_UI = 2.0
 HIGHLIGHT_COLOR_PDF = (0, 0.9, 0)
 HIGHLIGHT_WIDTH_PDF = 2.0
-DISPLAY_IMAGE_DPI = 96  
+DISPLAY_IMAGE_DPI = 72  # Reduced from 96 for memory optimization  
 
 st.set_page_config(page_title="Fence Detector", layout="wide")
 st.markdown("""<style> /* Your CSS */ </style>""", unsafe_allow_html=True) 
