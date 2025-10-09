@@ -606,11 +606,11 @@ if st.session_state.run_analysis_triggered and \
                 gc.collect()
                 gc.collect()
             
-            # Step 4: CRITICAL - Close and reopen PDF document every 2 pages
+            # Step 4: CRITICAL - Close and reopen PDF document EVERY page
             # PyMuPDF keeps loaded pages in C-level memory that Python GC can't free
             # Image generation on complex pages creates 100+ MB temporary buffers
-            # Server shows higher memory usage than local - reopen more frequently
-            if i > 0 and i % 2 == 0:
+            # Server crashing at page 14 - need maximum aggressive memory management
+            if i > 0:  # Every page (was every 2 pages)
                 try:
                     doc_proc_loop.close()
                     # Force GC after close to ensure Python objects are freed
@@ -657,12 +657,11 @@ if st.session_state.run_analysis_triggered and \
             is_large_page = page_width > 2000 or page_height > 2000
             
             # Set DPI based on page size
-            # Profiling proves DocAI responses are tiny (< 12 KB even for complex pages)
-            # The memory issue is Python object retention, not OCR data size
-            # Therefore: Keep DPI=30 for quality, focus on aggressive GC instead
+            # Server crashing at page 14 - reduce DPI further for large pages
+            # Lower DPI = less memory per image
             
             if is_large_page:
-                dpi = 30  # Optimal DPI - responses are only ~2-12 KB
+                dpi = 25  # Reduced from 30 to save memory
                 profiler.record_step("→ Large page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi}")
             else:
                 dpi = 45  # Normal DPI for small pages
