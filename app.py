@@ -14,10 +14,10 @@ import atexit
 
 # --- Highlight Appearance & Performance ---
 HIGHLIGHT_COLOR_UI = (0, 0.9, 0)
-HIGHLIGHT_WIDTH_UI = 1.5
+HIGHLIGHT_WIDTH_UI = 2.0
 HIGHLIGHT_COLOR_PDF = (0, 0.9, 0)
-HIGHLIGHT_WIDTH_PDF = 1.5
-DISPLAY_IMAGE_DPI = 72  
+HIGHLIGHT_WIDTH_PDF = 2.0
+DISPLAY_IMAGE_DPI = 96  
 
 st.set_page_config(page_title="Fence Detector", layout="wide")
 st.markdown("""<style> /* Your CSS */ </style>""", unsafe_allow_html=True) 
@@ -81,7 +81,7 @@ initialize_session_state(current_session_id)
 
 # --- Sidebar (Keep as is) ---
 with st.sidebar:
-    # Configuration and API key loading
+    # ... (Your existing sidebar code) ...
     st.header("⚙️ Configuration") # Copied for completeness
     openai_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
     if not openai_key:
@@ -129,46 +129,6 @@ with st.sidebar:
         st.session_state.fence_keywords_app = [k.strip().lower() for k in custom_keywords_str.split("\n") if k.strip()]
         st.rerun()
     FENCE_KEYWORDS_APP = st.session_state.fence_keywords_app
-    
-    # Memory monitoring
-    st.caption(f"RAM: {_rss_mb():.1f} MB")
-    
-    # Memory flush button
-    st.markdown("---")
-    if st.button("🧹 Flush Memory & Reset", key="flush_memory_btn", help="Clean up temp files and clear all session data"):
-        import gc
-        
-        # Delete temp file if exists
-        if st.session_state.get('temp_pdf_path') and os.path.exists(st.session_state.temp_pdf_path):
-            try:
-                os.unlink(st.session_state.temp_pdf_path)
-                print(f"SESSION {current_session_id} LOG: Flushed temp file: {st.session_state.temp_pdf_path}")
-            except Exception as e:
-                print(f"SESSION {current_session_id} WARNING: Could not delete temp file during flush: {e}")
-        
-        # Clear all caches
-        st.cache_data.clear()
-        
-        # Reset session state (keep only model preference and keywords)
-        model_backup = st.session_state.get('selected_model_for_analysis')
-        keywords_backup = st.session_state.get('fence_keywords_app')
-        
-        for key in list(st.session_state.keys()):
-            if key not in ['selected_model_for_analysis', 'fence_keywords_app', 'model_selector_radio', 'highlight_toggle', 'kw_text_area', 'update_kw_btn', 'flush_memory_btn']:
-                del st.session_state[key]
-        
-        # Restore preferences
-        if model_backup:
-            st.session_state.selected_model_for_analysis = model_backup
-        if keywords_backup:
-            st.session_state.fence_keywords_app = keywords_backup
-        
-        # Aggressive GC
-        for _ in range(10):
-            gc.collect()
-        
-        st.success(f"✅ Memory flushed! RAM: {_rss_mb():.1f} MB")
-        st.rerun()
 
 
 llm_analysis_instance = None
@@ -181,29 +141,15 @@ if openai_key:
 
 
 def get_image_download_link_html(img_bytes, filename, text):
-    """
-    Return a download <a> tag using a data URL with the correct MIME type.
-    If the bytes are JPEG but the filename ends with .png, rewrite to .jpg
-    to avoid mismatches. Call sites do not need to change.
-    """
-    # MIME sniffing
-    mime = "application/octet-stream"
-    if img_bytes[:2] == b"\xff\xd8":
-        mime = "image/jpeg"
-        if filename.lower().endswith(".png"):
-            filename = filename[:-4] + ".jpg"
-    elif img_bytes[:8] == b"\x89PNG\r\n\x1a\n":
-        mime = "image/png"
-
     b64 = base64.b64encode(img_bytes).decode()
-    return f'<a href="data:{mime};base64,{b64}" download="{filename}" class="download-button">{text}</a>'
+    return f'<a href="data:image/png;base64,{b64}" download="{filename}" class="download-button">{text}</a>'
 
 @time_it 
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=200) # Increased max_entries
 def _generate_display_images_for_page_cached(page_idx, 
                                             pdf_hash_for_cache_key, # Use PDF hash as part of key
                                             fence_text_boxes_details_tuple,
-                                            ui_color, ui_width, display_dpi,
+                                            ui_color, ui_width, display_dpi, 
                                             session_id_for_log="N/A_CACHE"):
     # This function now RELIES on st.session_state.pdf_temp_path being the
     # correct path for the given pdf_hash_for_cache_key.
@@ -216,8 +162,10 @@ def _generate_display_images_for_page_cached(page_idx,
         print(f"SESSION {session_id_for_log} ERROR (_cached): pdf_temp_path does not exist: {st.session_state.pdf_temp_path}")
         return None, None
 
-    # Parse rectangles defensively
-    rects = []
+    original_image_bytes, highlighted_image_bytes = None, None
+    func_call_id = str(uuid.uuid4())[:4] 
+    print(f"SESSION {session_id_for_log} CACHE_CALL ({func_call_id}): _generate_display_images_for_page_cached for Page {page_idx}, PDF Hash: {pdf_hash_for_cache_key}. Num boxes: {len(fence_text_boxes_details_tuple)}")
+    render_start_time = time.time()
     try:
         # Use the PDF file from temp path
         with fitz.open(st.session_state.pdf_temp_path) as doc_orig:
@@ -241,14 +189,13 @@ def _generate_display_images_for_page_cached(page_idx,
     print(f"SESSION {session_id_for_log} CACHE_CALL_RENDER_TIME ({func_call_id}): Page {page_idx} took {render_duration:.4f}s for PyMuPDF rendering.")
     return original_image_bytes, highlighted_image_bytes
 
-
 def generate_display_images_for_page_wrapper(page_result_data, session_id):
     # Assumes st.session_state.current_pdf_hash and st.session_state.pdf_temp_path are set
     page_idx = page_result_data.get('page_index_in_original_doc')
     pdf_hash = st.session_state.get('current_pdf_hash')
 
-    if page_idx is None or pdf_hash is None:
-        print(f"SESSION {session_id} WARNING (wrapper): Missing page_idx or pdf_hash.")
+    if page_idx is None or pdf_hash is None: 
+        print(f"SESSION {session_id} WARNING (wrapper): Missing page_idx or pdf_hash for on-demand image gen.")
         return None, None
         
     boxes_details = page_result_data.get('fence_text_boxes_details', [])
@@ -257,12 +204,12 @@ def generate_display_images_for_page_wrapper(page_result_data, session_id):
     # The cached function now relies on session_state for the PDF path,
     # but the hash is part of the cache key to differentiate between PDFs.
     return _generate_display_images_for_page_cached(
-        page_idx,
-        pdf_hash,
-        box_rects_tuple,           # <— small, avoids text in cache key
-        HIGHLIGHT_COLOR_UI,
-        HIGHLIGHT_WIDTH_UI,
-        DISPLAY_IMAGE_DPI,
+        page_idx, 
+        pdf_hash, # Pass the PDF hash
+        details_tuple, 
+        HIGHLIGHT_COLOR_UI, 
+        HIGHLIGHT_WIDTH_UI, 
+        DISPLAY_IMAGE_DPI, 
         session_id
     )
 
@@ -306,16 +253,6 @@ def generate_combined_highlighted_pdf(pdf_temp_path, fence_pages_results_list, u
     print(f"SESSION {session_id} LOG: Finished generating combined PDF. Success: {pdf_bytes is not None}")
     return (pdf_bytes, fname) if pdf_bytes else (None, fname)
 
-
-# DELETED: compute_doc_legend_and_refs_compact() function (lines 367-495)
-# This was 130 lines of dead code for cross-reference analysis (never called)
-
-def merge_extra_keywords(signals: list) -> list:
-    """Return page-local signals only (cross-refs deleted)."""
-    return list(signals or [])
-
-
-
 # --- Main App Flow ---
 st.markdown("<div class='section-header'><h2>📄 Upload Engineering Drawings</h2></div>", unsafe_allow_html=True)
 uploaded_pdf_file_obj = st.file_uploader("Upload PDF Document", type=["pdf"], key="pdf_uploader_main")
@@ -340,31 +277,6 @@ if uploaded_pdf_file_obj:
         st.session_state.selected_model_for_analysis = current_selected_model # Restore
         st.session_state.fence_keywords_app = current_keywords # Restore
 
-        # Hard reset memory-heavy state
-        st.session_state.update({
-            'fence_pages': [],
-            'non_fence_pages': [],
-            'total_pages_processed_count': 0,
-            'doc_total_pages': 0,
-            'processing_complete': False,
-            'analysis_halted_due_to_error': False,
-            'legend_id_list': [],
-            'page_refs': {},
-            'legend_index_compact': [],
-            'highlighted_pdf_bytes_for_download': None,
-            'highlighted_pdf_filename_for_download': None,
-            'run_analysis_triggered': False,
-        })
-
-        # CLEANUP: Delete old temp file if exists
-        if st.session_state.get('temp_pdf_path') and os.path.exists(st.session_state.temp_pdf_path):
-            try:
-                os.unlink(st.session_state.temp_pdf_path)
-                print(f"SESSION {current_session_id} LOG: Cleaned up old temp file on new upload: {st.session_state.temp_pdf_path}")
-            except Exception as e_cleanup:
-                print(f"SESSION {current_session_id} WARNING: Could not delete old temp file: {e_cleanup}")
-        
-        # Store new file bytes & hash
         st.session_state.uploaded_pdf_name = uploaded_pdf_file_obj.name
         
         # Save to temp file instead of storing bytes in memory
@@ -375,10 +287,6 @@ if uploaded_pdf_file_obj:
             st.session_state.current_pdf_hash = hashlib.sha256(f.read()).hexdigest()
         
         st.session_state.last_uploaded_file_id = current_file_id
-
-        # Restore user prefs
-        st.session_state.selected_model_for_analysis = current_selected_model
-        st.session_state.fence_keywords_app = current_keywords
         
         st.cache_data.clear() 
         print(f"SESSION {current_session_id} LOG: Cleared all @st.cache_data caches due to new file.")
@@ -403,300 +311,80 @@ if st.session_state.run_analysis_triggered and \
    not st.session_state.processing_complete:
     
     print(f"SESSION {current_session_id} LOG: Starting PDF processing loop.")
-    print(f"SESSION {current_session_id} LOG: Memory BEFORE temp file: {_rss_mb():.1f} MB")
-    
-    # CRITICAL: Write PDF to temp file FIRST, then open from file (not from memory!)
-    import tempfile
-    temp_pdf_path = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
-    temp_pdf_path.write(st.session_state.original_pdf_bytes)
-    temp_pdf_path.close()
-    st.session_state.temp_pdf_path = temp_pdf_path.name
-    print(f"SESSION {current_session_id} LOG: Wrote PDF to temp file: {st.session_state.temp_pdf_path}")
-    
-    # NOW free the 149MB from session state BEFORE opening
-    st.session_state.original_pdf_bytes = None
-    import gc
-    gc.collect()
-    gc.collect()  # Call twice
-    print(f"SESSION {current_session_id} LOG: Freed 149MB from session state. RAM: {_rss_mb():.1f} MB")
-    
-    # OPEN PDF FROM FILE (not from memory!)
     doc_proc_loop = None
     try:
         doc_proc_loop = fitz.open(st.session_state.pdf_temp_path)
         st.session_state.doc_total_pages = len(doc_proc_loop)
-        print(f"SESSION {current_session_id} LOG: PDF opened from file, {st.session_state.doc_total_pages} pages. RAM: {_rss_mb():.1f} MB")
+        print(f"SESSION {current_session_id} LOG: PDF opened, {st.session_state.doc_total_pages} pages.")
     except Exception as e:
         st.error(f"Failed to open PDF: {e}"); st.session_state.processing_complete = True; st.session_state.analysis_halted_due_to_error = True
         if doc_proc_loop: doc_proc_loop.close()
         print(f"SESSION {current_session_id} ERROR: Failed to open PDF for processing: {e}")
         st.stop() 
-        # --- Cross-reference analysis disabled to save memory ---
-    # Skip cross-reference analysis entirely to prevent memory crashes
-    st.session_state.legend_id_list = []
-    st.session_state.page_refs = {}
-    st.session_state.legend_index_compact = []
-    print(f"[CROSS] Cross-reference analysis disabled for memory optimization. RAM: {_rss_mb():.1f} MB")
     st.markdown("<hr>", unsafe_allow_html=True); st.markdown("<h2>📊 Analysis Results (Live)</h2>", unsafe_allow_html=True)
     summary_placeholder = st.empty(); col_f, col_nf = st.columns(2)
     with col_f: st.subheader("✅ Fence-Related Pages")
     with col_nf: st.subheader("❌ Non-Fence Pages")
     prog_bar = st.progress(0); status_txt_area = st.empty()
     try:
-        print(f"SESSION {current_session_id} LOG: Starting processing loop for {st.session_state.doc_total_pages} pages")
-        print(f"SESSION {current_session_id} LOG: Initial memory: {_rss_mb():.1f} MB")
         for i in range(st.session_state.doc_total_pages):
             curr_pg_num = i + 1; st.session_state.total_pages_processed_count = curr_pg_num
             prog_bar.progress(curr_pg_num / st.session_state.doc_total_pages)
             status_txt_area.text(f"Processing Page {curr_pg_num}/{st.session_state.doc_total_pages}...")
-            memory_usage = _rss_mb()
-            if memory_usage == 0.0:
-                # Fallback memory monitoring if psutil fails
-                import sys
-                memory_usage = sys.getsizeof(st.session_state) / (1024**2)
-                memory_usage += sum(sys.getsizeof(v) for v in st.session_state.values() if hasattr(v, '__len__')) / (1024**2)
-            print(f"SESSION {current_session_id} LOG: Processing page {curr_pg_num}. RAM: {memory_usage:.1f} MB")
+            print(f"SESSION {current_session_id} LOG: Processing page {curr_pg_num}.")
+            page_obj = doc_proc_loop.load_page(i); text_content = page_obj.get_text("text")
             
-            # START PROFILING THIS PAGE
-            profiler.start_page(curr_pg_num)
-            
-            # AGGRESSIVE MEMORY MANAGEMENT - Force cleanup BEFORE processing
-            # Profiling shows DocAI responses are tiny (< 12KB), but Python objects accumulate
-            import gc
-            
-            # Step 1: Force immediate garbage collection (5x for thorough cleanup)
-            for _ in range(8):
-                gc.collect()
-            profiler.record_step("1. GC cleanup (8×)")
-            
-            # Step 2: Clear Streamlit caches more aggressively
-            if i >= 14 and i < 30:
-                # Critical zone - clear EVERY page
-                st.cache_data.clear()
-                profiler.record_step("2. Cache clear (critical zone)")
-            elif i % 3 == 0 and i > 0:  # Every 3 pages (was 5)
-                st.cache_data.clear()
-                profiler.record_step("2. Cache clear")
-            
-            # Step 3: Explicitly null out previous page data if it exists
-            if i > 0:
-                # Force release of any lingering references
-                if 'page_obj' in locals():
-                    try:
-                        del page_obj
-                    except:
-                        pass
-                if 'text_content' in locals():
-                    try:
-                        del text_content
-                    except:
-                        pass
-                if 'single_page_pdf_bytes' in locals():
-                    try:
-                        del single_page_pdf_bytes
-                    except:
-                        pass
-                # Force GC again after deletions
-                gc.collect()
-                gc.collect()
-            
-            # Step 4: CRITICAL - Close and reopen PDF document EVERY page
-            # PyMuPDF keeps loaded pages in C-level memory that Python GC can't free
-            # Image generation on complex pages creates 100+ MB temporary buffers
-            # Server crashing at page 14 - need maximum aggressive memory management
-            if i > 0:  # Every page (was every 2 pages)
-                try:
-                    doc_proc_loop.close()
-                    # Force GC after close to ensure Python objects are freed
-                    for _ in range(5):
-                        gc.collect()
-                    doc_proc_loop = fitz.open(st.session_state.temp_pdf_path)
-                    profiler.record_step("2b. Close/Reopen PDF", f"page {i} (free C memory)")
-                    # Clear cache after reopen to maximize memory release
-                    st.cache_data.clear()
-                    # Force GC after document reload
-                    for _ in range(5):
-                        gc.collect()
-                except Exception as e:
-                    print(f"SESSION {current_session_id} WARNING: Could not reopen PDF: {e}")
-            
-            # Check memory usage and halt if too high
-            current_memory = _rss_mb()
-            # Streamlit Cloud has 1GB (1024MB) hard limit
-            memory_limit = 950  # Safe limit with OCR enabled for all pages
-            
-            if current_memory > memory_limit:
-                error_msg = f"⚠️ Memory usage too high ({current_memory:.1f} MB). Stopping analysis to prevent crash."
-                st.error(error_msg)
-                st.warning("💡 Tip: You can download the partial results below and resume processing later.")
-                status_txt_area.error(error_msg)
-                st.session_state.analysis_halted_due_to_error = True
-                print(f"SESSION {current_session_id} ERROR: {error_msg}")
-                break
-            # Load page
-            page_obj = doc_proc_loop.load_page(i)
-            profiler.record_step("3. load_page()")
-            
-            # Extract text
-            text_content = page_obj.get_text("text")
-            profiler.record_step("4. get_text()", f"len={len(text_content)}")
-            
-            # CRITICAL FIX: For large pages, skip page_bytes entirely to prevent memory accumulation
-            # Testing shows memory grows from 730MB → 1427MB peak (memory leak!)
-            # Generate page_bytes for ALL pages (including large) for better OCR accuracy
-            # Testing showed 233% improvement with only 7.7MB additional memory cost
+            # Create single-page PDF bytes for comprehensive text extraction
             single_page_pdf_bytes = None
-            page_width = page_obj.rect.width
-            page_height = page_obj.rect.height
-            is_large_page = page_width > 2000 or page_height > 2000
-            
-            # Set DPI based on page size
-            # Server crashing at page 14 - reduce DPI further for large pages
-            # Lower DPI = less memory per image
-            
-            if is_large_page:
-                dpi = 25  # Reduced from 30 to save memory
-                profiler.record_step("→ Large page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi}")
-            else:
-                dpi = 45  # Normal DPI for small pages
-                profiler.record_step("→ Normal page", f"{page_width:.0f}×{page_height:.0f}, DPI={dpi}")
-            
             try:
-                # Generate page_bytes for ALL pages with adaptive DPI
-                pix = page_obj.get_pixmap(dpi=dpi, alpha=False)
-                pix_width, pix_height = pix.width, pix.height
-                profiler.record_step("5. get_pixmap()", f"size={pix_width}x{pix_height}")
-                
-                # Convert to PNG bytes and FREE pixmap immediately
-                img_bytes = pix.tobytes("png")
-                pix_size_mb = len(img_bytes) / (1024*1024)
-                del pix
-                gc.collect()
-                gc.collect()
-                profiler.record_step("6. tobytes() + free pixmap", f"{pix_size_mb:.2f}MB PNG")
-                
-                # Wrap PNG in minimal PDF wrapper
-                from io import BytesIO
-                temp_img_doc = fitz.open()
-                temp_page = temp_img_doc.new_page(width=pix_width, height=pix_height)
-                temp_page.insert_image(temp_page.rect, stream=img_bytes, keep_proportion=False)
-                single_page_pdf_bytes = temp_img_doc.tobytes(deflate=True, garbage=4)
-                temp_img_doc.close()
-                profiler.record_step("7. PDF wrapper", f"{len(single_page_pdf_bytes)/(1024*1024):.2f}MB")
-                
-                # Cleanup img_bytes
-                del img_bytes
-                gc.collect()
-                gc.collect()
-                profiler.record_step("8. Cleanup img_bytes")
-                
-                # EXTRA aggressive cleanup for large pages to prevent memory accumulation
-                if is_large_page:
-                    del temp_page
-                    gc.collect()
-                    gc.collect()
-                    gc.collect()
-                    profiler.record_step("8b. Extra cleanup (large page)")
+                temp_doc = fitz.open()
+                temp_doc.insert_pdf(doc_proc_loop, from_page=i, to_page=i)
+                single_page_pdf_bytes = temp_doc.tobytes()
+                temp_doc.close()
             except Exception as e:
-                print(f"SESSION {current_session_id} WARNING: Could not create page image for page {curr_pg_num}: {e}")
-                single_page_pdf_bytes = None  # Fallback to text-only if image generation fails
+                print(f"SESSION {current_session_id} WARNING: Could not create single page PDF for page {curr_pg_num}: {e}")
             
             page_data_an = {"page_number": curr_pg_num, "text": text_content, "page_bytes": single_page_pdf_bytes}
             analysis_res_core = {}; fatal_err_page = False
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
-                    try:
-                        analysis_res_core = analyze_page(
-                            page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
-                            recall_mode="strict"   # or "balanced"/"high"
-                        )
-                        profiler.record_step("9. analyze_page()", f"fence={analysis_res_core.get('fence_found')}")
-                        
-                        jr = json.loads(analysis_res_core["text_response"])
-                        signals = jr.get("signals", [])
-                    except Exception:
-                        signals = []
-                    profiler.record_step("10. Extract signals", f"count={len(signals)}")
-            except MemoryError as me:
-                tb = log_exception(current_session_id, f"Core Analysis Page {curr_pg_num} (MemoryError)", me)
-                st.error(f"💥 Memory error processing page {curr_pg_num}. Skipping OCR analysis.")
-                analysis_res_core = {"fence_found": False, "text_found": False}
-                signals = []
+                    analysis_res_core = analyze_page(
+                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config
+                    )
+
             except UnrecoverableRateLimitError as urle:
                 msg = f"🛑 API Rate Limit Pg {curr_pg_num}: {urle}. Analysis halted."; status_txt_area.error(msg); st.error(msg)
                 st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; print(f"SESSION {current_session_id} ERROR: {msg}"); break
-            except Exception as e:
-                tb = log_exception(current_session_id, f"Core Analysis Page {curr_pg_num}", e)
-                st.warning(f"⚠️ Analysis error on page {curr_pg_num}: {str(e)[:100]}...")
-                analysis_res_core = {"fence_found": False, "text_found": False}
-                signals = []
+            except Exception as e_core: st.error(f"Core analysis error pg {curr_pg_num}: {e_core}"); analysis_res_core = {"fence_found": False}; print(f"SESSION {current_session_id} ERROR: Core analysis pg {curr_pg_num}: {e_core}")
             analysis_result = {**analysis_res_core, 'page_number': curr_pg_num, 'page_index_in_original_doc': i, 'fence_text_boxes_details': [], 'highlight_fence_text_app_setting': highlight_fence_text_app}
-            # OCR HIGHLIGHTING (ALWAYS RUN - no memory-based skipping per user request)
             if not fatal_err_page and highlight_fence_text_app and analysis_result.get('text_found'):
                 status_txt_area.text(f"Page {curr_pg_num}: Highlighting (text match found)...")
+                single_pg_bytes_io = io.BytesIO(); temp_doc_single = None
+                try: 
+                    temp_doc_single = fitz.open()
+                    temp_doc_single.insert_pdf(doc_proc_loop, from_page=i, to_page=i); temp_doc_single.save(single_pg_bytes_io)
+                finally: 
+                    if temp_doc_single: temp_doc_single.close()
                 try:
                     with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):   
-                        # Page_bytes now available for all pages (OCR enabled globally)
-                        if single_page_pdf_bytes:
-                            # Validate signals against page text before using as keywords
-                            validated_signals = []
-                            page_text_lower = text_content.lower()
-                            for sig in signals:
-                                if sig and sig.lower() in page_text_lower:
-                                    validated_signals.append(sig)
-                            if len(validated_signals) < len(signals):
-                                print(f"SESSION {current_session_id} LOG: Filtered signals {len(signals)}→{len(validated_signals)} (only those in page text)")
-                            
-                            boxes,_,_ = get_fence_related_text_boxes(
-                                single_page_pdf_bytes,
-                                llm_analysis_instance,
-                                FENCE_KEYWORDS_APP,
-                                merge_extra_keywords(validated_signals),
-                                st.session_state.selected_model_for_analysis,
-                                google_cloud_config
-                            )
+                        boxes,_,_ = get_fence_related_text_boxes(
+                            single_pg_bytes_io.getvalue(),
+                            llm_analysis_instance,
+                            FENCE_KEYWORDS_APP,
+                            st.session_state.selected_model_for_analysis,
+                            google_cloud_config  # <-- pass it through
+                        )
 
-                            # Note: No coordinate scaling needed - page_bytes already at correct DPI
-                            # Large pages use DPI=30, small pages use DPI=45
-                            # OCR coordinates match the page_bytes dimensions, no conversion needed
-                            
-                            if boxes:
-                                analysis_result['fence_text_boxes_details'] = boxes
-                            profiler.record_step("11. OCR highlighting", f"boxes={len(boxes) if boxes else 0}")
-                        else:
-                            # Fallback: no page_bytes available (image generation failed)
-                            profiler.record_step("11. OCR highlighting", "skipped (no page_bytes)")
-                except MemoryError as me:
-                    tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num} (MemoryError)", me)
-                    st.warning(f"💥 Memory error during OCR on page {curr_pg_num}. Skipping highlights.")
-                    analysis_result['fence_text_boxes_details'] = []
-                    profiler.record_step("11. OCR highlighting (FAILED)", "MemoryError")
+                        if boxes: analysis_result['fence_text_boxes_details'] = boxes
                 except UnrecoverableRateLimitError as urle_hl:
                     msg = f"🛑 API Rate Limit Highlight Pg {curr_pg_num}: {urle_hl}. Halted."; status_txt_area.error(msg); st.error(msg)
                     st.session_state.analysis_halted_due_to_error = True; fatal_err_page = True; print(f"SESSION {current_session_id} ERROR: {msg}"); break
-                except Exception as e_hl: 
-                    tb = log_exception(current_session_id, f"OCR Processing Page {curr_pg_num}", e_hl)
-                    st.warning(f"⚠️ OCR error on page {curr_pg_num}: {str(e_hl)[:100]}...")
-                    analysis_result['fence_text_boxes_details'] = []
-                    profiler.record_step("11. OCR highlighting (FAILED)", str(e_hl)[:50])
+                except Exception as e_hl: st.warning(f"Highlight error pg {curr_pg_num}: {e_hl}"); print(f"SESSION {current_session_id} WARNING: Highlight error pg {curr_pg_num}: {e_hl}")
             elif not fatal_err_page and highlight_fence_text_app and analysis_result.get('fence_found'):
                  status_txt_area.text(f"Page {curr_pg_num}: Fence found, no text match for detailed highlighting.")
             if fatal_err_page: break
-            
-            # Store result in session state (ULTRA minimal - only essential fields)
-            # Remove ALL large data structures to save memory
-            analysis_result_minimal = {
-                'page_number': analysis_result.get('page_number'),
-                'page_index_in_original_doc': analysis_result.get('page_index_in_original_doc'),
-                'fence_found': analysis_result.get('fence_found'),
-                'text_found': analysis_result.get('text_found'),
-                'text_snippet': analysis_result.get('text_snippet', '')[:200] if analysis_result.get('text_snippet') else '',  # Limit snippet
-                'fence_text_boxes_details': analysis_result.get('fence_text_boxes_details', [])[:50],  # Limit to 50 boxes max
-                'highlight_fence_text_app_setting': analysis_result.get('highlight_fence_text_app_setting')
-            }
             target_col = col_f if analysis_result.get('fence_found') else col_nf
-            (st.session_state.fence_pages if analysis_result.get('fence_found') else st.session_state.non_fence_pages).append(analysis_result_minimal)
-            profiler.record_step("12. Store result (minimal)", f"size={len(str(analysis_result_minimal))/(1024):.1f}KB")
+            (st.session_state.fence_pages if analysis_result.get('fence_found') else st.session_state.non_fence_pages).append(analysis_result)
             with target_col: # Display Logic (copied from display_page_result_expander for consistency)
                 exp_title = f"Page {analysis_result['page_number']}"
                 if analysis_result.get('fence_found'):
@@ -705,14 +393,21 @@ if st.session_state.run_analysis_triggered and \
 
                     if analysis_result.get('fence_text_boxes_details') and highlight_fence_text_app: reasons.append("Highlights")
                     if reasons: exp_title += f" ({' & '.join(reasons)} Match)"
-                # Don't expand any pages during live processing to save maximum memory
-                with st.expander(exp_title, expanded=False):
+                with st.expander(exp_title, expanded=True):
                     img_col, det_col = st.columns([2,1])
-                    
-                    # Don't generate images during live processing - too memory intensive
-                    # Images will be available after processing completes
-                    with img_col:
-                        st.info("🚀 Processing... Images will be available after completion")
+                    print(f"SESSION {current_session_id} DEBUG LIVE DISPLAY Page {analysis_result['page_number']}: Num boxes: {len(analysis_result.get('fence_text_boxes_details', []))}")
+                    wrapper_call_start_time = time.time()
+                    with st.spinner(f"Rendering image for page {analysis_result['page_number']}..."): 
+                        orig_b, hl_b = generate_display_images_for_page_wrapper(analysis_result, current_session_id) # Pass session_id
+                    wrapper_call_duration = time.time() - wrapper_call_start_time
+                    print(f"SESSION {current_session_id} PERF_LOG: generate_display_images_for_page_wrapper Page {curr_pg_num} took {wrapper_call_duration:.4f}s.")
+                    with img_col: # Image display
+                        disp_img_ui = hl_b if hl_b else orig_b
+                        if disp_img_ui: st.image(disp_img_ui, caption=f"Page {analysis_result['page_number']}{' (Highlighted)' if hl_b else ''}")
+                        dl_links_html_live = []
+                        if hl_b: dl_links_html_live.append(get_image_download_link_html(hl_b, f"page_{analysis_result['page_number']}_hl.png", "DL HL Img"))
+                        if orig_b: dl_links_html_live.append(get_image_download_link_html(orig_b, f"page_{analysis_result['page_number']}_orig.png", "DL Orig Img"))
+                        if dl_links_html_live: st.markdown(" ".join(dl_links_html_live), unsafe_allow_html=True)
                     with det_col: # Text details display
                         # ... (Same detailed text display as before)
                         st.markdown("##### Analysis Details")
@@ -740,104 +435,12 @@ if st.session_state.run_analysis_triggered and \
                                 if display_text_live not in disp_set_live: st.markdown(display_text_live); disp_set_live.add(display_text_live); count_live+=1
                                 if count_live >=15 and len(details_list) > 17: st.markdown(f"- ...& {len(details_list)-count_live} more."); break
             summary_placeholder.markdown(f"### Summary (Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages})\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}")
-            
-            # ULTRA-AGGRESSIVE memory cleanup after each page
-            try:
-                # Delete everything from this page
-                del page_obj, text_content, single_page_pdf_bytes, page_data_an, analysis_res_core, analysis_result, analysis_result_minimal
-                if 'analysis_result_compact' in locals():
-                    del analysis_result_compact
-                if 'single_pg_bytes_io' in locals():
-                    del single_pg_bytes_io
-                if 'temp_doc_single' in locals():
-                    del temp_doc_single
-                if 'boxes' in locals():
-                    del boxes  # OCR boxes can be large
-                if 'signals' in locals():
-                    del signals
-                if 'jr' in locals():
-                    del jr
-                if 'pix' in locals():
-                    del pix
-                if 'img_bytes' in locals():
-                    del img_bytes
-                if 'temp_img_doc' in locals():
-                    del temp_img_doc
-                if 'temp_page' in locals():
-                    del temp_page
-                if 'validated_signals' in locals():
-                    del validated_signals
-                if 'page_text_lower' in locals():
-                    del page_text_lower
-                    
-                # Force IMMEDIATE garbage collection (10× for maximum cleanup)
-                # Profiling showed Python object retention is the real issue, not DocAI responses
-                # Server needs more aggressive GC than local
-                for _ in range(10):
-                    gc.collect()
-                profiler.record_step("13. Cleanup variables (ultra-aggressive + 10× GC)")
-            except Exception as cleanup_err:
-                print(f"Warning: cleanup error: {cleanup_err}")
-            
-            # Clear Streamlit's internal cache more aggressively
-            if i % 1 == 0:  # EVERY PAGE
-                try:
-                    st.cache_data.clear()
-                except:
-                    pass
-            
-            # End page profiling
-            net_change = profiler.end_page()
-            
             time.sleep(0.05) 
-    except Exception as fatal_error:
-        # Catch any unhandled exceptions in the main loop
-        tb = log_exception(current_session_id, f"FATAL ERROR in main processing loop at page {st.session_state.total_pages_processed_count}", fatal_error)
-        st.error(f"🔥 Fatal error during processing: {str(fatal_error)[:200]}")
-        with st.expander("⚠️ Click to see full error details", expanded=False):
-            st.code(tb, language="python")
-        st.session_state.analysis_halted_due_to_error = True
     finally: 
         if doc_proc_loop:
             doc_proc_loop.close()
             print(f"SESSION {current_session_id} LOG: Closed main processing PDF document in finally block.")
         doc_proc_loop = None 
-        
-        print(f"SESSION {current_session_id} LOG: Processing loop ended. Final memory: {_rss_mb():.1f} MB")
-        
-        # PRINT PROFILING SUMMARY
-        print("\n" + "="*80)
-        print("PROFILING SUMMARY - Memory Delta Per Function")
-        print("="*80)
-        if profiler.page_data:
-            summary = {}
-            for page_data in profiler.page_data:
-                for step in page_data['steps']:
-                    name = step['name']
-                    if name not in summary:
-                        summary[name] = {'count': 0, 'total': 0, 'max': 0, 'min': 999}
-                    summary[name]['count'] += 1
-                    summary[name]['total'] += step['delta']
-                    summary[name]['max'] = max(summary[name]['max'], step['delta'])
-                    summary[name]['min'] = min(summary[name]['min'], step['delta'])
-            
-            print(f"\n{'Step':<35} {'Calls':<8} {'Avg Δ':<10} {'Max Δ':<10} {'Min Δ':<10}")
-            print("-"*80)
-            for name in sorted(summary.keys()):
-                s = summary[name]
-                avg = s['total'] / s['count'] if s['count'] > 0 else 0
-                print(f"{name:<35} {s['count']:<8} {avg:>+9.1f}MB {s['max']:>+9.1f}MB {s['min']:>+9.1f}MB")
-            
-            total_net = sum((p['steps'][-1]['mem'] if p['steps'] else p['start_mem']) - p['start_mem'] for p in profiler.page_data)
-            avg_net = total_net / len(profiler.page_data) if profiler.page_data else 0
-            print(f"\nTotal pages profiled: {len(profiler.page_data)}")
-            print(f"Total NET memory change: {total_net:+.1f}MB")
-            print(f"Average NET per page: {avg_net:+.1f}MB")
-            print("="*80 + "\n")
-        else:
-            print("No profiling data collected")
-            print("="*80 + "\n")
-    
     st.session_state.processing_complete = True 
     if not st.session_state.analysis_halted_due_to_error:
         prog_bar.empty(); status_txt_area.success("All pages processed!")
@@ -856,22 +459,8 @@ elif st.session_state.processing_complete:
     st.markdown("<hr>", unsafe_allow_html=True); st.markdown("<h2>📊 Analysis Results</h2>", unsafe_allow_html=True)
     final_summary_text_rerun = f"### Final Summary ({'Halted Previously' if st.session_state.analysis_halted_due_to_error else 'Completed'})\n- Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages}\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}"
     st.markdown(final_summary_text_rerun)
-    
-    # Show download button if combined PDF was generated
-    if st.session_state.get('combined_pdf_ref') and not st.session_state.analysis_halted_due_to_error:
-        data, fname = st.session_state.combined_pdf_ref
-        st.download_button(
-            "⬇️ Download Highlighted Fence Pages (PDF)",
-            data,
-            fname,
-            "application/pdf",
-            key="dl_combined_pdf_rerun"
-        )
-        st.caption(f"📄 {len(st.session_state.fence_pages)} fence page(s) included with highlights")
-    elif len(st.session_state.fence_pages) == 0 and not st.session_state.analysis_halted_due_to_error:
-        st.info("ℹ️ No fence-related pages found. No PDF to download.")
-    elif st.session_state.analysis_halted_due_to_error and len(st.session_state.fence_pages) > 0:
-        st.warning("⚠️ Processing was halted. You can view partial results below, but no combined PDF was generated.")
+    if st.session_state.get('highlighted_pdf_bytes_for_download') and not st.session_state.analysis_halted_due_to_error:
+         st.download_button("⬇️ Download Highlighted Fence Pages (PDF)", st.session_state.highlighted_pdf_bytes_for_download, st.session_state.highlighted_pdf_filename_for_download, "application/pdf", key="dl_combined_pdf_rerun")
     col_f_res, col_nf_res = st.columns(2)
     with col_f_res: st.subheader(f"✅ Fence-Related Pages ({len(st.session_state.fence_pages)})")
     with col_nf_res: st.subheader(f"❌ Non-Fence Pages ({len(st.session_state.non_fence_pages)})")
@@ -888,30 +477,16 @@ elif st.session_state.processing_complete:
                     if reasons_res: exp_title_res += f" ({' & '.join(reasons_res)} Match)"
                 with st.expander(exp_title_res, expanded=False):
                     img_col_r, det_col_r = st.columns([2,1])
-                    
-                    # Always generate and display images (uses cache)
-                    orig_b_r, hl_b_r = generate_display_images_for_page_wrapper(res_data_item, session_id_for_display)
-                    
+                    with st.spinner(f"Loading image page {res_data_item['page_number']}..."):
+                        orig_b_r, hl_b_r = generate_display_images_for_page_wrapper(res_data_item, session_id_for_display) # Pass session_id
                     with img_col_r: # Image display
                         # ... (Same as live loop image display)
                         disp_img_r = hl_b_r if hl_b_r else orig_b_r
                         if disp_img_r: st.image(disp_img_r, caption=f"Page {res_data_item['page_number']}{' (HL)' if hl_b_r else ''}")
-                        if hl_b_r:
-                            st.download_button(
-                                "Download highlighted JPG",
-                                data=hl_b_r,
-                                file_name=f"page_{res_data_item['page_number']}_hl.jpg",
-                                mime="image/jpeg",
-                                key=f"dl_hl_r_{res_data_item['page_number']}",
-                            )
-                        if orig_b_r:
-                            st.download_button(
-                                "Download original JPG",
-                                data=orig_b_r,
-                                file_name=f"page_{res_data_item['page_number']}_orig.jpg",
-                                mime="image/jpeg",
-                                key=f"dl_orig_r_{res_data_item['page_number']}",
-                            )
+                        dl_links_html_rerun = []
+                        if hl_b_r: dl_links_html_rerun.append(get_image_download_link_html(hl_b_r, f"page_{res_data_item['page_number']}_hl.png", "DL HL Img"))
+                        if orig_b_r: dl_links_html_rerun.append(get_image_download_link_html(orig_b_r, f"page_{res_data_item['page_number']}_orig.png", "DL Orig Img"))
+                        if dl_links_html_rerun: st.markdown(" ".join(dl_links_html_rerun), unsafe_allow_html=True)
                     with det_col_r: # Text details
                         # ... (Same as live loop text details display)
                         st.markdown("##### Analysis Details")
@@ -937,23 +512,8 @@ elif st.session_state.processing_complete:
                                 display_text_r = f"- `{txt_r}` (Type: {type_llm_r}, Tag: {tag_r})"
                                 if display_text_r not in disp_set_r: st.markdown(display_text_r); disp_set_r.add(display_text_r); count_r+=1
                                 if count_r >=15 and len(details_list_r) > 17: st.markdown(f"- ...& {len(details_list_r)-count_r} more."); break
-    
-    # Display results with error handling
-    try:
-        display_page_result_expander(st.session_state.fence_pages, col_f_res, current_session_id)
-    except Exception as e_fence_display:
-        print(f"SESSION {current_session_id} ERROR: Error displaying fence pages: {e_fence_display}")
-        import traceback
-        traceback.print_exc()
-        col_f_res.error(f"Error displaying fence pages: {e_fence_display}")
-    
-    try:
-        display_page_result_expander(st.session_state.non_fence_pages, col_nf_res, current_session_id)
-    except Exception as e_non_fence_display:
-        print(f"SESSION {current_session_id} ERROR: Error displaying non-fence pages: {e_non_fence_display}")
-        import traceback
-        traceback.print_exc()
-        col_nf_res.error(f"Error displaying non-fence pages: {e_non_fence_display}")
+    display_page_result_expander(st.session_state.fence_pages, col_f_res, current_session_id)
+    display_page_result_expander(st.session_state.non_fence_pages, col_nf_res, current_session_id)
 
 elif not st.session_state.pdf_temp_path : st.info("Upload PDF.")
 elif not (openai_key and llm_analysis_instance): st.error("OpenAI models not initialized. Check API key.")
