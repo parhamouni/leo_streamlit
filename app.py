@@ -713,10 +713,10 @@ if st.session_state.run_analysis_triggered and \
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
                     try:
-                    analysis_res_core = analyze_page(
-                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
-                        recall_mode="strict"   # or "balanced"/"high"
-                    )
+                        analysis_res_core = analyze_page(
+                            page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
+                            recall_mode="strict"   # or "balanced"/"high"
+                        )
                         profiler.record_step("9. analyze_page()", f"fence={analysis_res_core.get('fence_found')}")
                         
                         jr = json.loads(analysis_res_core["text_response"])
