@@ -208,6 +208,43 @@ with st.sidebar:
     
     # Memory monitoring
     st.caption(f"RAM: {_rss_mb():.1f} MB")
+    
+    # Memory flush button
+    st.markdown("---")
+    if st.button("🧹 Flush Memory & Reset", key="flush_memory_btn", help="Clean up temp files and clear all session data"):
+        import gc
+        
+        # Delete temp file if exists
+        if st.session_state.get('temp_pdf_path') and os.path.exists(st.session_state.temp_pdf_path):
+            try:
+                os.unlink(st.session_state.temp_pdf_path)
+                print(f"SESSION {current_session_id} LOG: Flushed temp file: {st.session_state.temp_pdf_path}")
+            except Exception as e:
+                print(f"SESSION {current_session_id} WARNING: Could not delete temp file during flush: {e}")
+        
+        # Clear all caches
+        st.cache_data.clear()
+        
+        # Reset session state (keep only model preference and keywords)
+        model_backup = st.session_state.get('selected_model_for_analysis')
+        keywords_backup = st.session_state.get('fence_keywords_app')
+        
+        for key in list(st.session_state.keys()):
+            if key not in ['selected_model_for_analysis', 'fence_keywords_app', 'model_selector_radio', 'highlight_toggle', 'kw_text_area', 'update_kw_btn', 'flush_memory_btn']:
+                del st.session_state[key]
+        
+        # Restore preferences
+        if model_backup:
+            st.session_state.selected_model_for_analysis = model_backup
+        if keywords_backup:
+            st.session_state.fence_keywords_app = keywords_backup
+        
+        # Aggressive GC
+        for _ in range(10):
+            gc.collect()
+        
+        st.success(f"✅ Memory flushed! RAM: {_rss_mb():.1f} MB")
+        st.rerun()
 
 
 llm_analysis_instance = None
@@ -676,10 +713,10 @@ if st.session_state.run_analysis_triggered and \
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
                     try:
-                        analysis_res_core = analyze_page(
-                            page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
-                            recall_mode="strict"   # or "balanced"/"high"
-                        )
+                    analysis_res_core = analyze_page(
+                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
+                        recall_mode="strict"   # or "balanced"/"high"
+                    )
                         profiler.record_step("9. analyze_page()", f"fence={analysis_res_core.get('fence_found')}")
                         
                         jr = json.loads(analysis_res_core["text_response"])
@@ -717,14 +754,14 @@ if st.session_state.run_analysis_triggered and \
                             if len(validated_signals) < len(signals):
                                 print(f"SESSION {current_session_id} LOG: Filtered signals {len(signals)}→{len(validated_signals)} (only those in page text)")
                             
-                            boxes,_,_ = get_fence_related_text_boxes(
+                        boxes,_,_ = get_fence_related_text_boxes(
                                 single_page_pdf_bytes,
-                                llm_analysis_instance,
-                                FENCE_KEYWORDS_APP,
+                            llm_analysis_instance,
+                            FENCE_KEYWORDS_APP,
                                 merge_extra_keywords(validated_signals),
-                                st.session_state.selected_model_for_analysis,
-                                google_cloud_config
-                            )
+                            st.session_state.selected_model_for_analysis,
+                            google_cloud_config
+                        )
 
                             # Note: No coordinate scaling needed - page_bytes already at correct DPI
                             # Large pages use DPI=30, small pages use DPI=45
@@ -911,26 +948,42 @@ if st.session_state.run_analysis_triggered and \
     st.session_state.processing_complete = True 
     if not st.session_state.analysis_halted_due_to_error:
         prog_bar.empty(); status_txt_area.success("All pages processed!")
+        
+        # Debug logging
+        print(f"SESSION {current_session_id} LOG: Fence pages found: {len(st.session_state.fence_pages)}")
+        print(f"SESSION {current_session_id} LOG: Temp PDF path exists: {st.session_state.get('temp_pdf_path') and os.path.exists(st.session_state.temp_pdf_path)}")
+        
         if st.session_state.fence_pages and st.session_state.temp_pdf_path:
             # Read PDF from temp file
-            with open(st.session_state.temp_pdf_path, 'rb') as f:
-                pdf_bytes_for_final = f.read()
-            pdf_b, pdf_n = generate_combined_highlighted_pdf(
-                pdf_bytes_for_final,
-                st.session_state.fence_pages,
-                st.session_state.uploaded_pdf_name,
-                current_session_id
-            )
-            if pdf_b:
-                # cache by hash to avoid keeping duplicate big blobs in session
-                @st.cache_data
-                def _store_combined_pdf(pdf_hash, pdf_bytes, pdf_name):
-                    return pdf_bytes, pdf_name
-                st.session_state.combined_pdf_ref = _store_combined_pdf(
-                    st.session_state.current_pdf_hash, pdf_b, pdf_n
+            try:
+                with open(st.session_state.temp_pdf_path, 'rb') as f:
+                    pdf_bytes_for_final = f.read()
+                print(f"SESSION {current_session_id} LOG: Read {len(pdf_bytes_for_final)} bytes from temp file")
+                
+                pdf_b, pdf_n = generate_combined_highlighted_pdf(
+                    pdf_bytes_for_final,
+                    st.session_state.fence_pages,
+                    st.session_state.uploaded_pdf_name,
+                    current_session_id
                 )
-            else:
-                st.warning(f"Could not generate PDF: {pdf_n}")
+                if pdf_b:
+                    # cache by hash to avoid keeping duplicate big blobs in session
+                    @st.cache_data
+                    def _store_combined_pdf(pdf_hash, pdf_bytes, pdf_name):
+                        return pdf_bytes, pdf_name
+                    st.session_state.combined_pdf_ref = _store_combined_pdf(
+                        st.session_state.current_pdf_hash, pdf_b, pdf_n
+                    )
+                    print(f"SESSION {current_session_id} LOG: Combined PDF generated successfully: {pdf_n}")
+                else:
+                    st.warning(f"Could not generate PDF: {pdf_n}")
+                    print(f"SESSION {current_session_id} WARNING: PDF generation failed: {pdf_n}")
+            except Exception as e_pdf:
+                st.error(f"Error generating combined PDF: {e_pdf}")
+                print(f"SESSION {current_session_id} ERROR: Exception generating PDF: {e_pdf}")
+        elif not st.session_state.fence_pages:
+            st.info("ℹ️ No fence-related pages found in this document.")
+            print(f"SESSION {current_session_id} INFO: No fence pages found")
         
         # NOTE: Keep temp file for image generation in results display
         # It will be cleaned up when a new file is uploaded or session ends
@@ -941,6 +994,8 @@ if st.session_state.run_analysis_triggered and \
         print(f"SESSION {current_session_id} LOG: Keeping temp file after error (if exists): {st.session_state.get('temp_pdf_path')}") 
     final_summary_text = f"### Final Summary ({'Halted' if st.session_state.analysis_halted_due_to_error else 'Completed'})\n- Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages}\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}"
     summary_placeholder.markdown(final_summary_text)
+    
+    # Show download button if combined PDF was generated
     if st.session_state.get('combined_pdf_ref') and not st.session_state.analysis_halted_due_to_error:
         data, fname = st.session_state.combined_pdf_ref
         st.download_button(
@@ -950,12 +1005,19 @@ if st.session_state.run_analysis_triggered and \
             "application/pdf",
             key="dl_combined_pdf_main"
         )
+        st.caption(f"📄 {len(st.session_state.fence_pages)} fence page(s) included with highlights")
+    elif len(st.session_state.fence_pages) == 0 and not st.session_state.analysis_halted_due_to_error:
+        st.info("ℹ️ No fence-related pages found. No PDF to download.")
+    elif st.session_state.analysis_halted_due_to_error and len(st.session_state.fence_pages) > 0:
+        st.warning("⚠️ Processing was halted. You can view partial results below, but no combined PDF was generated.")
 
 elif st.session_state.processing_complete: 
     print(f"SESSION {current_session_id} LOG: Displaying previously processed results (rerun).")
     st.markdown("<hr>", unsafe_allow_html=True); st.markdown("<h2>📊 Analysis Results</h2>", unsafe_allow_html=True)
     final_summary_text_rerun = f"### Final Summary ({'Halted Previously' if st.session_state.analysis_halted_due_to_error else 'Completed'})\n- Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages}\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}"
     st.markdown(final_summary_text_rerun)
+    
+    # Show download button if combined PDF was generated
     if st.session_state.get('combined_pdf_ref') and not st.session_state.analysis_halted_due_to_error:
         data, fname = st.session_state.combined_pdf_ref
         st.download_button(
@@ -965,6 +1027,11 @@ elif st.session_state.processing_complete:
             "application/pdf",
             key="dl_combined_pdf_rerun"
         )
+        st.caption(f"📄 {len(st.session_state.fence_pages)} fence page(s) included with highlights")
+    elif len(st.session_state.fence_pages) == 0 and not st.session_state.analysis_halted_due_to_error:
+        st.info("ℹ️ No fence-related pages found. No PDF to download.")
+    elif st.session_state.analysis_halted_due_to_error and len(st.session_state.fence_pages) > 0:
+        st.warning("⚠️ Processing was halted. You can view partial results below, but no combined PDF was generated.")
     col_f_res, col_nf_res = st.columns(2)
     with col_f_res: st.subheader(f"✅ Fence-Related Pages ({len(st.session_state.fence_pages)})")
     with col_nf_res: st.subheader(f"❌ Non-Fence Pages ({len(st.session_state.non_fence_pages)})")
