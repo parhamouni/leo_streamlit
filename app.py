@@ -957,35 +957,65 @@ if st.session_state.run_analysis_triggered and \
             print(f"SESSION {current_session_id} LOG: Temp PDF exists: {st.session_state.get('temp_pdf_path') and os.path.exists(st.session_state.temp_pdf_path)}")
             
             if st.session_state.fence_pages and st.session_state.temp_pdf_path and os.path.exists(st.session_state.temp_pdf_path):
-                # Read PDF from temp file
-                try:
-                    with open(st.session_state.temp_pdf_path, 'rb') as f:
-                        pdf_bytes_for_final = f.read()
-                    print(f"SESSION {current_session_id} LOG: Read {len(pdf_bytes_for_final)} bytes from temp file")
-                    
-                    pdf_b, pdf_n = generate_combined_highlighted_pdf(
-                        pdf_bytes_for_final,
-                        st.session_state.fence_pages,
-                        st.session_state.uploaded_pdf_name,
-                        current_session_id
-                    )
-                    if pdf_b:
-                        # cache by hash to avoid keeping duplicate big blobs in session
-                        @st.cache_data
-                        def _store_combined_pdf(pdf_hash, pdf_bytes, pdf_name):
-                            return pdf_bytes, pdf_name
-                        st.session_state.combined_pdf_ref = _store_combined_pdf(
-                            st.session_state.current_pdf_hash, pdf_b, pdf_n
+                # Check memory before attempting PDF generation
+                current_mem = _rss_mb()
+                print(f"SESSION {current_session_id} LOG: Memory before PDF generation: {current_mem:.1f} MB")
+                
+                # If memory is too high, skip PDF generation to avoid crash
+                if current_mem > 850:  # Leave 150MB headroom
+                    st.warning(f"⚠️ Memory too high ({current_mem:.0f} MB) to generate combined PDF safely. You can still view and download individual pages below.")
+                    print(f"SESSION {current_session_id} WARNING: Skipping PDF generation due to high memory: {current_mem:.1f} MB")
+                else:
+                    # Read PDF from temp file
+                    try:
+                        # Force aggressive GC before PDF generation
+                        import gc
+                        for _ in range(10):
+                            gc.collect()
+                        
+                        with open(st.session_state.temp_pdf_path, 'rb') as f:
+                            pdf_bytes_for_final = f.read()
+                        print(f"SESSION {current_session_id} LOG: Read {len(pdf_bytes_for_final)} bytes from temp file")
+                        
+                        # Force GC after reading large file
+                        for _ in range(5):
+                            gc.collect()
+                        
+                        pdf_b, pdf_n = generate_combined_highlighted_pdf(
+                            pdf_bytes_for_final,
+                            st.session_state.fence_pages,
+                            st.session_state.uploaded_pdf_name,
+                            current_session_id
                         )
-                        print(f"SESSION {current_session_id} LOG: Combined PDF generated successfully: {pdf_n}")
-                    else:
-                        st.warning(f"Could not generate PDF: {pdf_n}")
-                        print(f"SESSION {current_session_id} WARNING: PDF generation failed: {pdf_n}")
-                except Exception as e_pdf:
-                    st.error(f"Error generating combined PDF: {e_pdf}")
-                    print(f"SESSION {current_session_id} ERROR: Exception generating PDF: {e_pdf}")
-                    import traceback
-                    traceback.print_exc()
+                        
+                        # Free the large pdf_bytes_for_final immediately
+                        del pdf_bytes_for_final
+                        for _ in range(5):
+                            gc.collect()
+                        
+                        if pdf_b:
+                            # cache by hash to avoid keeping duplicate big blobs in session
+                            @st.cache_data
+                            def _store_combined_pdf(pdf_hash, pdf_bytes, pdf_name):
+                                return pdf_bytes, pdf_name
+                            st.session_state.combined_pdf_ref = _store_combined_pdf(
+                                st.session_state.current_pdf_hash, pdf_b, pdf_n
+                            )
+                            print(f"SESSION {current_session_id} LOG: Combined PDF generated successfully: {pdf_n}")
+                            print(f"SESSION {current_session_id} LOG: Memory after PDF generation: {_rss_mb():.1f} MB")
+                        else:
+                            st.warning(f"Could not generate PDF: {pdf_n}")
+                            print(f"SESSION {current_session_id} WARNING: PDF generation failed: {pdf_n}")
+                    except MemoryError as me:
+                        st.error(f"⚠️ Out of memory generating combined PDF. You can still view individual pages below.")
+                        print(f"SESSION {current_session_id} ERROR: MemoryError generating PDF: {me}")
+                        import traceback
+                        traceback.print_exc()
+                    except Exception as e_pdf:
+                        st.error(f"Error generating combined PDF: {e_pdf}")
+                        print(f"SESSION {current_session_id} ERROR: Exception generating PDF: {e_pdf}")
+                        import traceback
+                        traceback.print_exc()
             elif not st.session_state.fence_pages:
                 st.info("ℹ️ No fence-related pages found in this document.")
                 print(f"SESSION {current_session_id} INFO: No fence pages found")
