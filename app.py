@@ -534,9 +534,9 @@ if st.session_state.run_analysis_triggered and \
             import gc
             
             # Step 1: Force immediate garbage collection (5x for thorough cleanup)
-            for _ in range(5):
+            for _ in range(8):
                 gc.collect()
-            profiler.record_step("1. GC cleanup (5×)")
+            profiler.record_step("1. GC cleanup (8×)")
             
             # Step 2: Clear Streamlit caches more aggressively
             if i >= 14 and i < 30:
@@ -569,16 +569,22 @@ if st.session_state.run_analysis_triggered and \
                 gc.collect()
                 gc.collect()
             
-            # Step 4: CRITICAL - Close and reopen PDF document every 3 pages
+            # Step 4: CRITICAL - Close and reopen PDF document every 2 pages
             # PyMuPDF keeps loaded pages in C-level memory that Python GC can't free
             # Image generation on complex pages creates 100+ MB temporary buffers
-            if i > 0 and i % 3 == 0:
+            # Server shows higher memory usage than local - reopen more frequently
+            if i > 0 and i % 2 == 0:
                 try:
                     doc_proc_loop.close()
+                    # Force GC after close to ensure Python objects are freed
+                    for _ in range(5):
+                        gc.collect()
                     doc_proc_loop = fitz.open(st.session_state.temp_pdf_path)
                     profiler.record_step("2b. Close/Reopen PDF", f"page {i} (free C memory)")
+                    # Clear cache after reopen to maximize memory release
+                    st.cache_data.clear()
                     # Force GC after document reload
-                    for _ in range(3):
+                    for _ in range(5):
                         gc.collect()
                 except Exception as e:
                     print(f"SESSION {current_session_id} WARNING: Could not reopen PDF: {e}")
@@ -670,10 +676,10 @@ if st.session_state.run_analysis_triggered and \
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
                     try:
-                        analysis_res_core = analyze_page(
-                            page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
-                            recall_mode="strict"   # or "balanced"/"high"
-                        )
+                    analysis_res_core = analyze_page(
+                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
+                        recall_mode="strict"   # or "balanced"/"high"
+                    )
                         profiler.record_step("9. analyze_page()", f"fence={analysis_res_core.get('fence_found')}")
                         
                         jr = json.loads(analysis_res_core["text_response"])
@@ -711,14 +717,14 @@ if st.session_state.run_analysis_triggered and \
                             if len(validated_signals) < len(signals):
                                 print(f"SESSION {current_session_id} LOG: Filtered signals {len(signals)}→{len(validated_signals)} (only those in page text)")
                             
-                            boxes,_,_ = get_fence_related_text_boxes(
+                        boxes,_,_ = get_fence_related_text_boxes(
                                 single_page_pdf_bytes,
-                                llm_analysis_instance,
-                                FENCE_KEYWORDS_APP,
+                            llm_analysis_instance,
+                            FENCE_KEYWORDS_APP,
                                 merge_extra_keywords(validated_signals),
-                                st.session_state.selected_model_for_analysis,
-                                google_cloud_config
-                            )
+                            st.session_state.selected_model_for_analysis,
+                            google_cloud_config
+                        )
 
                             # Note: No coordinate scaling needed - page_bytes already at correct DPI
                             # Large pages use DPI=30, small pages use DPI=45
@@ -834,11 +840,12 @@ if st.session_state.run_analysis_triggered and \
                 if 'page_text_lower' in locals():
                     del page_text_lower
                     
-                # Force IMMEDIATE garbage collection (7× for maximum cleanup)
+                # Force IMMEDIATE garbage collection (10× for maximum cleanup)
                 # Profiling showed Python object retention is the real issue, not DocAI responses
-                for _ in range(7):
+                # Server needs more aggressive GC than local
+                for _ in range(10):
                     gc.collect()
-                profiler.record_step("13. Cleanup variables (ultra-aggressive + 7× GC)")
+                profiler.record_step("13. Cleanup variables (ultra-aggressive + 10× GC)")
             except Exception as cleanup_err:
                 print(f"Warning: cleanup error: {cleanup_err}")
             
