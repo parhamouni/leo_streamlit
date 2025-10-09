@@ -9,6 +9,8 @@ import io
 import time 
 import uuid 
 import hashlib # For hashing PDF bytes
+import tempfile
+import atexit
 
 # --- Highlight Appearance & Performance ---
 HIGHLIGHT_COLOR_UI = (0, 0.9, 0)
@@ -20,6 +22,34 @@ DISPLAY_IMAGE_DPI = 96
 st.set_page_config(page_title="Fence Detector", layout="wide")
 st.markdown("""<style> /* Your CSS */ </style>""", unsafe_allow_html=True) 
 st.markdown("<h1 class='main-header'>🔍 Fence Detection in Engineering Drawings</h1>", unsafe_allow_html=True)
+
+# --- Temp File Management ---
+def save_uploaded_pdf_to_temp(uploaded_file, session_id):
+    """Save uploaded PDF to temp file and return path"""
+    print(f"SESSION {session_id} LOG: Saving uploaded PDF to temporary file.")
+    try:
+        # Create temp file with a unique name
+        temp_dir = tempfile.gettempdir()
+        temp_filename = f"fence_detector_{session_id}_{uploaded_file.name}"
+        temp_path = os.path.join(temp_dir, temp_filename)
+        
+        with open(temp_path, 'wb') as f:
+            f.write(uploaded_file.getvalue())
+        
+        print(f"SESSION {session_id} LOG: PDF saved to {temp_path}")
+        return temp_path
+    except Exception as e:
+        print(f"SESSION {session_id} ERROR: Failed to save PDF to temp file: {e}")
+        raise
+
+def cleanup_temp_pdf(pdf_path, session_id):
+    """Clean up temporary PDF file"""
+    if pdf_path and os.path.exists(pdf_path):
+        try:
+            os.unlink(pdf_path)
+            print(f"SESSION {session_id} LOG: Cleaned up temp PDF: {pdf_path}")
+        except Exception as e:
+            print(f"SESSION {session_id} WARNING: Could not delete temp PDF {pdf_path}: {e}")
 
 def get_session_id():
     if 'session_id' not in st.session_state:
@@ -33,8 +63,8 @@ def initialize_session_state(session_id_val):
         'fence_pages': [], 'non_fence_pages': [], 'total_pages_processed_count': 0,
         'doc_total_pages': 0, 'processing_complete': False, 'analysis_halted_due_to_error': False,
         'fence_keywords_app': ['fence', 'fencing', 'gate', 'barrier', 'guardrail', 'post', 'mesh', 'panel', 'chain link'],
-        'run_analysis_triggered': False, 'uploaded_pdf_name': None, 'original_pdf_bytes': None,
-        'current_pdf_hash': None, # NEW: To store hash of current PDF
+        'run_analysis_triggered': False, 'uploaded_pdf_name': None, 'pdf_temp_path': None,
+        'current_pdf_hash': None, # To store hash of current PDF
         'highlighted_pdf_bytes_for_download': None, 'last_uploaded_file_id': None,
         'selected_model_for_analysis': "gpt-4o" 
     }
@@ -117,38 +147,34 @@ def get_image_download_link_html(img_bytes, filename, text):
 @time_it 
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=200) # Increased max_entries
 def _generate_display_images_for_page_cached(page_idx, 
-                                            pdf_hash_for_cache_key, # CHANGED: Use PDF hash as part of key
+                                            pdf_hash_for_cache_key, # Use PDF hash as part of key
                                             fence_text_boxes_details_tuple,
                                             ui_color, ui_width, display_dpi, 
                                             session_id_for_log="N/A_CACHE"):
-    # This function now RELIES on st.session_state.original_pdf_bytes being the
-    # correct bytes for the given pdf_hash_for_cache_key.
-    # This makes the cached function "impure" but avoids hashing full PDF bytes on every call.
+    # This function now RELIES on st.session_state.pdf_temp_path being the
+    # correct path for the given pdf_hash_for_cache_key.
     
-    if 'original_pdf_bytes' not in st.session_state or st.session_state.original_pdf_bytes is None:
-        print(f"SESSION {session_id_for_log} ERROR (_cached): original_pdf_bytes not in session_state for hash {pdf_hash_for_cache_key}")
+    if 'pdf_temp_path' not in st.session_state or st.session_state.pdf_temp_path is None:
+        print(f"SESSION {session_id_for_log} ERROR (_cached): pdf_temp_path not in session_state for hash {pdf_hash_for_cache_key}")
         return None, None
     
-    # Verify if the current session PDF matches the hash. This is an extra check.
-    # In practice, st.cache_data.clear() on new PDF upload should handle this.
-    current_pdf_bytes = st.session_state.original_pdf_bytes
-    # Recalculate hash of current PDF bytes in session to compare (can be slow if done often)
-    # For simplicity, we'll assume st.cache_data.clear() and the pdf_hash_for_cache_key argument 
-    # are sufficient to ensure correctness. A mismatch here would indicate a deeper state issue.
+    if not os.path.exists(st.session_state.pdf_temp_path):
+        print(f"SESSION {session_id_for_log} ERROR (_cached): pdf_temp_path does not exist: {st.session_state.pdf_temp_path}")
+        return None, None
 
     original_image_bytes, highlighted_image_bytes = None, None
     func_call_id = str(uuid.uuid4())[:4] 
     print(f"SESSION {session_id_for_log} CACHE_CALL ({func_call_id}): _generate_display_images_for_page_cached for Page {page_idx}, PDF Hash: {pdf_hash_for_cache_key}. Num boxes: {len(fence_text_boxes_details_tuple)}")
     render_start_time = time.time()
     try:
-        # Use the PDF bytes from session state
-        with fitz.open(stream=io.BytesIO(current_pdf_bytes), filetype="pdf") as doc_orig:
+        # Use the PDF file from temp path
+        with fitz.open(st.session_state.pdf_temp_path) as doc_orig:
             page_orig = doc_orig.load_page(page_idx)
             pix_orig = page_orig.get_pixmap(dpi=display_dpi); original_image_bytes = pix_orig.tobytes("png"); del pix_orig
 
             if fence_text_boxes_details_tuple: # Check the tuple directly
                 fence_text_boxes_details = [dict(item_tuple) for item_tuple in fence_text_boxes_details_tuple]
-                with fitz.open(stream=io.BytesIO(current_pdf_bytes), filetype="pdf") as doc_hl:
+                with fitz.open(st.session_state.pdf_temp_path) as doc_hl:
                     page_hl = doc_hl.load_page(page_idx)
                     derot_matrix = page_hl.derotation_matrix
                     for box_detail in fence_text_boxes_details:
@@ -164,7 +190,7 @@ def _generate_display_images_for_page_cached(page_idx,
     return original_image_bytes, highlighted_image_bytes
 
 def generate_display_images_for_page_wrapper(page_result_data, session_id):
-    # Assumes st.session_state.current_pdf_hash and st.session_state.original_pdf_bytes are set
+    # Assumes st.session_state.current_pdf_hash and st.session_state.pdf_temp_path are set
     page_idx = page_result_data.get('page_index_in_original_doc')
     pdf_hash = st.session_state.get('current_pdf_hash')
 
@@ -175,7 +201,7 @@ def generate_display_images_for_page_wrapper(page_result_data, session_id):
     boxes_details = page_result_data.get('fence_text_boxes_details', [])
     details_tuple = tuple(tuple(sorted(d.items())) for d in sorted(boxes_details, key=lambda x: x.get('id', str(x)))) if boxes_details else tuple()
     
-    # The cached function now relies on session_state for the actual PDF bytes,
+    # The cached function now relies on session_state for the PDF path,
     # but the hash is part of the cache key to differentiate between PDFs.
     return _generate_display_images_for_page_cached(
         page_idx, 
@@ -187,14 +213,16 @@ def generate_display_images_for_page_wrapper(page_result_data, session_id):
         session_id
     )
 
-# generate_combined_highlighted_pdf (Keep as is from previous version - it doesn't use this image cache)
-# (Ensure it's present in your file)
-def generate_combined_highlighted_pdf(original_pdf_bytes, fence_pages_results_list, uploaded_pdf_name_base, session_id):
-    # ... (Same as previous full app.py) ...
+# generate_combined_highlighted_pdf
+def generate_combined_highlighted_pdf(pdf_temp_path, fence_pages_results_list, uploaded_pdf_name_base, session_id):
     print(f"SESSION {session_id} LOG: Generating combined highlighted PDF.")
-    if not fence_pages_results_list or not original_pdf_bytes: return None, "No data for PDF."
+    if not fence_pages_results_list or not pdf_temp_path: return None, "No data for PDF."
+    if not os.path.exists(pdf_temp_path):
+        print(f"SESSION {session_id} ERROR: PDF temp path does not exist: {pdf_temp_path}")
+        return None, f"PDF temp file not found: {pdf_temp_path}"
+    
     output_doc = fitz.open(); input_doc = None
-    try: input_doc = fitz.open(stream=io.BytesIO(original_pdf_bytes), filetype="pdf")
+    try: input_doc = fitz.open(pdf_temp_path)
     except Exception as e:
         print(f"SESSION {session_id} ERROR: Opening original PDF for combined: {e}")
         if output_doc: output_doc.close(); return None, f"Error opening original PDF: {e}"
@@ -235,6 +263,11 @@ if uploaded_pdf_file_obj:
     
     if st.session_state.last_uploaded_file_id != current_file_id:
         print(f"SESSION {current_session_id} LOG: New file detected. Resetting state for {current_file_id}.")
+        
+        # Clean up old temp file if exists
+        if st.session_state.get('pdf_temp_path'):
+            cleanup_temp_pdf(st.session_state.pdf_temp_path, current_session_id)
+        
         # Preserve some settings across resets
         current_selected_model = st.session_state.selected_model_for_analysis
         current_keywords = st.session_state.fence_keywords_app
@@ -245,9 +278,14 @@ if uploaded_pdf_file_obj:
         st.session_state.fence_keywords_app = current_keywords # Restore
 
         st.session_state.uploaded_pdf_name = uploaded_pdf_file_obj.name
-        st.session_state.original_pdf_bytes = uploaded_pdf_file_obj.getvalue()
-        # Generate and store hash of the current PDF
-        st.session_state.current_pdf_hash = hashlib.sha256(st.session_state.original_pdf_bytes).hexdigest()
+        
+        # Save to temp file instead of storing bytes in memory
+        st.session_state.pdf_temp_path = save_uploaded_pdf_to_temp(uploaded_pdf_file_obj, current_session_id)
+        
+        # Generate and store hash of the current PDF (read from temp file for hash)
+        with open(st.session_state.pdf_temp_path, 'rb') as f:
+            st.session_state.current_pdf_hash = hashlib.sha256(f.read()).hexdigest()
+        
         st.session_state.last_uploaded_file_id = current_file_id
         
         st.cache_data.clear() 
@@ -265,9 +303,9 @@ if uploaded_pdf_file_obj:
 # Ensure all calls to generate_display_images_for_page_wrapper(res_data_item, current_session_id)
 # And generate_combined_highlighted_pdf(..., current_session_id)
 
-# --- Analysis Execution Block --- (Copied and adapted from previous version)
+# --- Analysis Execution Block ---
 if st.session_state.run_analysis_triggered and \
-   st.session_state.original_pdf_bytes and \
+   st.session_state.pdf_temp_path and \
    llm_analysis_instance and \
    not st.session_state.analysis_halted_due_to_error and \
    not st.session_state.processing_complete:
@@ -275,7 +313,7 @@ if st.session_state.run_analysis_triggered and \
     print(f"SESSION {current_session_id} LOG: Starting PDF processing loop.")
     doc_proc_loop = None
     try:
-        doc_proc_loop = fitz.open(stream=io.BytesIO(st.session_state.original_pdf_bytes), filetype="pdf")
+        doc_proc_loop = fitz.open(st.session_state.pdf_temp_path)
         st.session_state.doc_total_pages = len(doc_proc_loop)
         print(f"SESSION {current_session_id} LOG: PDF opened, {st.session_state.doc_total_pages} pages.")
     except Exception as e:
@@ -406,8 +444,8 @@ if st.session_state.run_analysis_triggered and \
     st.session_state.processing_complete = True 
     if not st.session_state.analysis_halted_due_to_error:
         prog_bar.empty(); status_txt_area.success("All pages processed!")
-        if st.session_state.fence_pages and st.session_state.original_pdf_bytes:
-            pdf_b, pdf_n = generate_combined_highlighted_pdf(st.session_state.original_pdf_bytes, st.session_state.fence_pages, st.session_state.uploaded_pdf_name, current_session_id)
+        if st.session_state.fence_pages and st.session_state.pdf_temp_path:
+            pdf_b, pdf_n = generate_combined_highlighted_pdf(st.session_state.pdf_temp_path, st.session_state.fence_pages, st.session_state.uploaded_pdf_name, current_session_id)
             if pdf_b: st.session_state.highlighted_pdf_bytes_for_download, st.session_state.highlighted_pdf_filename_for_download = pdf_b, pdf_n
             else: st.warning(f"Could not generate PDF: {pdf_n}")
     else: prog_bar.empty() 
@@ -477,7 +515,7 @@ elif st.session_state.processing_complete:
     display_page_result_expander(st.session_state.fence_pages, col_f_res, current_session_id)
     display_page_result_expander(st.session_state.non_fence_pages, col_nf_res, current_session_id)
 
-elif not st.session_state.original_pdf_bytes : st.info("Upload PDF.")
+elif not st.session_state.pdf_temp_path : st.info("Upload PDF.")
 elif not (openai_key and llm_analysis_instance): st.error("OpenAI models not initialized. Check API key.")
 elif st.session_state.analysis_halted_due_to_error: st.error("Analysis was halted. Upload file again or try a different one.")
 
