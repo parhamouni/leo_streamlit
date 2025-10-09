@@ -1007,24 +1007,32 @@ if st.session_state.run_analysis_triggered and \
         traceback.print_exc()
         st.error(f"⚠️ Error during post-processing: {e_post}")
         st.warning("You can still view the page-by-page results below.") 
-    final_summary_text = f"### Final Summary ({'Halted' if st.session_state.analysis_halted_due_to_error else 'Completed'})\n- Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages}\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}"
-    summary_placeholder.markdown(final_summary_text)
     
-    # Show download button if combined PDF was generated
-    if st.session_state.get('combined_pdf_ref') and not st.session_state.analysis_halted_due_to_error:
-        data, fname = st.session_state.combined_pdf_ref
-        st.download_button(
-            "⬇️ Download Highlighted Fence Pages (PDF)",
-            data,
-            fname,
-            "application/pdf",
-            key="dl_combined_pdf_main"
-        )
-        st.caption(f"📄 {len(st.session_state.fence_pages)} fence page(s) included with highlights")
-    elif len(st.session_state.fence_pages) == 0 and not st.session_state.analysis_halted_due_to_error:
-        st.info("ℹ️ No fence-related pages found. No PDF to download.")
-    elif st.session_state.analysis_halted_due_to_error and len(st.session_state.fence_pages) > 0:
-        st.warning("⚠️ Processing was halted. You can view partial results below, but no combined PDF was generated.")
+    # Display final summary
+    try:
+        final_summary_text = f"### Final Summary ({'Halted' if st.session_state.analysis_halted_due_to_error else 'Completed'})\n- Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages}\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}"
+        summary_placeholder.markdown(final_summary_text)
+        
+        # Show download button if combined PDF was generated
+        if st.session_state.get('combined_pdf_ref') and not st.session_state.analysis_halted_due_to_error:
+            data, fname = st.session_state.combined_pdf_ref
+            st.download_button(
+                "⬇️ Download Highlighted Fence Pages (PDF)",
+                data,
+                fname,
+                "application/pdf",
+                key="dl_combined_pdf_main"
+            )
+            st.caption(f"📄 {len(st.session_state.fence_pages)} fence page(s) included with highlights")
+        elif len(st.session_state.fence_pages) == 0 and not st.session_state.analysis_halted_due_to_error:
+            st.info("ℹ️ No fence-related pages found. No PDF to download.")
+        elif st.session_state.analysis_halted_due_to_error and len(st.session_state.fence_pages) > 0:
+            st.warning("⚠️ Processing was halted. You can view partial results below, but no combined PDF was generated.")
+    except Exception as e_summary:
+        print(f"SESSION {current_session_id} ERROR: Summary display error: {e_summary}")
+        import traceback
+        traceback.print_exc()
+        st.error(f"Error displaying summary: {e_summary}")
 
 elif st.session_state.processing_complete: 
     print(f"SESSION {current_session_id} LOG: Displaying previously processed results (rerun).")
@@ -1112,8 +1120,23 @@ elif st.session_state.processing_complete:
                                 display_text_r = f"- `{txt_r}` (Type: {type_llm_r}, Tag: {tag_r})"
                                 if display_text_r not in disp_set_r: st.markdown(display_text_r); disp_set_r.add(display_text_r); count_r+=1
                                 if count_r >=15 and len(details_list_r) > 17: st.markdown(f"- ...& {len(details_list_r)-count_r} more."); break
-    display_page_result_expander(st.session_state.fence_pages, col_f_res, current_session_id)
-    display_page_result_expander(st.session_state.non_fence_pages, col_nf_res, current_session_id)
+    
+    # Display results with error handling
+    try:
+        display_page_result_expander(st.session_state.fence_pages, col_f_res, current_session_id)
+    except Exception as e_fence_display:
+        print(f"SESSION {current_session_id} ERROR: Error displaying fence pages: {e_fence_display}")
+        import traceback
+        traceback.print_exc()
+        col_f_res.error(f"Error displaying fence pages: {e_fence_display}")
+    
+    try:
+        display_page_result_expander(st.session_state.non_fence_pages, col_nf_res, current_session_id)
+    except Exception as e_non_fence_display:
+        print(f"SESSION {current_session_id} ERROR: Error displaying non-fence pages: {e_non_fence_display}")
+        import traceback
+        traceback.print_exc()
+        col_nf_res.error(f"Error displaying non-fence pages: {e_non_fence_display}")
 
 elif not st.session_state.original_pdf_bytes : st.info("Upload PDF.")
 elif not (openai_key and llm_analysis_instance): st.error("OpenAI models not initialized. Check API key.")
