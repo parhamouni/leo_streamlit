@@ -145,7 +145,7 @@ def get_image_download_link_html(img_bytes, filename, text):
     return f'<a href="data:image/png;base64,{b64}" download="{filename}" class="download-button">{text}</a>'
 
 @time_it 
-@st.cache_data(ttl=3600, show_spinner=False, max_entries=200) # Increased max_entries
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=20) # Reduced for memory optimization
 def _generate_display_images_for_page_cached(page_idx, 
                                             pdf_hash_for_cache_key, # Use PDF hash as part of key
                                             fence_text_boxes_details_tuple,
