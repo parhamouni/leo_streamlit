@@ -561,9 +561,10 @@ if st.session_state.run_analysis_triggered and \
                 gc.collect()
                 gc.collect()
             
-            # Step 4: CRITICAL - Close and reopen PDF document every 5 pages
+            # Step 4: CRITICAL - Close and reopen PDF document every 3 pages
             # PyMuPDF keeps loaded pages in C-level memory that Python GC can't free
-            if i > 0 and i % 5 == 0:
+            # Image generation on complex pages creates 100+ MB temporary buffers
+            if i > 0 and i % 3 == 0:
                 try:
                     doc_proc_loop.close()
                     doc_proc_loop = fitz.open(st.session_state.temp_pdf_path)
