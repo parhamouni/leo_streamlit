@@ -946,52 +946,67 @@ if st.session_state.run_analysis_triggered and \
             print("="*80 + "\n")
     
     st.session_state.processing_complete = True 
-    if not st.session_state.analysis_halted_due_to_error:
-        prog_bar.empty(); status_txt_area.success("All pages processed!")
-        
-        # Debug logging
-        print(f"SESSION {current_session_id} LOG: Fence pages found: {len(st.session_state.fence_pages)}")
-        print(f"SESSION {current_session_id} LOG: Temp PDF path exists: {st.session_state.get('temp_pdf_path') and os.path.exists(st.session_state.temp_pdf_path)}")
-        
-        if st.session_state.fence_pages and st.session_state.temp_pdf_path:
-            # Read PDF from temp file
-            try:
-                with open(st.session_state.temp_pdf_path, 'rb') as f:
-                    pdf_bytes_for_final = f.read()
-                print(f"SESSION {current_session_id} LOG: Read {len(pdf_bytes_for_final)} bytes from temp file")
-                
-                pdf_b, pdf_n = generate_combined_highlighted_pdf(
-                    pdf_bytes_for_final,
-                    st.session_state.fence_pages,
-                    st.session_state.uploaded_pdf_name,
-                    current_session_id
-                )
-                if pdf_b:
-                    # cache by hash to avoid keeping duplicate big blobs in session
-                    @st.cache_data
-                    def _store_combined_pdf(pdf_hash, pdf_bytes, pdf_name):
-                        return pdf_bytes, pdf_name
-                    st.session_state.combined_pdf_ref = _store_combined_pdf(
-                        st.session_state.current_pdf_hash, pdf_b, pdf_n
+    
+    # Post-processing: Generate combined PDF and display results
+    try:
+        if not st.session_state.analysis_halted_due_to_error:
+            prog_bar.empty(); status_txt_area.success("All pages processed!")
+            
+            # Debug logging
+            print(f"SESSION {current_session_id} LOG: Fence pages found: {len(st.session_state.fence_pages)}")
+            print(f"SESSION {current_session_id} LOG: Temp PDF path: {st.session_state.get('temp_pdf_path')}")
+            print(f"SESSION {current_session_id} LOG: Temp PDF exists: {st.session_state.get('temp_pdf_path') and os.path.exists(st.session_state.temp_pdf_path)}")
+            
+            if st.session_state.fence_pages and st.session_state.temp_pdf_path and os.path.exists(st.session_state.temp_pdf_path):
+                # Read PDF from temp file
+                try:
+                    with open(st.session_state.temp_pdf_path, 'rb') as f:
+                        pdf_bytes_for_final = f.read()
+                    print(f"SESSION {current_session_id} LOG: Read {len(pdf_bytes_for_final)} bytes from temp file")
+                    
+                    pdf_b, pdf_n = generate_combined_highlighted_pdf(
+                        pdf_bytes_for_final,
+                        st.session_state.fence_pages,
+                        st.session_state.uploaded_pdf_name,
+                        current_session_id
                     )
-                    print(f"SESSION {current_session_id} LOG: Combined PDF generated successfully: {pdf_n}")
-                else:
-                    st.warning(f"Could not generate PDF: {pdf_n}")
-                    print(f"SESSION {current_session_id} WARNING: PDF generation failed: {pdf_n}")
-            except Exception as e_pdf:
-                st.error(f"Error generating combined PDF: {e_pdf}")
-                print(f"SESSION {current_session_id} ERROR: Exception generating PDF: {e_pdf}")
-        elif not st.session_state.fence_pages:
-            st.info("ℹ️ No fence-related pages found in this document.")
-            print(f"SESSION {current_session_id} INFO: No fence pages found")
-        
-        # NOTE: Keep temp file for image generation in results display
-        # It will be cleaned up when a new file is uploaded or session ends
-        print(f"SESSION {current_session_id} LOG: Keeping temp file for results display: {st.session_state.temp_pdf_path}")
-    else: 
-        prog_bar.empty()
-        # NOTE: Keep temp file even on error for potential results display
-        print(f"SESSION {current_session_id} LOG: Keeping temp file after error (if exists): {st.session_state.get('temp_pdf_path')}") 
+                    if pdf_b:
+                        # cache by hash to avoid keeping duplicate big blobs in session
+                        @st.cache_data
+                        def _store_combined_pdf(pdf_hash, pdf_bytes, pdf_name):
+                            return pdf_bytes, pdf_name
+                        st.session_state.combined_pdf_ref = _store_combined_pdf(
+                            st.session_state.current_pdf_hash, pdf_b, pdf_n
+                        )
+                        print(f"SESSION {current_session_id} LOG: Combined PDF generated successfully: {pdf_n}")
+                    else:
+                        st.warning(f"Could not generate PDF: {pdf_n}")
+                        print(f"SESSION {current_session_id} WARNING: PDF generation failed: {pdf_n}")
+                except Exception as e_pdf:
+                    st.error(f"Error generating combined PDF: {e_pdf}")
+                    print(f"SESSION {current_session_id} ERROR: Exception generating PDF: {e_pdf}")
+                    import traceback
+                    traceback.print_exc()
+            elif not st.session_state.fence_pages:
+                st.info("ℹ️ No fence-related pages found in this document.")
+                print(f"SESSION {current_session_id} INFO: No fence pages found")
+            elif not st.session_state.temp_pdf_path or not os.path.exists(st.session_state.temp_pdf_path):
+                st.warning("⚠️ Temporary PDF file not found. Cannot generate combined PDF.")
+                print(f"SESSION {current_session_id} WARNING: Temp PDF path missing or file deleted")
+            
+            # NOTE: Keep temp file for image generation in results display
+            # It will be cleaned up when a new file is uploaded or session ends
+            print(f"SESSION {current_session_id} LOG: Keeping temp file for results display: {st.session_state.temp_pdf_path}")
+        else: 
+            prog_bar.empty()
+            # NOTE: Keep temp file even on error for potential results display
+            print(f"SESSION {current_session_id} LOG: Keeping temp file after error (if exists): {st.session_state.get('temp_pdf_path')}")
+    except Exception as e_post:
+        print(f"SESSION {current_session_id} ERROR: Post-processing error: {e_post}")
+        import traceback
+        traceback.print_exc()
+        st.error(f"⚠️ Error during post-processing: {e_post}")
+        st.warning("You can still view the page-by-page results below.") 
     final_summary_text = f"### Final Summary ({'Halted' if st.session_state.analysis_halted_due_to_error else 'Completed'})\n- Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages}\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}"
     summary_placeholder.markdown(final_summary_text)
     
