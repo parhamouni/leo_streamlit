@@ -431,6 +431,14 @@ if uploaded_pdf_file_obj:
             'run_analysis_triggered': False,
         })
 
+        # CLEANUP: Delete old temp file if exists
+        if st.session_state.get('temp_pdf_path') and os.path.exists(st.session_state.temp_pdf_path):
+            try:
+                os.unlink(st.session_state.temp_pdf_path)
+                print(f"SESSION {current_session_id} LOG: Cleaned up old temp file on new upload: {st.session_state.temp_pdf_path}")
+            except Exception as e_cleanup:
+                print(f"SESSION {current_session_id} WARNING: Could not delete old temp file: {e_cleanup}")
+        
         # Store new file bytes & hash
         st.session_state.uploaded_pdf_name = uploaded_pdf_file_obj.name
         st.session_state.original_pdf_bytes = uploaded_pdf_file_obj.getvalue()
@@ -858,15 +866,6 @@ if st.session_state.run_analysis_triggered and \
             print(f"SESSION {current_session_id} LOG: Closed main processing PDF document in finally block.")
         doc_proc_loop = None 
         
-        # CLEANUP: Delete temp file to prevent leaks
-        if st.session_state.get('temp_pdf_path') and os.path.exists(st.session_state.temp_pdf_path):
-            try:
-                os.unlink(st.session_state.temp_pdf_path)
-                print(f"SESSION {current_session_id} LOG: Cleaned up temp file: {st.session_state.temp_pdf_path}")
-                st.session_state.temp_pdf_path = None
-            except Exception as e_cleanup:
-                print(f"SESSION {current_session_id} WARNING: Could not delete temp file: {e_cleanup}")
-        
         print(f"SESSION {current_session_id} LOG: Processing loop ended. Final memory: {_rss_mb():.1f} MB")
         
         # PRINT PROFILING SUMMARY
@@ -925,7 +924,14 @@ if st.session_state.run_analysis_triggered and \
                 )
             else:
                 st.warning(f"Could not generate PDF: {pdf_n}")
-    else: prog_bar.empty() 
+        
+        # NOTE: Keep temp file for image generation in results display
+        # It will be cleaned up when a new file is uploaded or session ends
+        print(f"SESSION {current_session_id} LOG: Keeping temp file for results display: {st.session_state.temp_pdf_path}")
+    else: 
+        prog_bar.empty()
+        # NOTE: Keep temp file even on error for potential results display
+        print(f"SESSION {current_session_id} LOG: Keeping temp file after error (if exists): {st.session_state.get('temp_pdf_path')}") 
     final_summary_text = f"### Final Summary ({'Halted' if st.session_state.analysis_halted_due_to_error else 'Completed'})\n- Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages}\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}"
     summary_placeholder.markdown(final_summary_text)
     if st.session_state.get('combined_pdf_ref') and not st.session_state.analysis_halted_due_to_error:
