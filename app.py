@@ -99,6 +99,34 @@ with st.sidebar:
         st.session_state.fence_keywords_app = [k.strip().lower() for k in custom_keywords_str.split("\n") if k.strip()]
         st.rerun()
     FENCE_KEYWORDS_APP = st.session_state.fence_keywords_app
+    
+    # Reset button to free memory
+    st.markdown("---")
+    st.subheader("🔄 Reset")
+    if st.button("🗑️ Clear Analysis & Free Memory", key="reset_btn", type="primary", use_container_width=True):
+        # Clear analysis results
+        st.session_state.fence_pages = []
+        st.session_state.non_fence_pages = []
+        st.session_state.total_pages_processed_count = 0
+        st.session_state.doc_total_pages = 0
+        st.session_state.processing_complete = False
+        st.session_state.analysis_halted_due_to_error = False
+        st.session_state.run_analysis_triggered = False
+        st.session_state.original_pdf_bytes = None
+        st.session_state.current_pdf_hash = None
+        st.session_state.highlighted_pdf_bytes_for_download = None
+        st.session_state.last_uploaded_file_id = None
+        
+        # Clear cache to free memory
+        st.cache_data.clear()
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        print(f"SESSION {current_session_id} LOG: Memory cleared and analysis reset")
+        st.success("✅ Analysis cleared! Memory freed. Upload a new PDF to start.")
+        st.rerun()
 
 
 llm_analysis_instance = None
@@ -311,7 +339,8 @@ if st.session_state.run_analysis_triggered and \
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
                     analysis_res_core = analyze_page(
-                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config
+                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
+                        recall_mode="strict"  # Only trust LLM's explicit yes/no answer
                     )
 
             except UnrecoverableRateLimitError as urle:
@@ -327,14 +356,26 @@ if st.session_state.run_analysis_triggered and \
                     temp_doc_single.insert_pdf(doc_proc_loop, from_page=i, to_page=i); temp_doc_single.save(single_pg_bytes_io)
                 finally: 
                     if temp_doc_single: temp_doc_single.close()
+                
+                # Extract signals from analysis result to use for highlighting
+                signals_for_highlighting = []
+                try:
+                    import json
+                    text_resp = json.loads(analysis_result.get('text_response', '{}'))
+                    signals_for_highlighting = text_resp.get('signals', [])
+                    print(f"SESSION {current_session_id} LOG: Page {curr_pg_num} using signals for highlighting: {signals_for_highlighting}")
+                except Exception as e:
+                    print(f"SESSION {current_session_id} WARNING: Could not extract signals from analysis: {e}")
+                
                 try:
                     with st.spinner(f"Page {curr_pg_num}: Extracting highlight boxes..."):   
                         boxes,_,_ = get_fence_related_text_boxes(
                             single_pg_bytes_io.getvalue(),
                             llm_analysis_instance,
                             FENCE_KEYWORDS_APP,
+                            signals_for_highlighting,  # Pass signals from LLM analysis
                             st.session_state.selected_model_for_analysis,
-                            google_cloud_config  # <-- pass it through
+                            google_cloud_config
                         )
 
                         if boxes: analysis_result['fence_text_boxes_details'] = boxes
