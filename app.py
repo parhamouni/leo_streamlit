@@ -32,11 +32,14 @@ def initialize_session_state(session_id_val):
         'session_id': session_id_val, 
         'fence_pages': [], 'non_fence_pages': [], 'total_pages_processed_count': 0,
         'doc_total_pages': 0, 'processing_complete': False, 'analysis_halted_due_to_error': False,
-        'fence_keywords_app': ['fence', 'fencing', 'gate', 'barrier', 'guardrail', 'post', 'mesh', 'panel', 'chain link'],
+        'fence_keywords_app': ['fence', 'fencing', 'gate', 'barrier', 'guardrail', 'post', 'mesh', 'panel', 'chain link', 'masonry', 'fence details', 'canopy shading', 'adot specifications', 'mag specifications', 'rail', 'railing', 'bollards', 'handrails', 'wall', 'cmu', 'keynote'],
         'run_analysis_triggered': False, 'uploaded_pdf_name': None, 'original_pdf_bytes': None,
         'current_pdf_hash': None, # NEW: To store hash of current PDF
         'highlighted_pdf_bytes_for_download': None, 'last_uploaded_file_id': None,
-        'selected_model_for_analysis': "gpt-4o" 
+        'selected_model_for_analysis': "gpt-4o",
+        # Memory management for 413 error prevention
+        'max_pages_in_memory': 20,  # Limit pages stored in memory
+        'session_size_mb': 0  # Track session size
     }
     for key, value in default_state.items():
         if key not in st.session_state:
@@ -45,6 +48,43 @@ def initialize_session_state(session_id_val):
                                     value
         elif key == 'session_id' and st.session_state.session_id != session_id_val :
              st.session_state.session_id = session_id_val
+
+def manage_session_memory():
+    """Simple memory management to prevent 413 errors."""
+    try:
+        import sys
+        
+        # Check if we have too many pages in memory
+        total_pages = len(st.session_state.fence_pages) + len(st.session_state.non_fence_pages)
+        max_pages = st.session_state.get('max_pages_in_memory', 20)
+        
+        if total_pages > max_pages:
+            print(f"SESSION {get_session_id()} WARNING: Too many pages in memory ({total_pages}). Clearing oldest pages.")
+            
+            # Keep only the most recent pages
+            if len(st.session_state.fence_pages) > max_pages // 2:
+                st.session_state.fence_pages = st.session_state.fence_pages[-max_pages//2:]
+            if len(st.session_state.non_fence_pages) > max_pages // 2:
+                st.session_state.non_fence_pages = st.session_state.non_fence_pages[-max_pages//2:]
+            
+            # Clear cache to free memory
+            st.cache_data.clear()
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            print(f"SESSION {get_session_id()} LOG: Memory cleared. Pages: fence={len(st.session_state.fence_pages)}, non_fence={len(st.session_state.non_fence_pages)}")
+        
+        # Check PDF size
+        if st.session_state.original_pdf_bytes:
+            pdf_size_mb = len(st.session_state.original_pdf_bytes) / (1024 * 1024)
+            st.session_state.session_size_mb = pdf_size_mb
+        
+        return True
+    except Exception as e:
+        print(f"SESSION {get_session_id()} ERROR: Memory management failed: {e}")
+        return True
 
 current_session_id = get_session_id() 
 initialize_session_state(current_session_id) 
@@ -90,6 +130,16 @@ with st.sidebar:
     selected_label = st.radio("Select LLM:", list(model_options.keys()), key="model_selector_radio", index=default_model_idx)
     st.session_state.selected_model_for_analysis = model_options[selected_label]
     st.info(f"Using: **{st.session_state.selected_model_for_analysis}**.")
+    
+    # Display memory usage
+    if st.session_state.get('session_size_mb', 0) > 0:
+        st.metric("📊 Memory Usage", f"{st.session_state.session_size_mb:.1f} MB")
+        if st.session_state.session_size_mb > 20:
+            st.warning("⚠️ High memory usage - may cause 413 errors")
+    
+    # Long page handling information
+    st.subheader("📄 Long Page Handling")
+    st.info("🔍 Long pages are handled with enhanced LLM prompts to focus on fence-related content without losing information.")
  
     highlight_fence_text_app = st.toggle("🔍 Highlight text & indicators", value=True, key="highlight_toggle")
     st.subheader("Fence Keywords")
@@ -99,34 +149,6 @@ with st.sidebar:
         st.session_state.fence_keywords_app = [k.strip().lower() for k in custom_keywords_str.split("\n") if k.strip()]
         st.rerun()
     FENCE_KEYWORDS_APP = st.session_state.fence_keywords_app
-    
-    # Reset button to free memory
-    st.markdown("---")
-    st.subheader("🔄 Reset")
-    if st.button("🗑️ Clear Analysis & Free Memory", key="reset_btn", type="primary", use_container_width=True):
-        # Clear analysis results
-        st.session_state.fence_pages = []
-        st.session_state.non_fence_pages = []
-        st.session_state.total_pages_processed_count = 0
-        st.session_state.doc_total_pages = 0
-        st.session_state.processing_complete = False
-        st.session_state.analysis_halted_due_to_error = False
-        st.session_state.run_analysis_triggered = False
-        st.session_state.original_pdf_bytes = None
-        st.session_state.current_pdf_hash = None
-        st.session_state.highlighted_pdf_bytes_for_download = None
-        st.session_state.last_uploaded_file_id = None
-        
-        # Clear cache to free memory
-        st.cache_data.clear()
-        
-        # Force garbage collection
-        import gc
-        gc.collect()
-        
-        print(f"SESSION {current_session_id} LOG: Memory cleared and analysis reset")
-        st.success("✅ Analysis cleared! Memory freed. Upload a new PDF to start.")
-        st.rerun()
 
 
 llm_analysis_instance = None
@@ -316,6 +338,8 @@ if st.session_state.run_analysis_triggered and \
     with col_f: st.subheader("✅ Fence-Related Pages")
     with col_nf: st.subheader("❌ Non-Fence Pages")
     prog_bar = st.progress(0); status_txt_area = st.empty()
+    
+    # Add 413 error handling
     try:
         for i in range(st.session_state.doc_total_pages):
             curr_pg_num = i + 1; st.session_state.total_pages_processed_count = curr_pg_num
@@ -339,8 +363,7 @@ if st.session_state.run_analysis_triggered and \
             try:
                 with st.spinner(f"Page {curr_pg_num}: Core analysis..."):
                     analysis_res_core = analyze_page(
-                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config,
-                        recall_mode="strict"  # Only trust LLM's explicit yes/no answer
+                        page_data_an, llm_analysis_instance, FENCE_KEYWORDS_APP, google_cloud_config
                     )
 
             except UnrecoverableRateLimitError as urle:
@@ -388,6 +411,10 @@ if st.session_state.run_analysis_triggered and \
             if fatal_err_page: break
             target_col = col_f if analysis_result.get('fence_found') else col_nf
             (st.session_state.fence_pages if analysis_result.get('fence_found') else st.session_state.non_fence_pages).append(analysis_result)
+            
+            # Manage memory to prevent 413 errors
+            if curr_pg_num % 5 == 0:  # Check every 5 pages
+                manage_session_memory()
             with target_col: # Display Logic (copied from display_page_result_expander for consistency)
                 exp_title = f"Page {analysis_result['page_number']}"
                 if analysis_result.get('fence_found'):
@@ -439,6 +466,20 @@ if st.session_state.run_analysis_triggered and \
                                 if count_live >=15 and len(details_list) > 17: st.markdown(f"- ...& {len(details_list)-count_live} more."); break
             summary_placeholder.markdown(f"### Summary (Processed: {st.session_state.total_pages_processed_count}/{st.session_state.doc_total_pages})\n- ✅ Fence: {len(st.session_state.fence_pages)}\n- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}")
             time.sleep(0.05) 
+    except Exception as e:
+        if "413" in str(e) or "Request Entity Too Large" in str(e):
+            st.error("🚨 413 ERROR: Request too large. Clearing large data and retrying...")
+            # Clear large data
+            st.session_state.original_pdf_bytes = None
+            st.session_state.highlighted_pdf_bytes_for_download = None
+            st.cache_data.clear()
+            import gc
+            gc.collect()
+            st.error("Please refresh the page and try with a smaller PDF.")
+            st.stop()
+        else:
+            st.error(f"Processing error: {e}")
+            st.stop()
     finally: 
         if doc_proc_loop:
             doc_proc_loop.close()
