@@ -434,7 +434,7 @@ def extract_legend_entries(
             bbox_desc = None
             bbox_ind = None
 
-            # A. Description
+            # A. Try to find Description bbox
             if desc:
                 bbox_desc = find_best_bbox(desc, pdf_lines, ocr_lines, chunk_bbox)
                 if not bbox_desc:
@@ -442,22 +442,36 @@ def extract_legend_entries(
                 if not bbox_desc:
                     bbox_desc = find_best_bbox(desc, pdf_lines, ocr_lines, (0, 0, 10000, 10000))
 
-            # B. Indicator
+            # B. Try to find Indicator bbox
             if ind:
                 bbox_ind = find_best_bbox(ind, pdf_lines, ocr_lines, chunk_bbox)
                 if not bbox_ind:
                     bbox_ind = find_best_bbox(ind, pdf_lines, ocr_lines, (0, 0, 10000, 10000))
 
-            if bbox_desc:
-                results.append({
-                    "indicator": ind,
-                    "keyword": desc,
-                    "description": item["description"],
-                    "x0": bbox_desc["x0"], "y0": bbox_desc["y0"],
-                    "x1": bbox_desc["x1"], "y1": bbox_desc["y1"],
-                    "source": bbox_desc.get("source", "unknown") + "_desc"
-                })
+            # ALWAYS add the legend entry - use chunk bbox as fallback if no precise bbox found
+            if desc:
+                if bbox_desc:
+                    results.append({
+                        "indicator": ind,
+                        "keyword": desc,
+                        "description": item.get("description", ""),
+                        "x0": bbox_desc["x0"], "y0": bbox_desc["y0"],
+                        "x1": bbox_desc["x1"], "y1": bbox_desc["y1"],
+                        "source": bbox_desc.get("source", "unknown") + "_desc"
+                    })
+                else:
+                    # Fallback: use chunk bbox for the legend entry
+                    results.append({
+                        "indicator": ind,
+                        "keyword": desc,
+                        "description": item.get("description", ""),
+                        "x0": chunk_bbox[0], "y0": chunk_bbox[1],
+                        "x1": chunk_bbox[2], "y1": chunk_bbox[3],
+                        "source": "chunk_fallback"
+                    })
+                    print(f"[DEBUG] Using chunk bbox fallback for: {ind} -> {desc[:30]}...")
 
+            # Add indicator bbox if found and different from description
             if bbox_ind:
                 is_duplicate = False
                 if bbox_desc:

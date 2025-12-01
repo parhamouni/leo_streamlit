@@ -164,8 +164,14 @@ if uploaded_file and openai_key and ade_key:
                 # --- DEBUG VISUALIZATION END ---
 
                 # D. Page Classification (optional - skip non-fence pages)
-                # Use FULL page text for classification (not fragmented word tokens)
+                # Use FULL page text for classification - combine PDF text + OCR for scanned pages
                 page_text = page.get_text()
+                
+                # If PDF text is very short, also check ADE chunk text (for scanned pages)
+                if len(page_text.strip()) < 100:
+                    chunk_texts = [c.get("text", "") for c in chunks]
+                    page_text = page_text + " " + " ".join(chunk_texts)
+                    print(f" [APP] Page has minimal PDF text, using ADE chunks for classification")
                 
                 if USE_PAGE_CLASSIFICATION:
                     print(" [APP] Classifying page...")
