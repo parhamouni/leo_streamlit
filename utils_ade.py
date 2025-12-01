@@ -255,43 +255,148 @@ def get_native_pdf_lines(page: fitz.Page) -> List[Dict]:
 
 
 # ==============================================================================
-# 4. Matching Logic (Center-Point Strategy)
+# 4. Line-Based Matching (from backup - more robust)
 # ==============================================================================
 
 
-def is_center_inside(item_box: Dict, chunk_box: Tuple[float, float, float, float], tolerance: float = 15.0) -> bool:
-    item_cx = (item_box["x0"] + item_box["x1"]) / 2
-    item_cy = (item_box["y0"] + item_box["y1"]) / 2
-    cx0, cy0, cx1, cy1 = chunk_box
+def group_items_by_line(items: List[Dict], y_tolerance: float = 10.0) -> List[List[Dict]]:
+    """
+    Group items (OCR tokens or PDF words) by line based on Y coordinates.
+    This is crucial for detecting the full "Code + Description" line.
+    """
+    if not items:
+        return []
+    
+    # Filter out items with no text
+    valid_items = [item for item in items if item.get("text")]
+    
+    # Sort by Y position primarily, then X
+    sorted_items = sorted(
+        valid_items,
+        key=lambda it: (it.get("y0", 0.0), it.get("x0", 0.0))
+    )
+    
+    lines: List[List[Dict]] = []
+    current: List[Dict] = []
+    last_y: Optional[float] = None
+    
+    for item in sorted_items:
+        y0 = float(item.get("y0", 0.0))
+        if last_y is None or abs(y0 - last_y) <= y_tolerance:
+            current.append(item)
+        else:
+            if current:
+                lines.append(sorted(current, key=lambda it: it.get("x0", 0.0)))
+            current = [item]
+        last_y = y0
+        
+    if current:
+        lines.append(sorted(current, key=lambda it: it.get("x0", 0.0)))
+        
+    return lines
 
-    inside_x = (cx0 - tolerance) <= item_cx <= (cx1 + tolerance)
-    inside_y = (cy0 - tolerance) <= item_cy <= (cy1 + tolerance)
-    return inside_x and inside_y
+
+def combine_bbox(items: List[Dict]) -> Tuple[float, float, float, float]:
+    """Calculate the union bounding box of multiple items."""
+    if not items:
+        return (0, 0, 0, 0)
+    x0 = min(float(item.get("x0", 0.0)) for item in items)
+    y0 = min(float(item.get("y0", 0.0)) for item in items)
+    x1 = max(float(item.get("x1", 0.0)) for item in items)
+    y1 = max(float(item.get("y1", 0.0)) for item in items)
+    return x0, y0, x1, y1
+
+
+def make_highlight(items: List[Dict], fallback_text: str, source: str = "unknown") -> Optional[Dict]:
+    """Create a highlight result covering all items in the list."""
+    if not items:
+        return None
+    x0, y0, x1, y1 = combine_bbox(items)
+    text_join = " ".join(item.get("text", "") for item in items).strip()
+    return {
+        "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+        "text": text_join or fallback_text,
+        "source": source
+    }
+
+
+def match_text_in_lines(
+    search_text: str,
+    lines: List[List[Dict]],
+    chunk_bbox: Optional[Tuple[float, float, float, float]] = None,
+    tolerance: float = 50.0
+) -> Optional[Dict]:
+    """
+    Match text in lines. 
+    KEY FEATURE: If a match is found, returns the bbox for the ENTIRE LINE.
+    """
+    if not search_text or not lines:
+        return None
+    
+    target = re.sub(r'[^0-9A-Za-z]', '', search_text).lower()
+    if not target:
+        return None
+    
+    chunk_x0, chunk_y0, chunk_x1, chunk_y1 = chunk_bbox if chunk_bbox else (0, 0, 10000, 10000)
+    
+    def is_in_region(x0, y0, x1, y1):
+        if not chunk_bbox:
+            return True
+        return not (x1 < chunk_x0 - tolerance or x0 > chunk_x1 + tolerance or
+                   y1 < chunk_y0 - tolerance or y0 > chunk_y1 + tolerance)
+    
+    for line in lines:
+        if not line:
+            continue
+        
+        # Filter line items by region
+        line_items = [item for item in line if is_in_region(
+            float(item.get("x0", 0)), float(item.get("y0", 0)),
+            float(item.get("x1", 0)), float(item.get("y1", 0))
+        )]
+        if not line_items:
+            continue
+        
+        # Strategy 1: Direct token match
+        for item in line_items:
+            raw_text = item.get("text", "") or ""
+            clean_text = re.sub(r'[^0-9A-Za-z]', '', raw_text).lower()
+            
+            if clean_text and (clean_text == target or target in clean_text):
+                return make_highlight(line_items, search_text, "line_match")
+        
+        # Strategy 2: Combined line text
+        line_text = " ".join(item.get("text", "") for item in line_items)
+        line_clean = re.sub(r'[^0-9A-Za-z]', '', line_text).lower()
+        if target in line_clean:
+            return make_highlight(line_items, search_text, "line_match")
+    
+    return None
 
 
 def find_best_bbox(search_text: str, pdf_lines: List[Dict], ocr_lines: List[Dict], chunk_bbox: Tuple[float, float, float, float], **kwargs) -> Optional[Dict]:
+    """
+    Find the best bounding box for search_text using line-based matching.
+    Returns the ENTIRE LINE bbox when a match is found.
+    """
     if not search_text:
         return None
-    target = re.sub(r'[^0-9a-zA-Z]', '', search_text).lower()
-    if not target:
-        return None
-
-    def check_candidates(candidates):
-        for line in candidates:
-            line_clean = re.sub(r'[^0-9a-zA-Z]', '', line["text"]).lower()
-            if target not in line_clean:
-                continue
-            # Global search override (if chunk is huge) or local check
-            if chunk_bbox[2] > 5000 or is_center_inside(line, chunk_bbox):
-                return line
-        return None
-
-    match = check_candidates(pdf_lines)
-    if match:
-        return match
-    match = check_candidates(ocr_lines)
-    if match:
-        return match
+    
+    # Group into lines and search
+    if pdf_lines:
+        pdf_grouped = group_items_by_line(pdf_lines, y_tolerance=5.0)
+        result = match_text_in_lines(search_text, pdf_grouped, chunk_bbox)
+        if result:
+            result["source"] = "pdf"
+            return result
+    
+    if ocr_lines:
+        ocr_grouped = group_items_by_line(ocr_lines, y_tolerance=10.0)
+        result = match_text_in_lines(search_text, ocr_grouped, chunk_bbox)
+        if result:
+            result["source"] = "ocr"
+            return result
+    
     return None
 
 
