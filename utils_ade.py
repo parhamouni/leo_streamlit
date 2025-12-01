@@ -101,19 +101,34 @@ def align_ade_chunks_to_page(ade_result: Dict, page_idx: int, page_width: float,
 
 
 def segment_chunks(chunks: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Segment ADE chunks into legend-like (tables, text with keywords) and figure-like (drawings).
+    """
     legend_like = []
     figure_like = []
+    
     for chunk in chunks:
         raw_type = (chunk.get("type") or "").lower()
         text_lower = (chunk.get("text") or "").lower()
-        is_figure = raw_type in {"figure", "architectural_drawing"}
-        has_legend_hint = any(token in text_lower for token in {"legend", "keynote", "abbreviation", "symbol"})
-
-        if not is_figure or has_legend_hint:
+        
+        # Tables are always legend-like (they contain structured data)
+        if raw_type == "table":
             legend_like.append(chunk)
-        elif is_figure:
+            continue
+        
+        # Check for legend/keynote keywords
+        has_legend_hint = any(token in text_lower for token in {"legend", "keynote", "abbreviation", "symbol", "notes"})
+        
+        # Figures without legend hints go to figure_like
+        is_figure = raw_type in {"figure", "architectural_drawing", "image"}
+        
+        if is_figure and not has_legend_hint:
             figure_like.append(chunk)
-    print(f"[DEBUG] Segmented: {len(legend_like)} Legend-like chunks, {len(figure_like)} Figure-like chunks.")
+        else:
+            # Text chunks, or figures with legend hints
+            legend_like.append(chunk)
+    
+    print(f"[DEBUG] Segmented: {len(legend_like)} Legend-like, {len(figure_like)} Figure-like")
     return legend_like, figure_like
 
 
@@ -285,6 +300,40 @@ def find_best_bbox(search_text: str, pdf_lines: List[Dict], ocr_lines: List[Dict
 # ==============================================================================
 
 
+def parse_table_rows(table_text: str) -> List[Dict]:
+    """
+    Parse HTML table rows from ADE markdown to extract indicator→description pairs.
+    ADE returns tables like: <tr><td>18</td><td>CMU SCREEN WALL</td></tr>
+    """
+    items = []
+    
+    # Find all table rows
+    row_pattern = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL | re.IGNORECASE)
+    cell_pattern = re.compile(r'<td[^>]*>(.*?)</td>', re.DOTALL | re.IGNORECASE)
+    
+    for row_match in row_pattern.finditer(table_text):
+        row_content = row_match.group(1)
+        cells = cell_pattern.findall(row_content)
+        
+        if len(cells) >= 2:
+            # First cell is usually indicator, second is description
+            indicator = re.sub(r'<[^>]+>', '', cells[0]).strip()
+            description = re.sub(r'<[^>]+>', '', cells[1]).strip()
+            
+            # Clean up HTML entities
+            description = description.replace('&amp;', '&').replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>')
+            
+            if indicator and description:
+                items.append({
+                    "indicator": indicator,
+                    "text_element": description,
+                    "description": f"Table entry: {description[:50]}..."
+                })
+    
+    print(f"[DEBUG] Parsed {len(items)} items from table HTML")
+    return items
+
+
 def llm_extract_fence_elements(llm, text: str, keywords: List[str], max_items: int = 100) -> List[Dict]:
     if not llm or not text:
         return []
@@ -342,6 +391,7 @@ def extract_legend_entries(
 ) -> List[Dict]:
     print("[DEBUG] Extracting Legend Entries and Matching BBoxes...")
     results = []
+    fence_keywords_lower = [kw.lower() for kw in fence_keywords]
 
     # Helper: Make a shortened version of the text
     def get_substring(text):
@@ -349,13 +399,33 @@ def extract_legend_entries(
         if len(words) > 4:
             return " ".join(words[:4])
         return text
+    
+    # Helper: Check if text is fence-related
+    def is_fence_related(text):
+        text_lower = text.lower()
+        return any(kw in text_lower for kw in fence_keywords_lower)
 
     for chunk in legend_chunks:
         text = chunk.get("text", "")
-        if not text:
+        markdown = chunk.get("markdown", "")
+        chunk_type = chunk.get("type", "").lower()
+        
+        if not text and not markdown:
             continue
-
-        items = llm_extract_fence_elements(llm, text, fence_keywords)
+        
+        items = []
+        
+        # For TABLE chunks, parse HTML structure first
+        if chunk_type == "table" and "<tr" in (markdown or text):
+            table_items = parse_table_rows(markdown or text)
+            # Filter to fence-related items only
+            items = [item for item in table_items if is_fence_related(item.get("text_element", ""))]
+            print(f"[DEBUG] Table chunk: {len(table_items)} total rows, {len(items)} fence-related")
+        
+        # If no table items or not a table, use LLM extraction
+        if not items:
+            items = llm_extract_fence_elements(llm, text, fence_keywords)
+        
         chunk_bbox = (chunk["x0"], chunk["y0"], chunk["x1"], chunk["y1"])
 
         for item in items:
