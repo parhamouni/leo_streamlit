@@ -527,58 +527,48 @@ if st.session_state.run_analysis_triggered and \
                             st.markdown(" ".join(dl_links), unsafe_allow_html=True)
                     
                     with det_col:
-                        st.markdown("##### Analysis Details")
-                        if fence_found:
-                            pts = []
-                            if definitions:
-                                pts.append(f"✔️ {len(definitions)} Definitions")
-                            if instances:
-                                pts.append(f"✔️ {len(instances)} Instances")
-                            if highlight_fence_text_app and (definitions or instances):
-                                pts.append("✔️ Highlights")
-                            if not pts:
-                                pts.append("Fence flagged")
-                            st.markdown("\n".join(f"- {s}" for s in pts))
-                        else:
-                            st.markdown("No fence indicators found.")
-                        
-                        # ADE Stats
-                        st.markdown("---")
-                        st.markdown("**ADE Stats:**")
-                        st.markdown(f"- Chunks: {len(chunks)}")
-                        st.markdown(f"- Legend regions: {len(legend_chunks)}")
-                        st.markdown(f"- Figure regions: {len(figure_chunks)}")
+                        # ADE Stats (compact)
+                        st.metric("ADE Chunks", len(chunks))
+                        col_leg, col_fig = st.columns(2)
+                        with col_leg:
+                            st.metric("Legend", len(legend_chunks))
+                        with col_fig:
+                            st.metric("Figure", len(figure_chunks))
                         
                         # Text response popover
                         if analysis_result.get('text_response'):
                             with st.popover("Analysis Log"):
                                 st.markdown(f"_{analysis_result['text_response']}_")
-                        
-                        # Snippet
-                        if text_snippet:
-                            st.markdown("---")
-                            st.markdown("**Key Items:**")
-                            st.code(text_snippet, language=None)
-                        
-                        # Definitions list
-                        if definitions and highlight_fence_text_app:
-                            st.markdown("---")
-                            st.markdown("**Found Definitions:**")
-                            disp_set = set()
-                            count = 0
-                            for d in sorted(definitions, key=lambda x: x.get('y0', 0)):
-                                if d.get('description') == "Indicator Code":
-                                    continue
-                                txt = d.get('keyword', 'N/A')
-                                ind = d.get('indicator', 'N/A')
-                                display_text = f"- `{ind}`: {txt}"
-                                if display_text not in disp_set:
-                                    st.markdown(display_text)
-                                    disp_set.add(display_text)
-                                    count += 1
-                                if count >= 10 and len(definitions) > 12:
-                                    st.markdown(f"- ...& {len(definitions) - count} more.")
-                                    break
+                    
+                    # Found Items Section (below the image/details row)
+                    st.subheader("Found Items")
+                    
+                    if definitions:
+                        st.markdown("### 🟢 Definitions (Legend)")
+                        df_def = pd.DataFrame(definitions)
+                        # Filter out "Indicator Code" helper rows
+                        if "description" in df_def.columns:
+                            df_display = df_def[df_def["description"] != "Indicator Code"]
+                            if not df_display.empty:
+                                display_cols = ["indicator", "keyword", "description"]
+                                available_cols = [c for c in display_cols if c in df_display.columns]
+                                st.dataframe(df_display[available_cols], hide_index=True)
+                            else:
+                                st.info("No definition details available.")
+                        else:
+                            st.dataframe(df_def, hide_index=True)
+                    else:
+                        st.info("No Legend Items found.")
+                    
+                    if instances:
+                        st.markdown("### 🟣 Instances (Drawings)")
+                        df_inst = pd.DataFrame(instances)
+                        if "indicator" in df_inst.columns:
+                            st.dataframe(df_inst[["indicator"]], hide_index=True)
+                        else:
+                            st.dataframe(df_inst, hide_index=True)
+                    else:
+                        st.info("No Instances found in drawings.")
             
             # Update summary
             summary_placeholder.markdown(
@@ -710,50 +700,50 @@ elif st.session_state.processing_complete:
                             st.markdown(" ".join(dl_links_rerun), unsafe_allow_html=True)
                     
                     with det_col_r:
-                        st.markdown("##### Analysis Details")
-                        if res_data_item.get('fence_found'):
-                            pts_r = []
-                            definitions = res_data_item.get('definitions', [])
-                            instances = res_data_item.get('instances', [])
-                            if definitions:
-                                pts_r.append(f"✔️ {len(definitions)} Definitions")
-                            if instances:
-                                pts_r.append(f"✔️ {len(instances)} Instances")
-                            if res_data_item.get('highlight_fence_text_app_setting', True) and (definitions or instances):
-                                pts_r.append("✔️ Highlights")
-                            if not pts_r:
-                                pts_r.append("Fence flagged")
-                            st.markdown("\n".join(f"- {s}" for s in pts_r))
-                        else:
-                            st.markdown("No fence indicators found.")
+                        # ADE Stats (compact)
+                        st.metric("ADE Chunks", res_data_item.get('chunk_count', 0))
+                        col_leg_r, col_fig_r = st.columns(2)
+                        with col_leg_r:
+                            st.metric("Legend", res_data_item.get('legend_count', 0))
+                        with col_fig_r:
+                            st.metric("Figure", res_data_item.get('figure_count', 0))
                         
                         if res_data_item.get('text_response'):
                             with st.popover("Analysis Log"):
                                 st.markdown(f"_{res_data_item['text_response']}_")
-                        
-                        if res_data_item.get('text_snippet'):
-                            st.markdown("---")
-                            st.code(res_data_item['text_snippet'], language=None)
-                        
-                        definitions = res_data_item.get('definitions', [])
-                        if definitions and res_data_item.get('highlight_fence_text_app_setting', True):
-                            st.markdown("---")
-                            st.markdown("**Found Definitions:**")
-                            disp_set_r = set()
-                            count_r = 0
-                            for d in sorted(definitions, key=lambda x: x.get('y0', 0)):
-                                if d.get('description') == "Indicator Code":
-                                    continue
-                                txt_r = d.get('keyword', 'N/A')
-                                ind_r = d.get('indicator', 'N/A')
-                                display_text_r = f"- `{ind_r}`: {txt_r}"
-                                if display_text_r not in disp_set_r:
-                                    st.markdown(display_text_r)
-                                    disp_set_r.add(display_text_r)
-                                    count_r += 1
-                                if count_r >= 10 and len(definitions) > 12:
-                                    st.markdown(f"- ...& {len(definitions) - count_r} more.")
-                                    break
+                    
+                    # Found Items Section (below the image/details row)
+                    st.subheader("Found Items")
+                    
+                    definitions = res_data_item.get('definitions', [])
+                    instances = res_data_item.get('instances', [])
+                    
+                    if definitions:
+                        st.markdown("### 🟢 Definitions (Legend)")
+                        df_def = pd.DataFrame(definitions)
+                        # Filter out "Indicator Code" helper rows
+                        if "description" in df_def.columns:
+                            df_display = df_def[df_def["description"] != "Indicator Code"]
+                            if not df_display.empty:
+                                display_cols = ["indicator", "keyword", "description"]
+                                available_cols = [c for c in display_cols if c in df_display.columns]
+                                st.dataframe(df_display[available_cols], hide_index=True)
+                            else:
+                                st.info("No definition details available.")
+                        else:
+                            st.dataframe(df_def, hide_index=True)
+                    else:
+                        st.info("No Legend Items found.")
+                    
+                    if instances:
+                        st.markdown("### 🟣 Instances (Drawings)")
+                        df_inst = pd.DataFrame(instances)
+                        if "indicator" in df_inst.columns:
+                            st.dataframe(df_inst[["indicator"]], hide_index=True)
+                        else:
+                            st.dataframe(df_inst, hide_index=True)
+                    else:
+                        st.info("No Instances found in drawings.")
     
     display_page_result_expander(st.session_state.fence_pages, col_f_res)
     display_page_result_expander(st.session_state.non_fence_pages, col_nf_res)
