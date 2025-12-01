@@ -12,13 +12,13 @@ import utils_ade as ade
 # Optional: LLM client
 from langchain_openai import ChatOpenAI
 
-st.set_page_config(page_title="ADE Fence Detector (v2)", layout="wide")
+st.set_page_config(page_title="ADE Fence Detector (v3 - Enhanced)", layout="wide")
 
 # ==============================================================================
 # 1. Configuration & Sidebar
 # ==============================================================================
 
-st.title("🔍 ADE Fence Detector (Refactored)")
+st.title("🔍 ADE Fence Detector (v3 - Enhanced)")
 
 with st.sidebar:
     st.header("🔑 Configuration")
@@ -59,6 +59,12 @@ with st.sidebar:
 
     st.markdown("---")
     DEBUG_MODE = st.checkbox("🛠️ Enable Debug View", value=False)
+    
+    st.markdown("---")
+    st.markdown("**Processing Options**")
+    USE_PAGEWISE_ADE = st.checkbox("📄 Process pages individually (slower but more reliable)", value=True)
+    USE_PAGE_CLASSIFICATION = st.checkbox("🎯 Skip non-fence pages (faster)", value=True)
+    USE_FUZZY_MATCHING = st.checkbox("🔍 Fuzzy matching for OCR errors", value=True)
 
 # ==============================================================================
 # 2. Main Logic
@@ -80,15 +86,20 @@ if uploaded_file and openai_key and ade_key:
     # Initialize LLM
     llm = ChatOpenAI(api_key=openai_key, model="gpt-4o-mini", temperature=0)
 
-    # Step 1: ADE Analysis (Full Document)
+    # Step 1: ADE Analysis (Full Document or Page-wise)
     if st.button("🚀 Run Analysis"):
         with st.status("Running ADE Analysis...", expanded=True) as status:
 
-            # 1. Call ADE
+            # 1. Call ADE (page-wise or full document)
             if not st.session_state.ade_result:
-                st.write("Sending to LandingAI ADE...")
-                print("[APP] Sending document to LandingAI ADE...")
-                ade_response = ade.ade_parse_document(file_bytes, ade_key)
+                if USE_PAGEWISE_ADE:
+                    st.write("Processing pages individually (more reliable)...")
+                    print("[APP] Using page-wise ADE parsing...")
+                    ade_response = ade.ade_parse_document_pagewise(file_bytes, ade_key)
+                else:
+                    st.write("Sending full document to LandingAI ADE...")
+                    print("[APP] Sending document to LandingAI ADE...")
+                    ade_response = ade.ade_parse_document(file_bytes, ade_key)
 
                 if not ade_response["success"]:
                     st.error(f"ADE Failed: {ade_response['error']}")
@@ -96,6 +107,9 @@ if uploaded_file and openai_key and ade_key:
                     st.stop()
 
                 st.session_state.ade_result = ade_response
+                failed_pages = ade_response.get("data", {}).get("failed_pages", [])
+                if failed_pages:
+                    st.warning(f"⚠️ Some pages failed: {failed_pages}")
                 st.write("✅ ADE Analysis Complete!")
 
             ade_data = st.session_state.ade_result["data"]
@@ -118,17 +132,22 @@ if uploaded_file and openai_key and ade_key:
 
                 # B. Align ADE Chunks
                 chunks = ade.align_ade_chunks_to_page(st.session_state.ade_result, page_idx, w, h)
-                legend_chunks, figure_chunks = ade.segment_chunks(chunks)
+                
+                # Use smart segmentation with LLM
+                legend_chunks, figure_chunks = ade.segment_chunks_smart(chunks, llm)
 
-                # C. Get Lines (Native & OCR) for precise Legend Matching
-                print(" [APP] Extracting PDF Native Lines...")
+                # C. Get UNIFIED Lines (PDF + OCR merged, deduplicated)
+                print(" [APP] Building unified text lines (PDF + OCR)...")
+                unified_lines = ade.get_unified_text_lines(
+                    page,
+                    google_cloud_config=google_cloud_config,
+                    pdf_bytes=file_bytes,
+                    page_idx=page_idx
+                )
+                
+                # Also keep separate for backward compatibility
                 pdf_lines = ade.get_native_pdf_lines(page)
-
-                ocr_lines = []
-                if google_cloud_config:
-                    print(" [APP] Preparing Google OCR request...")
-                    single_page_pdf = ade.create_single_page_pdf(file_bytes, page_idx)
-                    ocr_lines = ade.run_google_ocr_blocks(single_page_pdf, google_cloud_config, w, h)
+                ocr_lines = []  # Already merged into unified_lines
 
                 # --- DEBUG VISUALIZATION START ---
                 if DEBUG_MODE:
@@ -144,26 +163,52 @@ if uploaded_file and openai_key and ade_key:
                     st.image(debug_bytes, caption=f"DEBUG: Layers Page {page_num}", use_container_width=True)
                 # --- DEBUG VISUALIZATION END ---
 
-                # D. Extract Definitions (Legend Items)
-                print(" [APP] Matching Legend Entries...")
-                definitions = ade.extract_legend_entries(
+                # D. Page Classification (optional - skip non-fence pages)
+                page_text = " ".join([line.get("text", "") for line in unified_lines])
+                
+                if USE_PAGE_CLASSIFICATION:
+                    print(" [APP] Classifying page...")
+                    classification = ade.classify_page_fence_related(page_text, llm, FENCE_KEYWORDS)
+                    
+                    if not classification.get("is_fence_related", True):
+                        print(f" [APP] Page {page_num} skipped (not fence-related)")
+                        st.session_state.page_results[page_num] = {
+                            "definitions": [],
+                            "instances": [],
+                            "image": page_img_bytes,
+                            "chunk_count": len(chunks),
+                            "legend_count": 0,
+                            "figure_count": 0,
+                            "skipped": True,
+                            "skip_reason": classification.get("reason", "Not fence-related")
+                        }
+                        progress_bar.progress((page_idx + 1) / total_pages)
+                        continue
+
+                # E. Extract Definitions (Legend Items) - ENHANCED
+                print(" [APP] Extracting Legend Entries (enhanced)...")
+                definitions = ade.extract_legend_entries_enhanced(
                     legend_chunks=legend_chunks,
-                    pdf_lines=pdf_lines,
-                    ocr_lines=ocr_lines,
+                    unified_lines=unified_lines,
                     fence_keywords=FENCE_KEYWORDS,
                     llm=llm
                 )
 
-                # E. Find Instances (For figures, we still need simple tokens)
+                # F. Find Instances (with fuzzy matching for OCR errors)
                 print(" [APP] Finding Instances in Figures...")
                 native_words = page.get_text("words")
                 all_figure_tokens = [{"text": w[4], "x0": w[0], "y0": w[1], "x1": w[2], "y1": w[3]} for w in native_words]
 
-                instances = ade.find_instances_in_figures(
-                    definitions, figure_chunks, all_figure_tokens
-                )
+                if USE_FUZZY_MATCHING:
+                    instances = ade.find_instances_in_figures_fuzzy(
+                        definitions, figure_chunks, all_figure_tokens
+                    )
+                else:
+                    instances = ade.find_instances_in_figures(
+                        definitions, figure_chunks, all_figure_tokens
+                    )
 
-                # F. Visualize
+                # G. Visualize
                 print(" [APP] Generating Final Highlight Image...")
                 viz_bytes = ade.highlight_page_image(
                     page_img_bytes,
@@ -209,6 +254,10 @@ if st.session_state.get("page_results"):
                 st.metric("ADE Chunks", res["chunk_count"])
                 st.metric("Legend Regions", res["legend_count"])
                 st.metric("Figure Regions", res["figure_count"])
+                
+                if res.get("skipped"):
+                    st.warning(f"⏭️ Skipped: {res.get('skip_reason', 'Not fence-related')}")
+                    continue
 
             st.subheader("Found Items")
 
