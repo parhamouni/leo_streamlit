@@ -592,8 +592,308 @@ def ade_parse_document_pagewise(pdf_bytes: bytes, api_key: str, zdr: bool = Fals
 
 
 # ==============================================================================
-# 8. NEW: Unified Text Extraction (PDF + OCR Merged)
+# 8. NEW: Unified Text Extraction (PDF + OCR Merged) - IMPROVED
 # ==============================================================================
+
+def normalize_text_for_matching(text: Optional[str]) -> str:
+    """Normalize text for matching, handling common OCR errors."""
+    if not text:
+        return ""
+    # Common OCR substitutions
+    replacements = {
+        "O": "0", "o": "0",
+        "I": "1", "l": "1",
+        "B": "8",
+        "S": "5",
+    }
+    cleaned = "".join(replacements.get(ch, ch) for ch in str(text).strip())
+    return cleaned.replace(" ", "").upper()
+
+
+def extract_pdf_text_words(page: fitz.Page) -> List[Dict]:
+    """Extract word-level tokens from PDF text layer."""
+    words = []
+    for x0, y0, x1, y1, text, block_no, line_no, word_no in page.get_text("words"):
+        words.append({
+            "text": text,
+            "normalized_text": normalize_text_for_matching(text),
+            "x0": float(x0),
+            "y0": float(y0),
+            "x1": float(x1),
+            "y1": float(y1),
+            "block_no": block_no,
+            "line_no": line_no,
+            "word_no": word_no,
+            "source": "pdf_native"
+        })
+    return words
+
+
+def run_ocr_word_level(
+    page: fitz.Page,
+    google_cloud_config: Dict,
+    pdf_bytes: bytes,
+    page_idx: int
+) -> List[Dict]:
+    """Run OCR and return word-level tokens with coordinates."""
+    if not google_cloud_config or not GOOGLE_CLOUD_AVAILABLE:
+        return []
+    
+    client = get_docai_client(google_cloud_config)
+    if not client:
+        return []
+    
+    project_id = google_cloud_config.get("project_number")
+    location = google_cloud_config.get("location")
+    processor_id = google_cloud_config.get("processor_id")
+    name = f"projects/{project_id}/locations/{location}/processors/{processor_id}"
+    
+    # Create single page PDF and render
+    single_page_pdf = create_single_page_pdf(pdf_bytes, page_idx)
+    doc = fitz.open(stream=single_page_pdf, filetype="pdf")
+    ocr_page = doc[0]
+    
+    w, h = page.rect.width, page.rect.height
+    
+    # Dynamic zoom for quality
+    max_dimension = 4000.0
+    current_max = max(ocr_page.rect.width, ocr_page.rect.height)
+    zoom = min(3.0, max_dimension / current_max)
+    
+    mat = fitz.Matrix(zoom, zoom)
+    pix = ocr_page.get_pixmap(matrix=mat, alpha=False)
+    image_content = pix.tobytes("jpeg", jpg_quality=85)
+    
+    raw_document = documentai.RawDocument(content=image_content, mime_type="image/jpeg")
+    request = documentai.ProcessRequest(name=name, raw_document=raw_document)
+    
+    try:
+        result = client.process_document(request=request)
+        doc_result = result.document
+    except Exception as e:
+        print(f"[DEBUG] OCR failed: {e}")
+        return []
+    
+    if not doc_result.pages:
+        return []
+    
+    ocr_page_result = doc_result.pages[0]
+    tokens = []
+    
+    # Extract word-level tokens
+    for token in ocr_page_result.tokens:
+        anchor = token.layout.text_anchor
+        text = ""
+        if anchor and anchor.text_segments:
+            for segment in anchor.text_segments:
+                text += doc_result.text[segment.start_index:segment.end_index]
+        text = text.strip()
+        if not text:
+            continue
+        
+        layout = token.layout
+        poly = getattr(layout, "bounding_poly", None)
+        if not poly:
+            continue
+        
+        vertices = list(getattr(poly, "normalized_vertices", []))
+        if not vertices:
+            continue
+        
+        xs = [v.x for v in vertices if v.x is not None]
+        ys = [v.y for v in vertices if v.y is not None]
+        if len(xs) < 2 or len(ys) < 2:
+            continue
+        
+        tokens.append({
+            "text": text,
+            "normalized_text": normalize_text_for_matching(text),
+            "x0": min(xs) * w,
+            "y0": min(ys) * h,
+            "x1": max(xs) * w,
+            "y1": max(ys) * h,
+            "confidence": getattr(layout, "confidence", 1.0),
+            "source": "ocr"
+        })
+    
+    doc.close()
+    print(f"[DEBUG] OCR extracted {len(tokens)} word-level tokens")
+    return tokens
+
+
+def calculate_overlap_ratio(bbox1: Dict, bbox2: Dict) -> float:
+    """Calculate overlap ratio relative to smaller box."""
+    x1_min, y1_min = float(bbox1.get("x0", 0)), float(bbox1.get("y0", 0))
+    x1_max, y1_max = float(bbox1.get("x1", 0)), float(bbox1.get("y1", 0))
+    x2_min, y2_min = float(bbox2.get("x0", 0)), float(bbox2.get("y0", 0))
+    x2_max, y2_max = float(bbox2.get("x1", 0)), float(bbox2.get("y1", 0))
+    
+    # Calculate intersection
+    x_left = max(x1_min, x2_min)
+    y_top = max(y1_min, y2_min)
+    x_right = min(x1_max, x2_max)
+    y_bottom = min(y1_max, y2_max)
+    
+    if x_right <= x_left or y_bottom <= y_top:
+        return 0.0
+    
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+    
+    area1 = (x1_max - x1_min) * (y1_max - y1_min)
+    area2 = (x2_max - x2_min) * (y2_max - y2_min)
+    
+    smaller_area = min(area1, area2)
+    if smaller_area <= 0:
+        return 0.0
+    
+    return intersection_area / smaller_area
+
+
+def calculate_text_similarity(text1: str, text2: str) -> float:
+    """Calculate text similarity using normalized text."""
+    norm1 = normalize_text_for_matching(text1)
+    norm2 = normalize_text_for_matching(text2)
+    
+    if not norm1 and not norm2:
+        return 1.0
+    if not norm1 or not norm2:
+        return 0.0
+    
+    # Exact match
+    if norm1 == norm2:
+        return 1.0
+    
+    # One contains the other
+    if norm1 in norm2 or norm2 in norm1:
+        return 0.8
+    
+    # Character overlap (Jaccard)
+    set1 = set(norm1)
+    set2 = set(norm2)
+    intersection = len(set1 & set2)
+    union = len(set1 | set2)
+    return intersection / union if union > 0 else 0.0
+
+
+def merge_pdf_ocr_tokens(
+    pdf_words: List[Dict],
+    ocr_tokens: List[Dict],
+    overlap_threshold: float = 0.2,
+    text_similarity_threshold: float = 0.5,
+) -> List[Dict]:
+    """
+    Merge PDF and OCR tokens by finding overlaps and combining them.
+    Based on the approach from three_level_extraction_merge.ipynb.
+    
+    Returns unified list with source tracking.
+    """
+    print(f"[DEBUG] Merging {len(pdf_words)} PDF words + {len(ocr_tokens)} OCR tokens...")
+    
+    merged_tokens = []
+    ocr_used = set()
+    
+    # Start with PDF words as base
+    for pdf_word in pdf_words:
+        pdf_bbox = {
+            "x0": float(pdf_word.get("x0", 0)),
+            "y0": float(pdf_word.get("y0", 0)),
+            "x1": float(pdf_word.get("x1", 0)),
+            "y1": float(pdf_word.get("y1", 0)),
+        }
+        pdf_text = pdf_word.get("text", "")
+        
+        # Find matching OCR tokens
+        matching_ocr = []
+        for idx, ocr_token in enumerate(ocr_tokens):
+            if idx in ocr_used:
+                continue
+            
+            ocr_bbox = {
+                "x0": float(ocr_token.get("x0", 0)),
+                "y0": float(ocr_token.get("y0", 0)),
+                "x1": float(ocr_token.get("x1", 0)),
+                "y1": float(ocr_token.get("y1", 0)),
+            }
+            ocr_text = ocr_token.get("text", "")
+            
+            # Check overlap
+            overlap = calculate_overlap_ratio(pdf_bbox, ocr_bbox)
+            if overlap < overlap_threshold:
+                continue
+            
+            # Check text similarity
+            similarity = calculate_text_similarity(pdf_text, ocr_text)
+            if similarity < text_similarity_threshold:
+                continue
+            
+            matching_ocr.append((idx, ocr_token, overlap, similarity))
+        
+        # Merge if matches found
+        if matching_ocr:
+            # Merge bounding boxes (union)
+            all_x0 = [pdf_bbox["x0"]] + [ocr_tokens[idx]["x0"] for idx, _, _, _ in matching_ocr]
+            all_y0 = [pdf_bbox["y0"]] + [ocr_tokens[idx]["y0"] for idx, _, _, _ in matching_ocr]
+            all_x1 = [pdf_bbox["x1"]] + [ocr_tokens[idx]["x1"] for idx, _, _, _ in matching_ocr]
+            all_y1 = [pdf_bbox["y1"]] + [ocr_tokens[idx]["y1"] for idx, _, _, _ in matching_ocr]
+            
+            # Use best text (prefer longer, or OCR if higher confidence)
+            texts = [pdf_text] + [ocr_tokens[idx]["text"] for idx, _, _, _ in matching_ocr]
+            best_text = max(texts, key=len)
+            
+            # Mark OCR tokens as used
+            for idx, _, _, _ in matching_ocr:
+                ocr_used.add(idx)
+            
+            merged_tokens.append({
+                "text": best_text,
+                "normalized_text": normalize_text_for_matching(best_text),
+                "x0": min(all_x0),
+                "y0": min(all_y0),
+                "x1": max(all_x1),
+                "y1": max(all_y1),
+                "source": "pdf+ocr",
+                "sources_count": 1 + len(matching_ocr),
+                "original_pdf_text": pdf_text,
+            })
+        else:
+            # No match, keep PDF word as-is
+            merged_tokens.append({
+                "text": pdf_text,
+                "normalized_text": normalize_text_for_matching(pdf_text),
+                "x0": pdf_bbox["x0"],
+                "y0": pdf_bbox["y0"],
+                "x1": pdf_bbox["x1"],
+                "y1": pdf_bbox["y1"],
+                "source": "pdf_only",
+                "sources_count": 1,
+            })
+    
+    # Add remaining OCR tokens that weren't matched
+    for idx, ocr_token in enumerate(ocr_tokens):
+        if idx in ocr_used:
+            continue
+        
+        merged_tokens.append({
+            "text": ocr_token.get("text", ""),
+            "normalized_text": normalize_text_for_matching(ocr_token.get("text", "")),
+            "x0": float(ocr_token.get("x0", 0)),
+            "y0": float(ocr_token.get("y0", 0)),
+            "x1": float(ocr_token.get("x1", 0)),
+            "y1": float(ocr_token.get("y1", 0)),
+            "source": "ocr_only",
+            "sources_count": 1,
+        })
+    
+    # Count sources
+    source_counts = defaultdict(int)
+    for token in merged_tokens:
+        source_counts[token.get("source", "unknown")] += 1
+    
+    print(f"[DEBUG] Merge result: {len(merged_tokens)} tokens")
+    print(f"[DEBUG]   pdf+ocr: {source_counts['pdf+ocr']}, pdf_only: {source_counts['pdf_only']}, ocr_only: {source_counts['ocr_only']}")
+    
+    return merged_tokens
+
 
 def get_unified_text_lines(
     page: fitz.Page,
@@ -603,46 +903,26 @@ def get_unified_text_lines(
 ) -> List[Dict]:
     """
     Merge PDF native text and OCR text into a unified list.
-    Deduplicates overlapping text to avoid double-counting.
+    Uses word-level extraction and proper overlap-based merging.
     """
-    print("[DEBUG] Building unified text lines (PDF + OCR)...")
+    print("[DEBUG] Building unified text (word-level PDF + OCR)...")
     
-    # Get PDF native lines
-    pdf_lines = get_native_pdf_lines(page)
+    # Get PDF word-level tokens
+    pdf_words = extract_pdf_text_words(page)
+    print(f"[DEBUG] PDF text layer: {len(pdf_words)} words")
     
-    # Get OCR lines if configured
-    ocr_lines = []
+    # Get OCR word-level tokens if configured
+    ocr_tokens = []
     if google_cloud_config and pdf_bytes:
-        single_page_pdf = create_single_page_pdf(pdf_bytes, page_idx)
-        w, h = page.rect.width, page.rect.height
-        ocr_lines = run_google_ocr_blocks(single_page_pdf, google_cloud_config, w, h)
+        ocr_tokens = run_ocr_word_level(page, google_cloud_config, pdf_bytes, page_idx)
     
-    # Merge with deduplication
-    unified = list(pdf_lines)  # Start with PDF lines
+    # Merge with proper deduplication
+    if ocr_tokens:
+        unified = merge_pdf_ocr_tokens(pdf_words, ocr_tokens)
+    else:
+        unified = pdf_words
+        print(f"[DEBUG] No OCR, using {len(pdf_words)} PDF words only")
     
-    for ocr_line in ocr_lines:
-        # Check if OCR line overlaps significantly with any PDF line
-        is_duplicate = False
-        ocr_text_clean = re.sub(r'\s+', '', ocr_line["text"].lower())
-        
-        for pdf_line in pdf_lines:
-            pdf_text_clean = re.sub(r'\s+', '', pdf_line["text"].lower())
-            
-            # Check text similarity
-            if ocr_text_clean and pdf_text_clean:
-                similarity = SequenceMatcher(None, ocr_text_clean, pdf_text_clean).ratio()
-                if similarity > 0.8:
-                    # Check spatial overlap (IoU)
-                    iou = compute_iou(ocr_line, pdf_line)
-                    if iou > 0.3:
-                        is_duplicate = True
-                        break
-        
-        if not is_duplicate:
-            ocr_line["source"] = "ocr_unique"
-            unified.append(ocr_line)
-    
-    print(f"[DEBUG] Unified text: {len(pdf_lines)} PDF + {len(ocr_lines)} OCR = {len(unified)} unique lines")
     return unified
 
 
