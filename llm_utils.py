@@ -26,8 +26,10 @@ def json_invoke(llm, messages: List[HumanMessage], max_retries: int = 2):
 
 # ---------- Prompt builders (safe) ----------
 
-def make_analyze_page_prompt(context_info: str, page_text: str) -> str:
+def make_analyze_page_prompt(context_info: str, page_text: str, long_page_guidance: str = None) -> str:
     # NOTE: Double braces {{ }} are used to keep literal JSON in an f-string.
+    guidance_section = f"\n{long_page_guidance}\n" if long_page_guidance else ""
+    
     return f"""
 You are a careful engineering-drawing analyst.
 Return STRICT JSON with the schema:
@@ -37,7 +39,7 @@ Rules:
 - Favor RECALL over precision. When uncertain but plausible, answer "yes" with lower confidence.
 - Extract short key SIGNALS (words/phrases) that influenced your decision.
 - DO NOT include markdown fences. Output one JSON object only.
-
+{guidance_section}
 Few-shots (positive & sparse cases):
 1) Text: "F-2 8' CL FENCE – SEE DETAIL 3/L2-01"
    -> {{"answer":"yes","confidence":0.9,"signals":["F-2","FENCE","DETAIL REFERENCE"],"reason":"Fence legend with explicit callout"}}

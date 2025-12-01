@@ -294,6 +294,12 @@ def analyze_page(
         comprehensive_text = page_data.get("text", "") or ""
         extraction_stats = {}
         extraction_method = "legacy"
+    
+    # ---- Handle long pages by improving LLM prompt structure ----
+    # Instead of truncating, we'll structure the prompt better for long content
+    is_long_page = len(comprehensive_text) > 10000  # Flag for long pages
+    if is_long_page:
+        print(f"SESSION {pg_num} LOG: Long page detected ({len(comprehensive_text)} chars). Using enhanced prompt structure.")
 
     # ---- Optional neighbor context for sparse pages (kept tiny) ----
     context_bits = []
@@ -310,37 +316,66 @@ def analyze_page(
         f"Extraction: {extraction_method}, elements={extraction_stats.get('total_elements','n/a')}"
         + ("; " + " | ".join(context_bits) if context_bits else "")
     )
-    prompt = make_analyze_page_prompt(context_info=context_info, page_text=comprehensive_text)
+    
+    # Enhanced prompt for long pages to help LLM focus
+    if is_long_page:
+        # Add guidance for long pages
+        long_page_guidance = f"""
+IMPORTANT: This is a long page ({len(comprehensive_text)} characters). 
+Focus on finding fence-related content by scanning for:
+- Keywords: {', '.join(fence_keywords[:5])} and related terms
+- Look for fence specifications, dimensions, materials, or installation details
+- Pay attention to any text near drawings or technical specifications
+- Don't get distracted by unrelated content - focus on fence-related information
+"""
+        prompt = make_analyze_page_prompt(context_info=context_info, page_text=comprehensive_text, long_page_guidance=long_page_guidance)
+    else:
+        prompt = make_analyze_page_prompt(context_info=context_info, page_text=comprehensive_text)
 
     # ---- LLM call ----
     try:
         raw_obj = retry_with_backoff(llm_text.invoke, [HumanMessage(content=prompt)])
         raw = raw_obj.content if hasattr(raw_obj, "content") else str(raw_obj)
-        parsed = json.loads(raw)
+        
+        # Handle empty or invalid responses
+        if not raw or not raw.strip():
+            print(f"analyze_page empty response pg {pg_num}")
+            answer, confidence, signals, reason = "no", 0.0, [], "empty LLM response"
+        else:
+            # Try to extract JSON from response (handle markdown code blocks)
+            import re
+            raw_clean = raw.strip()
+            # Remove markdown code blocks if present
+            json_match = re.search(r'```json\s*([\s\S]*?)\s*```', raw_clean, re.IGNORECASE)
+            if json_match:
+                raw_clean = json_match.group(1).strip()
+            elif raw_clean.startswith('```'):
+                # Remove generic code blocks
+                raw_clean = re.sub(r'^```[a-z]*\s*', '', raw_clean)
+                raw_clean = re.sub(r'\s*```$', '', raw_clean).strip()
+            
+            # Try to find JSON object in response
+            if raw_clean.startswith('{'):
+                parsed = json.loads(raw_clean)
+            else:
+                # Try to extract JSON object from response
+                json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw_clean)
+                if json_match:
+                    parsed = json.loads(json_match.group(0))
+                else:
+                    raise ValueError("No JSON object found in response")
+            
         answer = str(parsed.get("answer", "no")).strip().lower()
         confidence = float(parsed.get("confidence", 0.0))
         signals = parsed.get("signals", []) or []
         reason = parsed.get("reason", "")
     except Exception as e:
-        print(f"analyze_page JSON parse failed pg {pg_num}: {e}")
-        answer, confidence, signals, reason = "no", 0.0, [], f"error {e}"
+        print(f"analyze_page JSON parse failed pg {pg_num}: {e}, raw response length: {len(raw) if 'raw' in locals() else 0}")
+        answer, confidence, signals, reason = "no", 0.0, [], f"error {str(e)[:100]}"
 
-    # ---- Decision policy ----
-    primary_vocab = {k.lower() for k in (fence_keywords or [])}
-    primary_vocab |= {
-        "fence","fencing","gate","gates","barrier","guardrail",
-        "chain link","chain-link","chainlink","screen wall","privacy screen"
-    }
-    signals_l = [s.lower() for s in signals if isinstance(s, str)]
-    has_primary_signal = any(any(p in s for p in primary_vocab) for s in signals_l)
-
-    mode = (recall_mode or os.getenv("RECALL_MODE", "balanced")).strip().lower()
-    if mode == "strict":
-        found = (answer == "yes")
-    elif mode == "high":
-        found = (answer == "yes") or (confidence >= 0.55 and has_primary_signal)
-    else:  # balanced
-        found = (answer == "yes") or (confidence >= 0.65 and has_primary_signal)
+    # ---- Simplified Decision policy ----
+    # Use the LLM's direct answer as the primary decision
+    found = (answer == "yes")
 
     # Short snippet only (<= ~100 chars around first hit)
     snippet = extract_snippet(comprehensive_text, fence_keywords) if found else None
@@ -744,10 +779,26 @@ def get_fence_related_text_boxes(
                 else:
                     plur = " ".join(toks[:-1] + [last + "s"])
                     out.add(plur); out.add(plur.replace(" ", "-"))
-            # collapsed (“screenwall”) variant for two-word phrases
+            # collapsed ("screenwall") variant for two-word phrases
             if len(base.split()) == 2:
                 out.add(base.replace(" ", ""))
         return sorted(set(out))
+
+    def _prioritize_fence_content(lines, fence_keywords):
+        """Prioritize lines containing fence-related keywords for better highlighting."""
+        fence_lines = []
+        other_lines = []
+        
+        for line in lines:
+            line_lower = line.lower()
+            if any(keyword.lower() in line_lower for keyword in fence_keywords):
+                fence_lines.append(line)
+            else:
+                other_lines.append(line)
+        
+        # Return fence lines first, then other lines (limited)
+        prioritized = fence_lines + other_lines[:50]  # Limit other lines to 50
+        return prioritized
 
     raw_user = [k for k in (fence_keywords_from_app or []) if isinstance(k, str)]
     raw_signals = [k for k in (extra_keywords or []) if isinstance(k, str)]
@@ -794,27 +845,91 @@ def get_fence_related_text_boxes(
     def _expand_spans_with_context(spans, n_tokens, max_idx):
         return [(max(0, a - n_tokens), min(max_idx, b + n_tokens)) for a, b in spans]
 
-    def _tight_boxes_from_spans(tokens_line, spans, pad_px, max_height_mult, gap_split_factor):
+    def _split_segment_by_width(segment, max_width_pts, char_width_med):
+        """Split a token segment into smaller parts that don't exceed max_width_pts."""
+        if not segment: return []
+        
+        segments = []
+        current_seg = []
+        current_width = 0
+        
+        for token in segment:
+            token_width = token["x1"] - token["x0"]
+            
+            # If adding this token would exceed max width, start a new segment
+            if current_seg and current_width + token_width > max_width_pts:
+                if current_seg:  # Only add non-empty segments
+                    segments.append(current_seg)
+                current_seg = [token]
+                current_width = token_width
+            else:
+                current_seg.append(token)
+                current_width += token_width
+        
+        # Add the last segment if it exists
+        if current_seg:
+            segments.append(current_seg)
+        
+        return segments
+
+    def _tight_boxes_from_spans(tokens_line, spans, pad_px, max_height_mult, gap_split_factor, max_box_width_pts=200):
         if not spans: return []
+        
+        # Calculate median character width for better horizontal gap detection
+        char_widths = []
+        for t in tokens_line:
+            if t.get("text") and len(t["text"]) > 0:
+                token_width = t["x1"] - t["x0"]
+                char_width = token_width / len(t["text"])
+                char_widths.append(char_width)
+        
+        char_width_med = median(char_widths) if char_widths else 8.0
         h_med = median([max(1.0, t["y1"] - t["y0"]) for t in tokens_line]) if tokens_line else 8.0
-        gap_thresh = gap_split_factor * h_med
+        
+        # Use character-based gap threshold for horizontal spacing
+        gap_thresh = gap_split_factor * char_width_med * 2.5
+        
         out = []
         for a, b in spans:
             segs, start = [], a
             for j in range(a, b):
-                gap = tokens_line[j+1]["x0"] - tokens_line[j]["x1"]
-                if gap > gap_thresh:
-                    segs.append((start, j)); start = j + 1
+                if j + 1 < len(tokens_line):
+                    gap = tokens_line[j+1]["x0"] - tokens_line[j]["x1"]
+                    if gap > gap_thresh:
+                        segs.append((start, j)); start = j + 1
             segs.append((start, b))
+            
             for sa, sb in segs:
                 seg = tokens_line[sa:sb+1]
+                if not seg: continue
+                
                 x0 = min(t["x0"] for t in seg); x1 = max(t["x1"] for t in seg)
                 ty0 = min(t["y0"] for t in seg); ty1 = max(t["y1"] for t in seg)
                 height = min((ty1 - ty0), max_height_mult * h_med)
                 cy = 0.5 * (ty0 + ty1)
                 y0 = cy - 0.5 * height; y1 = cy + 0.5 * height
-                x0, y0, x1, y1 = _pad_rect(x0, y0, x1, y1, pad=pad_px)
-                out.append((x0, y0, x1, y1))
+                
+                # Extract matched text from the segment
+                matched_text = " ".join(t["text"] for t in seg if t.get("text"))
+                
+                # Check if box width exceeds maximum and split if needed
+                box_width = x1 - x0
+                if box_width > max_box_width_pts:
+                    # Split the segment into smaller parts at natural boundaries
+                    split_segments = _split_segment_by_width(seg, max_box_width_pts, char_width_med)
+                    for split_seg in split_segments:
+                        if not split_seg: continue
+                        sx0 = min(t["x0"] for t in split_seg); sx1 = max(t["x1"] for t in split_seg)
+                        sty0 = min(t["y0"] for t in split_seg); sty1 = max(t["y1"] for t in split_seg)
+                        sheight = min((sty1 - sty0), max_height_mult * h_med)
+                        scy = 0.5 * (sty0 + sty1)
+                        sy0 = scy - 0.5 * sheight; sy1 = scy + 0.5 * sheight
+                        sx0, sy0, sx1, sy1 = _pad_rect(sx0, sy0, sx1, sy1, pad=pad_px)
+                        split_text = " ".join(t["text"] for t in split_seg if t.get("text"))
+                        out.append((sx0, sy0, sx1, sy1, split_text))
+                else:
+                    x0, y0, x1, y1 = _pad_rect(x0, y0, x1, y1, pad=pad_px)
+                    out.append((x0, y0, x1, y1, matched_text))
         return out
 
     def _should_run_ocr_also(text_layer_boxes, tokens_text, pb: bytes):
@@ -869,26 +984,75 @@ def get_fence_related_text_boxes(
         ltoks.sort(key=lambda tt: tt["x0"])
         line_tokens_map[i] = ltoks
 
-    for i, L in enumerate(lines_pl or []):
-        txt = (L.get("text") or "").strip()
-        if not txt: continue
-        ltoks = line_tokens_map.get(i, [])
-        if not ltoks: continue
-        ln_norm = [_canon(t["text"]) for t in ltoks]
-        spans = _find_spans(ln_norm, [pl for pl in phrase_lists], single_set)
-        if not spans: continue
-        spans = _expand_spans_with_context(spans, CONTEXT_TOKENS_TEXT, len(ltoks)-1)
-        for j, (x0, y0, x1, y1) in enumerate(
-            _tight_boxes_from_spans(ltoks, spans, PAD_TEXT, MAX_H_MULT_TEXT, GAP_SPLIT_FACTOR_TEXT)
-        ):
-            final_boxes.append({
-                "id": f"kw_text_{i}_{j}",
-                "text": txt,
-                "x0": round(x0, 2), "y0": round(y0, 2),
-                "x1": round(x1, 2), "y1": round(y1, 2),
-                "type_from_llm": "keyword_line",
-                "tag_from_llm": "KEYWORD_TEXT"
-            })
+    # Process all lines but with smart prioritization for long pages
+    all_lines = lines_pl or []
+    is_long_page = len(all_lines) > 100
+    
+    if is_long_page:
+        print(f"[HL DEBUG] Long page detected ({len(all_lines)} lines). Processing with smart prioritization.")
+        
+        # Process fence-related lines first for better highlighting quality
+        fence_lines_processed = 0
+        other_lines_processed = 0
+        max_other_lines = 100  # Limit non-fence lines to prevent overwhelming
+        
+        for i, L in enumerate(all_lines):
+            txt = (L.get("text") or "").strip()
+            if not txt: continue
+            
+            # Check if this line contains fence keywords
+            is_fence_line = any(keyword.lower() in txt.lower() for keyword in fence_keywords_from_app)
+            
+            # Process fence lines first, then limit other lines
+            if is_fence_line or other_lines_processed < max_other_lines:
+                ltoks = line_tokens_map.get(i, [])
+                if not ltoks: continue
+                ln_norm = [_canon(t["text"]) for t in ltoks]
+                spans = _find_spans(ln_norm, [pl for pl in phrase_lists], single_set)
+                if not spans: continue
+                spans = _expand_spans_with_context(spans, CONTEXT_TOKENS_TEXT, len(ltoks)-1)
+                for j, (x0, y0, x1, y1, matched_text) in enumerate(
+                    _tight_boxes_from_spans(ltoks, spans, PAD_TEXT, MAX_H_MULT_TEXT, GAP_SPLIT_FACTOR_TEXT, 200)
+                ):
+                    final_boxes.append({
+                        "id": f"kw_text_{i}_{j}",
+                        "text": matched_text,  # Store only the matched text span, not the full line
+                        "x0": round(x0, 2), "y0": round(y0, 2),
+                        "x1": round(x1, 2), "y1": round(y1, 2),
+                        "type_from_llm": "keyword_line",
+                        "tag_from_llm": "KEYWORD_TEXT",
+                        "matched_keyword": matched_text,  # Track what was actually matched
+                        "line_context": txt  # Keep full line context in separate field
+                    })
+                
+                if is_fence_line:
+                    fence_lines_processed += 1
+                else:
+                    other_lines_processed += 1
+    else:
+        # Process all lines normally for shorter pages
+        for i, L in enumerate(all_lines):
+            txt = (L.get("text") or "").strip()
+            if not txt: continue
+            ltoks = line_tokens_map.get(i, [])
+            if not ltoks: continue
+            ln_norm = [_canon(t["text"]) for t in ltoks]
+            spans = _find_spans(ln_norm, [pl for pl in phrase_lists], single_set)
+            if not spans: continue
+            spans = _expand_spans_with_context(spans, CONTEXT_TOKENS_TEXT, len(ltoks)-1)
+            for j, (x0, y0, x1, y1, matched_text) in enumerate(
+                _tight_boxes_from_spans(ltoks, spans, PAD_TEXT, MAX_H_MULT_TEXT, GAP_SPLIT_FACTOR_TEXT, 200)
+            ):
+                final_boxes.append({
+                    "id": f"kw_text_{i}_{j}",
+                    "text": matched_text,  # Store only the matched text span, not the full line
+                    "x0": round(x0, 2), "y0": round(y0, 2),
+                    "x1": round(x1, 2), "y1": round(y1, 2),
+                    "type_from_llm": "keyword_line",
+                    "tag_from_llm": "KEYWORD_TEXT",
+                    "matched_keyword": matched_text,  # Track what was actually matched
+                    "line_context": txt  # Keep full line context in separate field
+                })
 
     # Decide if we should ALSO run OCR (mixed page)
     run_ocr_anyway = _should_run_ocr_also(final_boxes, tokens_text, page_bytes)
@@ -926,16 +1090,18 @@ def get_fence_related_text_boxes(
             spans = _find_spans(ln_norm, [pl for pl in phrase_lists], single_set)
             if not spans: continue
             spans = _expand_spans_with_context(spans, CONTEXT_TOKENS_OCR, len(ltoks)-1)
-            for j, (x0, y0, x1, y1) in enumerate(
-                _tight_boxes_from_spans(ltoks, spans, PAD_OCR, MAX_H_MULT_OCR, GAP_SPLIT_FACTOR_OCR)
+            for j, (x0, y0, x1, y1, matched_text) in enumerate(
+                _tight_boxes_from_spans(ltoks, spans, PAD_OCR, MAX_H_MULT_OCR, GAP_SPLIT_FACTOR_OCR, 200)
             ):
                 ocr_boxes.append({
                     "id": f"kw_ocr_{i}_{j}",
-                    "text": txt,
+                    "text": matched_text,  # Store only the matched text span, not the full line
                     "x0": round(x0, 2), "y0": round(y0, 2),
                     "x1": round(x1, 2), "y1": round(y1, 2),
                     "type_from_llm": "keyword_line",
-                    "tag_from_llm": "KEYWORD_OCR"
+                    "tag_from_llm": "KEYWORD_OCR",
+                    "matched_keyword": matched_text,  # Track what was actually matched
+                    "line_context": txt  # Keep full line context in separate field
                 })
 
         if ocr_boxes:

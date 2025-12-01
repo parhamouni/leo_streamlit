@@ -1,0 +1,76 @@
+{
+  "page_number": 2,
+  "extraction_results": [
+    {
+      "keyword": "MANUAL ROLLING GATES",
+      "indicator": "0113",
+      "description": "MANUAL ROLLING GATES",
+      "x0": 599.8797607421875,
+      "y0": 1416.72119140625,
+      "x1": 768.71142578125,
+      "y1": 1426.634765625,
+      "bbox_source": "pdf_words",
+      "matched_text": "0113 MANUAL ROLLING GATES",
+      "chunk_type": "table",
+      "chunk_id": "236b6817-05b4-4706-81bc-fd41dbac5a5d"
+    },
+    {
+      "keyword": "BOLLARD",
+      "indicator": "0508",
+      "description": "CONCRETE FILLED 6\" DIA STEEL PIPE BOLLARD - PANTED",
+      "x0": 599.8797607421875,
+      "y0": 1578.8411865234375,
+      "x1": 947.8070678710938,
+      "y1": 1588.7547607421875,
+      "bbox_source": "pdf_words",
+      "matched_text": "0508 CONCRETE FILLED 6\u201d DIA. STEEL PIPE BOLLARD \u2013 PAINTED",
+      "chunk_type": "table",
+      "chunk_id": "236b6817-05b4-4706-81bc-fd41dbac5a5d"
+    },
+    {
+      "keyword": "SCREEN WALL",
+      "indicator": "0401",
+      "description": "CMU PARKING SCREEN WALL COURGING AND FINGH PER ELEVATIONS",
+      "x0": 599.8797607421875,
+      "y0": 1524.8411865234375,
+      "x1": 1001.03125,
+      "y1": 1534.7547607421875,
+      "bbox_source": "pdf_words",
+      "matched_text": "0401 CMU PARKING SCREEN WALL. COURSING AND FINISH PER ELEVATIONS",
+      "chunk_type": "table",
+      "chunk_id": "236b6817-05b4-4706-81bc-fd41dbac5a5d"
+    },
+    {
+      "keyword": "SCREEN WALL",
+      "indicator": "0402",
+      "description": "CMU TRUCK COURT SCREEN WALL, COURSING AND FINGH PER ELEVATIONS",
+      "x0": 599.8797607421875,
+      "y0": 1524.8411865234375,
+      "x1": 1001.03125,
+      "y1": 1534.7547607421875,
+      "bbox_source": "pdf_words",
+      "matched_text": "0401 CMU PARKING SCREEN WALL. COURSING AND FINISH PER ELEVATIONS",
+      "chunk_type": "table",
+      "chunk_id": "236b6817-05b4-4706-81bc-fd41dbac5a5d"
+    },
+    {
+      "keyword": "SCREEN WALL",
+      "indicator": "0403",
+      "description": "STEPPED CMU SCREEN WALL AT RAMP",
+      "x0": 599.8797607421875,
+      "y0": 1524.8411865234375,
+      "x1": 1001.03125,
+      "y1": 1534.7547607421875,
+      "bbox_source": "pdf_words",
+      "matched_text": "0401 CMU PARKING SCREEN WALL. COURSING AND FINISH PER ELEVATIONS",
+      "chunk_type": "table",
+      "chunk_id": "236b6817-05b4-4706-81bc-fd41dbac5a5d"
+    }
+  ],
+  "figure_highlights": [],
+  "summary": {
+    "total_extractions": 5,
+    "with_indicators": 5,
+    "figure_highlights": 0
+  }
+}

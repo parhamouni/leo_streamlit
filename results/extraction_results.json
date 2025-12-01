@@ -1,0 +1,304 @@
+{
+  "0": {
+    "page": 0,
+    "width": 2592.0,
+    "height": 1728.0,
+    "definitions": [
+      {
+        "keyword": "EXISTING TEMPORARY W.I. FENCE",
+        "indicator": "26",
+        "description": "26 (number in a circle) EXISTING TEMPORARY W.I. FENCE TO BE REMOVED",
+        "x0": 1784.0798149108887,
+        "y0": 932.6300811767578,
+        "x1": 2007.7832050323486,
+        "y1": 943.2596626281738,
+        "bbox_source": "ocr",
+        "matched_text": "26 ) EXISTING TEMPORARY W.I. FENCE TO BE REMOVED",
+        "chunk_type": "table",
+        "chunk_id": "0de63a8b-7fb5-48e5-918f-9be221a7c2c3"
+      }
+    ],
+    "instances": [
+      {
+        "indicator": "26",
+        "text": "26",
+        "x0": 486.2310862541199,
+        "y0": 190.87028074264526,
+        "x1": 500.09699535369873,
+        "y1": 199.18908977508545,
+        "figure_chunk_id": "8c0d1eb3-6bc0-47a5-a006-f8a98d3c40a6"
+      },
+      {
+        "indicator": "26",
+        "text": "26",
+        "x0": 960.4450693130493,
+        "y0": 191.7946000099182,
+        "x1": 973.8487672805786,
+        "y1": 199.18908977508545,
+        "figure_chunk_id": "8c0d1eb3-6bc0-47a5-a006-f8a98d3c40a6"
+      },
+      {
+        "indicator": "26",
+        "text": "26",
+        "x0": 1433.7346687316895,
+        "y0": 191.33244037628174,
+        "x1": 1446.6761169433594,
+        "y1": 198.72693014144897,
+        "figure_chunk_id": "8c0d1eb3-6bc0-47a5-a006-f8a98d3c40a6"
+      },
+      {
+        "indicator": "26",
+        "text": "26",
+        "x0": 1525.8634033203125,
+        "y0": 962.60009765625,
+        "x1": 1536.4320068359375,
+        "y1": 972.4711303710938,
+        "figure_chunk_id": "8c0d1eb3-6bc0-47a5-a006-f8a98d3c40a6"
+      },
+      {
+        "indicator": "26",
+        "text": "26",
+        "x0": 1525.8634033203125,
+        "y0": 488.600341796875,
+        "x1": 1536.4320068359375,
+        "y1": 498.47137451171875,
+        "figure_chunk_id": "8c0d1eb3-6bc0-47a5-a006-f8a98d3c40a6"
+      },
+      {
+        "indicator": "26",
+        "text": "26",
+        "x0": 1525.8634033203125,
+        "y0": 1436.1201171875,
+        "x1": 1536.4320068359375,
+        "y1": 1445.9912109375,
+        "figure_chunk_id": "8c0d1eb3-6bc0-47a5-a006-f8a98d3c40a6"
+      }
+    ]
+  },
+  "1": {
+    "page": 1,
+    "width": 2592.0,
+    "height": 1728.0,
+    "definitions": [
+      {
+        "keyword": "MANUAL ROLLING GATES",
+        "indicator": "0113",
+        "description": "0113 MANUAL ROLLING GATES",
+        "x0": 599.8797607421875,
+        "y0": 1416.72119140625,
+        "x1": 768.71142578125,
+        "y1": 1426.634765625,
+        "bbox_source": "pdf_words",
+        "matched_text": "0113 MANUAL ROLLING GATES",
+        "chunk_type": "table",
+        "chunk_id": "0a0a5ae0-40da-4d71-9877-071666bb1f6b"
+      },
+      {
+        "keyword": "CMU PARKING SCREEN WALL COURSING AND FINISH PER ELEVATIONS",
+        "indicator": "0401",
+        "description": "0401 CMU PARKING SCREEN WALL COURSING AND FINISH PER ELEVATIONS",
+        "x0": 599.8797607421875,
+        "y0": 1524.8411865234375,
+        "x1": 1001.03125,
+        "y1": 1534.7547607421875,
+        "bbox_source": "pdf_words",
+        "matched_text": "0401 CMU PARKING SCREEN WALL. COURSING AND FINISH PER ELEVATIONS",
+        "chunk_type": "table",
+        "chunk_id": "0a0a5ae0-40da-4d71-9877-071666bb1f6b"
+      },
+      {
+        "keyword": "CMU TRUCK COURT SCREEN WALL, COURSING AND FINISH PER ELEVATIONS",
+        "indicator": "0402",
+        "description": "0402 CMU TRUCK COURT SCREEN WALL, COURSING AND FINISH PER ELEVATIONS",
+        "x0": 599.8797607421875,
+        "y0": 1538.2811279296875,
+        "x1": 1027.43115234375,
+        "y1": 1548.1947021484375,
+        "bbox_source": "pdf_words",
+        "matched_text": "0402 CMU TRUCK COURT SCREEN WALL. COURSING AND FINISH PER ELEVATIONS",
+        "chunk_type": "table",
+        "chunk_id": "0a0a5ae0-40da-4d71-9877-071666bb1f6b"
+      },
+      {
+        "keyword": "STEPPED CMU SCREEN WALL AT RAMP",
+        "indicator": "0403",
+        "description": "0403 STEPPED CMU SCREEN WALL AT RAMP",
+        "x0": 599.8797607421875,
+        "y0": 1544.9622802734375,
+        "x1": 1528.040283203125,
+        "y1": 1569.25,
+        "bbox_source": "pdf_words",
+        "matched_text": "0403 STEPPED CMU SCREEN WALL AT RAMP AVE.",
+        "chunk_type": "table",
+        "chunk_id": "0a0a5ae0-40da-4d71-9877-071666bb1f6b"
+      }
+    ],
+    "instances": [
+      {
+        "indicator": "0401",
+        "text": "0401",
+        "x0": 780.4796752929688,
+        "y0": 836.857177734375,
+        "x1": 807.0316772460938,
+        "y1": 846.7998046875,
+        "figure_chunk_id": "3f7884ae-6916-4805-a460-480fba533775"
+      },
+      {
+        "indicator": "0402",
+        "text": "0402",
+        "x0": 728.5197143554688,
+        "y0": 276.09759521484375,
+        "x1": 757.22802734375,
+        "y1": 286.04010009765625,
+        "figure_chunk_id": "3f7884ae-6916-4805-a460-480fba533775"
+      },
+      {
+        "indicator": "0113",
+        "text": "0113",
+        "x0": 1094.279541015625,
+        "y0": 354.2145080566406,
+        "x1": 1117.4832763671875,
+        "y1": 364.16070556640625,
+        "figure_chunk_id": "3f7884ae-6916-4805-a460-480fba533775"
+      },
+      {
+        "indicator": "0402",
+        "text": "0402",
+        "x0": 1091.6395263671875,
+        "y0": 336.8144836425781,
+        "x1": 1120.352783203125,
+        "y1": 346.76068115234375,
+        "figure_chunk_id": "3f7884ae-6916-4805-a460-480fba533775"
+      },
+      {
+        "indicator": "0403",
+        "text": "0403",
+        "x0": 342.1198425292969,
+        "y0": 424.4143371582031,
+        "x1": 370.7237548828125,
+        "y1": 434.36053466796875,
+        "figure_chunk_id": "3f7884ae-6916-4805-a460-480fba533775"
+      }
+    ]
+  },
+  "2": {
+    "page": 2,
+    "width": 2592.0,
+    "height": 1728.0,
+    "definitions": [
+      {
+        "keyword": "MANUAL ROLLING GATES",
+        "indicator": "0113",
+        "description": "0113 MANUAL ROLLING GATES",
+        "x0": 1049.3995361328125,
+        "y0": 1427.76123046875,
+        "x1": 1218.1116943359375,
+        "y1": 1437.6748046875,
+        "bbox_source": "pdf_words",
+        "matched_text": "0113 MANUAL ROLLING GATES",
+        "chunk_type": "table",
+        "chunk_id": "4f25b905-2690-44f5-ab4f-0d2679f6d9cd"
+      },
+      {
+        "keyword": "CMU PARKING SCREEN WALL",
+        "indicator": "0401",
+        "description": "0401 CMU PARKING SCREEN WALL. COURSING AND FINGH PER ELEVATIONS",
+        "x0": 963.5982666015625,
+        "y0": 1535.7611083984375,
+        "x1": 1450.4312744140625,
+        "y1": 1548.07958984375,
+        "bbox_source": "pdf_words",
+        "matched_text": "COMPANY. 0401 CMU PARKING SCREEN WALL. COURSING AND FINISH PER ELEVATIONS",
+        "chunk_type": "table",
+        "chunk_id": "4f25b905-2690-44f5-ab4f-0d2679f6d9cd"
+      },
+      {
+        "keyword": "CMU TRUCK COURT SCREEN WALL",
+        "indicator": "0402",
+        "description": "0402 CMU TRUCK COURT SCREEN WALL. COURSING AND FINGH PER ELEVATIONS",
+        "x0": 1049.399658203125,
+        "y0": 1549.3211669921875,
+        "x1": 1476.8314208984375,
+        "y1": 1559.2347412109375,
+        "bbox_source": "pdf_words",
+        "matched_text": "0402 CMU TRUCK COURT SCREEN WALL. COURSING AND FINISH PER ELEVATIONS",
+        "chunk_type": "table",
+        "chunk_id": "4f25b905-2690-44f5-ab4f-0d2679f6d9cd"
+      },
+      {
+        "keyword": "STEPPED CMU SCREEN WALL AT RAMP",
+        "indicator": "0403",
+        "description": "0403 STEPPED CMU SCREEN WALL AT RAMP",
+        "x0": 1049.399658203125,
+        "y0": 1562.7611083984375,
+        "x1": 1289.4779052734375,
+        "y1": 1572.6746826171875,
+        "bbox_source": "pdf_words",
+        "matched_text": "0403 STEPPED CMU SCREEN WALL AT RAMP",
+        "chunk_type": "table",
+        "chunk_id": "4f25b905-2690-44f5-ab4f-0d2679f6d9cd"
+      }
+    ],
+    "instances": [
+      {
+        "indicator": "0401",
+        "text": "0401",
+        "x0": 1272.3594970703125,
+        "y0": 1036.8968505859375,
+        "x1": 1298.92041015625,
+        "y1": 1046.83984375,
+        "figure_chunk_id": "70263757-773b-4b59-8305-84cf334accd6"
+      },
+      {
+        "indicator": "0402",
+        "text": "0402",
+        "x0": 1194.95947265625,
+        "y0": 195.81710815429688,
+        "x1": 1223.68115234375,
+        "y1": 205.76014709472656,
+        "figure_chunk_id": "70263757-773b-4b59-8305-84cf334accd6"
+      },
+      {
+        "indicator": "0113",
+        "text": "0113",
+        "x0": 1742.279296875,
+        "y0": 312.9371032714844,
+        "x1": 1765.491455078125,
+        "y1": 322.8801574707031,
+        "figure_chunk_id": "70263757-773b-4b59-8305-84cf334accd6"
+      },
+      {
+        "indicator": "0402",
+        "text": "0402",
+        "x0": 1739.519287109375,
+        "y0": 286.7770690917969,
+        "x1": 1768.240966796875,
+        "y1": 296.7201232910156,
+        "figure_chunk_id": "70263757-773b-4b59-8305-84cf334accd6"
+      },
+      {
+        "indicator": "0403",
+        "text": "0403",
+        "x0": 615.3597412109375,
+        "y0": 418.1769714355469,
+        "x1": 643.9716796875,
+        "y1": 428.1200256347656,
+        "figure_chunk_id": "70263757-773b-4b59-8305-84cf334accd6"
+      }
+    ]
+  },
+  "3": {
+    "page": 3,
+    "width": 2592.0,
+    "height": 1728.0,
+    "definitions": [],
+    "instances": []
+  },
+  "4": {
+    "page": 4,
+    "width": 3024.0,
+    "height": 2160.0,
+    "definitions": [],
+    "instances": []
+  }
+}
