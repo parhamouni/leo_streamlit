@@ -1,0 +1,511 @@
+"""
+utils_ade.py - Unified ADE Utility (Native Lines + Robust Overlap + DEBUG LOGGING)
+"""
+
+import re
+import json
+import time
+import requests
+from typing import List, Dict, Optional, Tuple
+from io import BytesIO
+
+import fitz  # PyMuPDF
+from PIL import Image, ImageDraw
+
+# Optional Google Cloud imports
+try:
+    from google.cloud import documentai_v1 as documentai
+    from google.oauth2 import service_account
+    GOOGLE_CLOUD_AVAILABLE = True
+except ImportError:
+    GOOGLE_CLOUD_AVAILABLE = False
+    documentai = None
+    print("[DEBUG] Google Cloud SDK not found.")
+
+# ==============================================================================
+# 1. ADE (LandingAI) Integration
+# ==============================================================================
+
+ADE_PARSE_ENDPOINT = "https://api.va.landing.ai/v1/ade/parse"
+
+
+def ade_parse_document(pdf_bytes: bytes, api_key: str, zdr: bool = False) -> Dict:
+    print(f"[DEBUG] Starting ADE Parsing for document ({len(pdf_bytes)} bytes)...")
+    if not api_key:
+        return {"success": False, "error": "Missing ADE API Key"}
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    files = {"document": ("document.pdf", pdf_bytes, "application/pdf")}
+    data = {"options": json.dumps({"zdr": zdr})} if zdr else {}
+
+    for attempt in range(3):
+        try:
+            print(f"[DEBUG] ADE API Request - Attempt {attempt+1}")
+            response = requests.post(
+                ADE_PARSE_ENDPOINT,
+                files=files,
+                data=data,
+                headers=headers,
+                timeout=600  # 10 minutes for large architectural PDFs
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            chunks = result.get("chunks", [])
+            pages = {c.get("grounding", {}).get("page", 0) for c in chunks}
+            total_pages = max(pages) + 1 if pages else 0
+            print(f"[DEBUG] ADE Success! Found {len(chunks)} chunks across {total_pages} pages.")
+
+            return {
+                "success": True,
+                "data": {
+                    "chunks": chunks,
+                    "total_pages": total_pages,
+                    "raw": result
+                }
+            }
+        except Exception as e:
+            print(f"[DEBUG] ADE Attempt {attempt+1} Failed: {e}")
+            if attempt == 2:
+                return {"success": False, "error": str(e)}
+            time.sleep(2 * (attempt + 1))
+
+    return {"success": False, "error": "Unknown error after retries"}
+
+
+def align_ade_chunks_to_page(ade_result: Dict, page_idx: int, page_width: float, page_height: float) -> List[Dict]:
+    chunks = ade_result.get("data", {}).get("chunks", [])
+    page_chunks = []
+    for chunk in chunks:
+        grounding = chunk.get("grounding", {})
+        if grounding.get("page") != page_idx:
+            continue
+
+        box = grounding.get("box", {})
+        x0 = float(box.get("left", 0.0)) * page_width
+        y0 = float(box.get("top", 0.0)) * page_height
+        x1 = float(box.get("right", 1.0)) * page_width
+        y1 = float(box.get("bottom", 1.0)) * page_height
+
+        page_chunks.append({
+            "id": chunk.get("id", ""),
+            "type": chunk.get("type", "unknown"),
+            "text": chunk.get("text") or chunk.get("markdown") or "",
+            "markdown": chunk.get("markdown", ""),
+            "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+            "bbox": (x0, y0, x1, y1)
+        })
+    return page_chunks
+
+
+def segment_chunks(chunks: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    legend_like = []
+    figure_like = []
+    for chunk in chunks:
+        raw_type = (chunk.get("type") or "").lower()
+        text_lower = (chunk.get("text") or "").lower()
+        is_figure = raw_type in {"figure", "architectural_drawing"}
+        has_legend_hint = any(token in text_lower for token in {"legend", "keynote", "abbreviation", "symbol"})
+
+        if not is_figure or has_legend_hint:
+            legend_like.append(chunk)
+        elif is_figure:
+            figure_like.append(chunk)
+    print(f"[DEBUG] Segmented: {len(legend_like)} Legend-like chunks, {len(figure_like)} Figure-like chunks.")
+    return legend_like, figure_like
+
+
+# ==============================================================================
+# 2. Google Cloud Document AI (OCR) - SAFE HIGH DPI (DEBUGGED)
+# ==============================================================================
+
+_DOCAI_CLIENT_CACHE = None
+
+
+def get_docai_client(google_cloud_config: Dict):
+    global _DOCAI_CLIENT_CACHE
+    if _DOCAI_CLIENT_CACHE:
+        return _DOCAI_CLIENT_CACHE
+    if not GOOGLE_CLOUD_AVAILABLE:
+        print("[DEBUG] Google Cloud libraries missing.")
+        return None
+
+    try:
+        service_info = google_cloud_config.get("service_account_info")
+        if service_info:
+            creds = service_account.Credentials.from_service_account_info(service_info)
+            _DOCAI_CLIENT_CACHE = documentai.DocumentProcessorServiceClient(credentials=creds)
+            return _DOCAI_CLIENT_CACHE
+    except Exception as e:
+        print(f"[DEBUG] ❌ Error creating DocAI client: {e}")
+        return None
+
+
+def run_google_ocr_blocks(page_bytes: bytes, google_cloud_config: Dict, w: float, h: float) -> List[Dict]:
+    print("[DEBUG] Starting Google OCR...")
+    client = get_docai_client(google_cloud_config)
+    if not client:
+        return []
+
+    project_id = google_cloud_config.get("project_number")
+    location = google_cloud_config.get("location")
+    processor_id = google_cloud_config.get("processor_id")
+    name = f"projects/{project_id}/locations/{location}/processors/{processor_id}"
+
+    doc = fitz.open(stream=page_bytes, filetype="pdf")
+    page = doc[0]
+
+    # --- DYNAMIC ZOOM ---
+    max_dimension = 4000.0
+    current_max = max(page.rect.width, page.rect.height)
+    zoom = min(3.0, max_dimension / current_max)
+    print(f"[DEBUG] Rendering page image with Zoom: {zoom:.2f}...")
+
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+
+    # --- JPEG COMPRESSION ---
+    image_content = pix.tobytes("jpeg", jpg_quality=85)
+    img_size_mb = len(image_content) / (1024 * 1024)
+    print(f"[DEBUG] Image rendered. Size: {img_size_mb:.2f} MB. Sending to Google API...")
+
+    raw_document = documentai.RawDocument(content=image_content, mime_type="image/jpeg")
+    request = documentai.ProcessRequest(name=name, raw_document=raw_document)
+
+    try:
+        result = client.process_document(request=request)
+        doc_result = result.document
+        print(f"[DEBUG] Google API returned successfully. Text length: {len(doc_result.text)}")
+    except Exception as e:
+        print(f"[DEBUG] ❌ DocAI Processing Failed: {e}")
+        return []
+
+    if not doc_result.pages:
+        return []
+    ocr_page = doc_result.pages[0]
+
+    ocr_lines = []
+
+    for paragraph in ocr_page.paragraphs:
+        text_content = ""
+        layout = paragraph.layout
+        for segment in layout.text_anchor.text_segments:
+            text_content += doc_result.text[segment.start_index:segment.end_index]
+
+        text_content = text_content.strip()
+        if not text_content:
+            continue
+
+        vertices = layout.bounding_poly.normalized_vertices
+        if not vertices:
+            continue
+
+        xs = [v.x for v in vertices]
+        ys = [v.y for v in vertices]
+
+        ocr_lines.append({
+            "text": text_content,
+            "x0": min(xs) * w, "y0": min(ys) * h,
+            "x1": max(xs) * w, "y1": max(ys) * h,
+            "source": "ocr_paragraph"
+        })
+
+    print(f"[DEBUG] OCR extraction complete. Found {len(ocr_lines)} paragraphs.")
+    return ocr_lines
+
+
+# ==============================================================================
+# 3. PDF Native Text Extraction
+# ==============================================================================
+
+
+def get_native_pdf_lines(page: fitz.Page) -> List[Dict]:
+    structure = page.get_text("dict")
+    lines = []
+    for block in structure.get("blocks", []):
+        if "lines" in block:
+            for line in block["lines"]:
+                text = " ".join(span["text"] for span in line["spans"]).strip()
+                bbox = line["bbox"]
+                if text:
+                    lines.append({
+                        "text": text,
+                        "x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3],
+                        "source": "pdf_native"
+                    })
+    print(f"[DEBUG] PDF Native extraction: Found {len(lines)} lines.")
+    return lines
+
+
+# ==============================================================================
+# 4. Matching Logic (Center-Point Strategy)
+# ==============================================================================
+
+
+def is_center_inside(item_box: Dict, chunk_box: Tuple[float, float, float, float], tolerance: float = 15.0) -> bool:
+    item_cx = (item_box["x0"] + item_box["x1"]) / 2
+    item_cy = (item_box["y0"] + item_box["y1"]) / 2
+    cx0, cy0, cx1, cy1 = chunk_box
+
+    inside_x = (cx0 - tolerance) <= item_cx <= (cx1 + tolerance)
+    inside_y = (cy0 - tolerance) <= item_cy <= (cy1 + tolerance)
+    return inside_x and inside_y
+
+
+def find_best_bbox(search_text: str, pdf_lines: List[Dict], ocr_lines: List[Dict], chunk_bbox: Tuple[float, float, float, float], **kwargs) -> Optional[Dict]:
+    if not search_text:
+        return None
+    target = re.sub(r'[^0-9a-zA-Z]', '', search_text).lower()
+    if not target:
+        return None
+
+    def check_candidates(candidates):
+        for line in candidates:
+            line_clean = re.sub(r'[^0-9a-zA-Z]', '', line["text"]).lower()
+            if target not in line_clean:
+                continue
+            # Global search override (if chunk is huge) or local check
+            if chunk_bbox[2] > 5000 or is_center_inside(line, chunk_bbox):
+                return line
+        return None
+
+    match = check_candidates(pdf_lines)
+    if match:
+        return match
+    match = check_candidates(ocr_lines)
+    if match:
+        return match
+    return None
+
+
+# ==============================================================================
+# 5. Keyword & Indicator Extraction
+# ==============================================================================
+
+
+def llm_extract_fence_elements(llm, text: str, keywords: List[str], max_items: int = 100) -> List[Dict]:
+    if not llm or not text:
+        return []
+    hint_keywords = ", ".join(sorted(set(keywords)))
+    print(f"[DEBUG] Asking LLM to extract items from text length {len(text)}...")
+
+    analysis_prompt = f"""
+You are an assistant reviewing engineering drawing documentation. Extract fence-related
+legend entries, callouts or tags and provide paired indicator + text elements.
+Only return items that clearly map to: {hint_keywords}.
+
+Text to analyse:
+<TEXT>
+{text.strip()[:4000]}
+</TEXT>
+
+Respond with a JSON array where each element has:
+- "indicator": the numeric or symbolic tag (e.g., "1", "F-3", "A", "3301")
+- "text_element": the textual description (e.g., "existing fence", "chain link")
+- "description": concise sentence on how the element relates to fencing
+"""
+    try:
+        raw_response = llm.invoke(analysis_prompt) if hasattr(llm, "invoke") else llm(analysis_prompt)
+        response_text = getattr(raw_response, "content", str(raw_response))
+    except Exception as exc:
+        print(f"[DEBUG] ⚠️ LLM call failed: {exc}")
+        return []
+
+    parsed = []
+    try:
+        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+        if json_match:
+            parsed_json = json.loads(json_match.group(0))
+            if isinstance(parsed_json, list):
+                for item in parsed_json:
+                    if not isinstance(item, dict):
+                        continue
+                    ind = str(item.get("indicator") or "").strip()
+                    txt = str(item.get("text_element") or "").strip()
+                    desc = str(item.get("description") or "").strip()
+                    if ind or txt:
+                        parsed.append({"indicator": ind, "text_element": txt, "description": desc})
+    except Exception:
+        pass
+    print(f"[DEBUG] LLM found {len(parsed)} candidates.")
+    return parsed
+
+
+def extract_legend_entries(
+    legend_chunks: List[Dict],
+    pdf_lines: List[Dict],
+    ocr_lines: List[Dict],
+    fence_keywords: List[str],
+    llm
+) -> List[Dict]:
+    print("[DEBUG] Extracting Legend Entries and Matching BBoxes...")
+    results = []
+
+    # Helper: Make a shortened version of the text
+    def get_substring(text):
+        words = text.split()
+        if len(words) > 4:
+            return " ".join(words[:4])
+        return text
+
+    for chunk in legend_chunks:
+        text = chunk.get("text", "")
+        if not text:
+            continue
+
+        items = llm_extract_fence_elements(llm, text, fence_keywords)
+        chunk_bbox = (chunk["x0"], chunk["y0"], chunk["x1"], chunk["y1"])
+
+        for item in items:
+            desc = item["text_element"]
+            ind = item["indicator"]
+            bbox_desc = None
+            bbox_ind = None
+
+            # A. Description
+            if desc:
+                bbox_desc = find_best_bbox(desc, pdf_lines, ocr_lines, chunk_bbox)
+                if not bbox_desc:
+                    bbox_desc = find_best_bbox(get_substring(desc), pdf_lines, ocr_lines, chunk_bbox)
+                if not bbox_desc:
+                    bbox_desc = find_best_bbox(desc, pdf_lines, ocr_lines, (0, 0, 10000, 10000))
+
+            # B. Indicator
+            if ind:
+                bbox_ind = find_best_bbox(ind, pdf_lines, ocr_lines, chunk_bbox)
+                if not bbox_ind:
+                    bbox_ind = find_best_bbox(ind, pdf_lines, ocr_lines, (0, 0, 10000, 10000))
+
+            if bbox_desc:
+                results.append({
+                    "indicator": ind,
+                    "keyword": desc,
+                    "description": item["description"],
+                    "x0": bbox_desc["x0"], "y0": bbox_desc["y0"],
+                    "x1": bbox_desc["x1"], "y1": bbox_desc["y1"],
+                    "source": bbox_desc.get("source", "unknown") + "_desc"
+                })
+
+            if bbox_ind:
+                is_duplicate = False
+                if bbox_desc:
+                    if abs(bbox_ind["x0"] - bbox_desc["x0"]) < 5.0 and abs(bbox_ind["y0"] - bbox_desc["y0"]) < 5.0:
+                        is_duplicate = True
+                if not is_duplicate:
+                    results.append({
+                        "indicator": ind,
+                        "keyword": ind,
+                        "description": "Indicator Code",
+                        "x0": bbox_ind["x0"], "y0": bbox_ind["y0"],
+                        "x1": bbox_ind["x1"], "y1": bbox_ind["y1"],
+                        "source": bbox_ind.get("source", "unknown") + "_ind"
+                    })
+    print(f"[DEBUG] Finished Legend Extraction. Total mapped items: {len(results)}")
+    return results
+
+
+def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Dict], all_tokens: List[Dict]) -> List[Dict]:
+    print("[DEBUG] Finding Instances in Figures...")
+    instances = []
+    indicators_to_find = {item["indicator"] for item in legend_entries if item["indicator"]}
+
+    if not indicators_to_find:
+        return []
+
+    figure_tokens = []
+    for chunk in figure_chunks:
+        cx0, cy0, cx1, cy1 = chunk["x0"], chunk["y0"], chunk["x1"], chunk["y1"]
+        ft = [t for t in all_tokens if t["x0"] >= cx0 and t["y0"] >= cy0 and t["x1"] <= cx1 and t["y1"] <= cy1]
+        figure_tokens.extend(ft)
+
+    for token in figure_tokens:
+        token_text = token["text"].strip()
+        clean_text = re.sub(r'[^\w]', '', token_text)
+        if clean_text in indicators_to_find:
+            instances.append({
+                "indicator": clean_text,
+                "x0": token["x0"], "y0": token["y0"], "x1": token["x1"], "y1": token["y1"],
+                "source": "figure_instance"
+            })
+    print(f"[DEBUG] Found {len(instances)} figure instances.")
+    return instances
+
+
+# ==============================================================================
+# 6. Visualization & Utils
+# ==============================================================================
+
+
+def highlight_page_image(page_image_bytes: bytes, definitions: List[Dict], instances: List[Dict], pdf_width: float, pdf_height: float) -> bytes:
+    print("[DEBUG] Generating Highlighted Image...")
+    try:
+        img = Image.open(BytesIO(page_image_bytes))
+        draw = ImageDraw.Draw(img, "RGBA")
+        img_w, img_h = img.size
+        scale_x = img_w / pdf_width if pdf_width > 0 else 1.0
+        scale_y = img_h / pdf_height if pdf_height > 0 else 1.0
+
+        def scale_box(box_dict):
+            return [
+                box_dict.get("x0", 0) * scale_x,
+                box_dict.get("y0", 0) * scale_y,
+                box_dict.get("x1", 0) * scale_x,
+                box_dict.get("y1", 0) * scale_y
+            ]
+
+        for d in definitions:
+            box = scale_box(d)
+            draw.rectangle(box, outline=(0, 255, 0, 255), width=3)
+            draw.rectangle(box, fill=(0, 255, 0, 40))
+        for i in instances:
+            box = scale_box(i)
+            draw.rectangle(box, outline=(255, 0, 255, 255), width=3)
+
+        out = BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue()
+    except Exception as e:
+        print(f"[DEBUG] Visualization Error: {e}")
+        return page_image_bytes
+
+
+def create_single_page_pdf(pdf_bytes: bytes, page_index: int) -> bytes:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    new_doc = fitz.open()
+    new_doc.insert_pdf(doc, from_page=page_index, to_page=page_index)
+    out = new_doc.tobytes()
+    doc.close()
+    new_doc.close()
+    return out
+
+
+def debug_visualize_coordinates(page_bytes: bytes, ade_chunks: List[Dict], pdf_lines: List[Dict], ocr_lines: List[Dict], pdf_width: float, pdf_height: float) -> bytes:
+    print("[DEBUG] Generating Layer Visualization...")
+    try:
+        img = Image.open(BytesIO(page_bytes))
+        draw = ImageDraw.Draw(img, "RGBA")
+        img_w, img_h = img.size
+        scale_x = img_w / pdf_width if pdf_width > 0 else 1.0
+        scale_y = img_h / pdf_height if pdf_height > 0 else 1.0
+
+        def get_rect(item):
+            return [
+                item.get("x0", 0) * scale_x,
+                item.get("y0", 0) * scale_y,
+                item.get("x1", 0) * scale_x,
+                item.get("y1", 0) * scale_y
+            ]
+
+        for line in pdf_lines:
+            draw.rectangle(get_rect(line), outline=(0, 0, 255, 128), width=1)
+        for line in ocr_lines:
+            draw.rectangle(get_rect(line), outline=(255, 165, 0, 128), width=1)
+        for chunk in ade_chunks:
+            draw.rectangle(get_rect(chunk), outline=(255, 0, 0, 255), width=3)
+
+        out = BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue()
+    except Exception as e:
+        print(f"[DEBUG] Debug Viz Error: {e}")
+        return page_bytes
