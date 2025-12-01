@@ -164,7 +164,8 @@ if uploaded_file and openai_key and ade_key:
                 # --- DEBUG VISUALIZATION END ---
 
                 # D. Page Classification (optional - skip non-fence pages)
-                page_text = " ".join([line.get("text", "") for line in unified_lines])
+                # Use FULL page text for classification (not fragmented word tokens)
+                page_text = page.get_text()
                 
                 if USE_PAGE_CLASSIFICATION:
                     print(" [APP] Classifying page...")

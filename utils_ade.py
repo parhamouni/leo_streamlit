@@ -974,37 +974,31 @@ def classify_page_fence_related(page_text: str, llm, fence_keywords: List[str] =
     """
     Use LLM to determine if a page contains fence-related content.
     Returns classification result with indicators and keywords found.
+    
+    IMPORTANT: page_text should be full page text from page.get_text(), 
+    NOT fragmented word tokens!
     """
     if not llm or not page_text:
         return {"is_fence_related": False, "confidence": 0.0, "fence_indicators": [], "fence_keywords": [], "reason": "No text or LLM"}
     
-    # Quick keyword pre-check
+    # Quick keyword pre-check - if ANY keyword found, page is fence-related
     text_lower = page_text.lower()
-    quick_keywords = fence_keywords or ["fence", "gate", "barrier", "guardrail", "wall", "cmu", "chain link", "bollard"]
-    has_keyword = any(kw in text_lower for kw in quick_keywords)
+    quick_keywords = fence_keywords or ["fence", "gate", "barrier", "guardrail", "wall", "cmu", "chain link", "bollard", "screen"]
+    found_keywords = [kw for kw in quick_keywords if kw in text_lower]
     
-    if not has_keyword:
+    if not found_keywords:
         print("[DEBUG] Page classification: No fence keywords found (quick check)")
         return {"is_fence_related": False, "confidence": 0.9, "fence_indicators": [], "fence_keywords": [], "reason": "No fence keywords in text"}
     
-    # LLM classification
-    prompt = FENCE_CLASSIFICATION_PROMPT.format(text=page_text[:6000])
-    
-    try:
-        response = llm.invoke(prompt) if hasattr(llm, "invoke") else llm(prompt)
-        response_text = getattr(response, "content", str(response))
-        
-        # Parse JSON response
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if json_match:
-            result = json.loads(json_match.group(0))
-            print(f"[DEBUG] Page classification: fence_related={result.get('is_fence_related')}, confidence={result.get('confidence')}")
-            return result
-    except Exception as e:
-        print(f"[DEBUG] Page classification failed: {e}")
-    
-    # Fallback: keyword-based
-    return {"is_fence_related": has_keyword, "confidence": 0.5, "fence_indicators": [], "fence_keywords": [], "reason": "Fallback to keyword check"}
+    # Keywords found - page IS fence-related (skip LLM to avoid false negatives)
+    print(f"[DEBUG] Page classification: fence_related=True (keywords found: {found_keywords})")
+    return {
+        "is_fence_related": True, 
+        "confidence": 0.8, 
+        "fence_indicators": [], 
+        "fence_keywords": found_keywords, 
+        "reason": f"Keywords found: {', '.join(found_keywords)}"
+    }
 
 
 # ==============================================================================
