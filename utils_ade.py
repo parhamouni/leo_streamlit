@@ -248,7 +248,15 @@ def run_google_ocr_blocks(page_bytes: bytes, google_cloud_config: Dict, pdf_widt
 
 
 def get_native_pdf_lines(page: fitz.Page) -> List[Dict]:
+    """
+    Extract text lines from PDF with coordinates in display space.
+    
+    IMPORTANT: Applies derotation matrix to handle rotated pages.
+    PDF text coordinates are in MediaBox space, but we need display space
+    to match the rendered image coordinates.
+    """
     structure = page.get_text("dict")
+    derotation_matrix = page.derotation_matrix
     lines = []
     for block in structure.get("blocks", []):
         if "lines" in block:
@@ -256,9 +264,13 @@ def get_native_pdf_lines(page: fitz.Page) -> List[Dict]:
                 text = " ".join(span["text"] for span in line["spans"]).strip()
                 bbox = line["bbox"]
                 if text:
+                    # Transform from MediaBox to display coordinates
+                    orig_rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
+                    trans_rect = orig_rect * derotation_matrix
                     lines.append({
                         "text": text,
-                        "x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3],
+                        "x0": trans_rect.x0, "y0": trans_rect.y0, 
+                        "x1": trans_rect.x1, "y1": trans_rect.y1,
                         "source": "pdf_native"
                     })
     print(f"[DEBUG] PDF Native extraction: Found {len(lines)} lines.")

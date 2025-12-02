@@ -433,11 +433,21 @@ if st.session_state.run_analysis_triggered and \
                 )
             
             # Get all page tokens for instance finding
+            # IMPORTANT: Apply derotation matrix to handle rotated pages
+            # page.get_text("words") returns coords in MediaBox space,
+            # but the rendered image is in display space (after rotation)
             native_words = page.get_text("words")
-            all_page_tokens = [
-                {"text": w[4], "x0": w[0], "y0": w[1], "x1": w[2], "y1": w[3]}
-                for w in native_words
-            ]
+            derotation_matrix = page.derotation_matrix
+            all_page_tokens = []
+            for w in native_words:
+                # Transform word bbox from MediaBox to display coordinates
+                orig_rect = fitz.Rect(w[0], w[1], w[2], w[3])
+                trans_rect = orig_rect * derotation_matrix
+                all_page_tokens.append({
+                    "text": w[4], 
+                    "x0": trans_rect.x0, "y0": trans_rect.y0, 
+                    "x1": trans_rect.x1, "y1": trans_rect.y1
+                })
             
             # Find instances in figures
             instances = []
