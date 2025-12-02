@@ -404,7 +404,7 @@ if st.session_state.run_analysis_triggered and \
             
             # Align ADE chunks to this page
             chunks = ade.align_ade_chunks_to_page(st.session_state.ade_result, page_idx, pdf_width, pdf_height)
-            legend_chunks, figure_chunks = ade.segment_chunks(chunks)
+            legend_chunks, figure_chunks, true_legend_chunks = ade.segment_chunks(chunks)
             
             # Get text lines for matching
             pdf_lines = ade.get_native_pdf_lines(page)
@@ -467,10 +467,10 @@ if st.session_state.run_analysis_triggered and \
                 sample = all_page_tokens[0]
                 print(f"[DEBUG] Sample token after transform: '{sample['text']}' at ({sample['x0']:.1f}, {sample['y0']:.1f})")
             
-            # Find instances in figures
+            # Find instances in figures (exclude true legend areas like KEY NOTES)
             instances = []
             if definitions and figure_chunks:
-                instances = ade.find_instances_in_figures(definitions, figure_chunks, all_page_tokens)
+                instances = ade.find_instances_in_figures(definitions, figure_chunks, all_page_tokens, true_legend_chunks)
             
             # DEBUG: Show coordinate info if enabled
             if DEBUG_MODE:
