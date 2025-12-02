@@ -479,6 +479,199 @@ def create_single_page_pdf(pdf_bytes: bytes, page_index: int) -> bytes:
     return out
 
 
+# ==============================================================================
+# 7. Fallback Page Classification (Keyword + LLM)
+# ==============================================================================
+
+
+def scan_page_for_keywords(pdf_lines: List[Dict], ocr_lines: List[Dict], fence_keywords: List[str]) -> Dict:
+    """
+    Scan page text for fence-related keywords.
+    Returns dict with matched keywords and their locations.
+    """
+    all_lines = pdf_lines + ocr_lines
+    combined_text = " ".join(line.get("text", "") for line in all_lines).lower()
+    
+    matches = []
+    matched_lines = []
+    
+    for keyword in fence_keywords:
+        kw_lower = keyword.lower()
+        if kw_lower in combined_text:
+            matches.append(keyword)
+            # Find lines containing this keyword
+            for line in all_lines:
+                if kw_lower in line.get("text", "").lower():
+                    matched_lines.append({
+                        "keyword": keyword,
+                        "text": line.get("text", ""),
+                        "x0": line.get("x0", 0),
+                        "y0": line.get("y0", 0),
+                        "x1": line.get("x1", 0),
+                        "y1": line.get("y1", 0),
+                        "source": line.get("source", "unknown")
+                    })
+    
+    return {
+        "has_keywords": len(matches) > 0,
+        "matched_keywords": list(set(matches)),
+        "matched_lines": matched_lines,
+        "total_text_length": len(combined_text)
+    }
+
+
+def llm_classify_page(llm, page_text: str, fence_keywords: List[str]) -> Dict:
+    """
+    Use LLM to classify if a page is fence-related.
+    Similar to app.py's analyze_page but simpler.
+    """
+    if not llm or not page_text:
+        return {"is_fence_related": False, "confidence": 0.0, "reason": "No LLM or text"}
+    
+    # Truncate if too long
+    text_for_llm = page_text[:8000] if len(page_text) > 8000 else page_text
+    keywords_hint = ", ".join(fence_keywords[:15])
+    
+    prompt = f"""You are analyzing an engineering drawing page to determine if it contains fence-related content.
+
+Keywords to look for: {keywords_hint}
+
+Page text:
+<TEXT>
+{text_for_llm}
+</TEXT>
+
+Analyze the text and determine if this page is about fences, gates, barriers, guardrails, or related elements.
+Look for:
+- Fence specifications, dimensions, or materials
+- Gate details or schedules
+- Barrier or guardrail references
+- Fence post details
+- Chain link, mesh, panel references
+- Any fence-related construction details
+
+Respond with JSON only:
+{{"is_fence_related": true/false, "confidence": 0.0-1.0, "signals": ["keyword1", "keyword2"], "reason": "brief explanation"}}
+"""
+    
+    try:
+        raw_response = llm.invoke(prompt) if hasattr(llm, "invoke") else llm(prompt)
+        response_text = getattr(raw_response, "content", str(raw_response))
+        
+        # Parse JSON from response
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group(0))
+            return {
+                "is_fence_related": result.get("is_fence_related", False),
+                "confidence": float(result.get("confidence", 0.0)),
+                "signals": result.get("signals", []),
+                "reason": result.get("reason", "")
+            }
+    except Exception as e:
+        print(f"[DEBUG] LLM page classification failed: {e}")
+    
+    return {"is_fence_related": False, "confidence": 0.0, "reason": "LLM parsing failed"}
+
+
+def fallback_fence_detection(
+    pdf_lines: List[Dict],
+    ocr_lines: List[Dict],
+    fence_keywords: List[str],
+    llm=None,
+    use_llm_confirmation: bool = True
+) -> Dict:
+    """
+    Fallback detection when ADE doesn't find structured definitions.
+    1. Scan for keywords
+    2. If keywords found and LLM available, confirm with LLM
+    3. Return detection result with matched items
+    """
+    print("[DEBUG] Running fallback fence detection...")
+    
+    # Step 1: Keyword scan
+    keyword_result = scan_page_for_keywords(pdf_lines, ocr_lines, fence_keywords)
+    
+    if not keyword_result["has_keywords"]:
+        print("[DEBUG] No keywords found in fallback scan.")
+        return {
+            "fence_found": False,
+            "method": "keyword_scan",
+            "matched_keywords": [],
+            "matched_lines": [],
+            "llm_result": None
+        }
+    
+    print(f"[DEBUG] Keywords found: {keyword_result['matched_keywords']}")
+    
+    # Step 2: LLM confirmation (if enabled and available)
+    llm_result = None
+    if use_llm_confirmation and llm:
+        all_lines = pdf_lines + ocr_lines
+        page_text = " ".join(line.get("text", "") for line in all_lines)
+        llm_result = llm_classify_page(llm, page_text, fence_keywords)
+        print(f"[DEBUG] LLM classification: {llm_result}")
+        
+        # Use LLM decision if confident
+        if llm_result["confidence"] >= 0.5:
+            return {
+                "fence_found": llm_result["is_fence_related"],
+                "method": "llm_confirmed",
+                "matched_keywords": keyword_result["matched_keywords"],
+                "matched_lines": keyword_result["matched_lines"],
+                "llm_result": llm_result
+            }
+    
+    # Step 3: Fall back to keyword-only decision
+    # If we found keywords, consider it fence-related
+    return {
+        "fence_found": True,
+        "method": "keyword_only",
+        "matched_keywords": keyword_result["matched_keywords"],
+        "matched_lines": keyword_result["matched_lines"],
+        "llm_result": llm_result
+    }
+
+
+def highlight_keyword_matches(page_image_bytes: bytes, matched_lines: List[Dict], pdf_width: float, pdf_height: float) -> bytes:
+    """
+    Highlight keyword matches on the page image.
+    Uses orange color to distinguish from definition (green) and instance (purple) highlights.
+    """
+    if not matched_lines:
+        return page_image_bytes
+    
+    try:
+        img = Image.open(BytesIO(page_image_bytes))
+        draw = ImageDraw.Draw(img, "RGBA")
+        img_w, img_h = img.size
+        scale_x = img_w / pdf_width if pdf_width > 0 else 1.0
+        scale_y = img_h / pdf_height if pdf_height > 0 else 1.0
+        
+        for line in matched_lines:
+            box = [
+                line.get("x0", 0) * scale_x,
+                line.get("y0", 0) * scale_y,
+                line.get("x1", 0) * scale_x,
+                line.get("y1", 0) * scale_y
+            ]
+            # Orange outline for keyword matches
+            draw.rectangle(box, outline=(255, 165, 0, 255), width=2)
+            draw.rectangle(box, fill=(255, 165, 0, 40))
+        
+        out = BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue()
+    except Exception as e:
+        print(f"[DEBUG] Keyword highlight error: {e}")
+        return page_image_bytes
+
+
+# ==============================================================================
+# 8. Debug Visualization
+# ==============================================================================
+
+
 def debug_visualize_coordinates(page_bytes: bytes, ade_chunks: List[Dict], pdf_lines: List[Dict], ocr_lines: List[Dict], pdf_width: float, pdf_height: float) -> bytes:
     print("[DEBUG] Generating Layer Visualization...")
     try:

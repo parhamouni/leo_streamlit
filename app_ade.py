@@ -442,26 +442,56 @@ if st.session_state.run_analysis_triggered and \
                 ]
                 instances = ade.find_instances_in_figures(definitions, figure_chunks, all_figure_tokens)
             
-            # Determine if this is a fence page
+            # Determine if this is a fence page (primary detection)
             fence_found = len(definitions) > 0 or len(instances) > 0
             
-            # Build text snippet from definitions
+            # FALLBACK: If ADE didn't find definitions, run keyword + LLM fallback
+            fallback_result = None
+            keyword_matches = []
+            if not fence_found:
+                print(f"[APP] Page {page_num}: No ADE definitions found, running fallback detection...")
+                fallback_result = ade.fallback_fence_detection(
+                    pdf_lines=pdf_lines,
+                    ocr_lines=ocr_lines,
+                    fence_keywords=FENCE_KEYWORDS_APP,
+                    llm=llm_analysis_instance,
+                    use_llm_confirmation=True
+                )
+                fence_found = fallback_result["fence_found"]
+                keyword_matches = fallback_result.get("matched_lines", [])
+                
+                if fence_found:
+                    print(f"[APP] Page {page_num}: Fallback detected fence content via {fallback_result['method']}")
+                    print(f"[APP] Page {page_num}: Matched keywords: {fallback_result['matched_keywords']}")
+            
+            # Build text snippet from definitions or fallback keywords
             text_snippet = None
             if definitions:
                 snippets = [f"{d.get('indicator', '')} - {d.get('keyword', '')}" for d in definitions[:3]]
                 text_snippet = "; ".join(snippets)
+            elif fallback_result and fallback_result.get("matched_keywords"):
+                text_snippet = "Keywords: " + ", ".join(fallback_result["matched_keywords"][:5])
             
             # Generate images
-            original_img_bytes, highlighted_img_bytes = None, None
+            original_img_bytes = page_img_bytes
+            highlighted_img_bytes = None
+            
             if highlight_fence_text_app:
-                highlighted_img_bytes = ade.highlight_page_image(
-                    page_img_bytes, definitions, instances, pdf_width, pdf_height
-                )
-                original_img_bytes = page_img_bytes
-            else:
-                original_img_bytes = page_img_bytes
+                if definitions or instances:
+                    # Primary highlighting: definitions (green) + instances (purple)
+                    highlighted_img_bytes = ade.highlight_page_image(
+                        page_img_bytes, definitions, instances, pdf_width, pdf_height
+                    )
+                elif keyword_matches:
+                    # Fallback highlighting: keyword matches (orange)
+                    highlighted_img_bytes = ade.highlight_keyword_matches(
+                        page_img_bytes, keyword_matches, pdf_width, pdf_height
+                    )
             
             # Build result structure (matching app.py format)
+            detection_method = "ade" if (definitions or instances) else (fallback_result["method"] if fallback_result else "none")
+            llm_result = fallback_result.get("llm_result") if fallback_result else None
+            
             analysis_result = {
                 'page_number': page_num,
                 'page_index_in_original_doc': page_idx,
@@ -469,14 +499,17 @@ if st.session_state.run_analysis_triggered and \
                 'text_found': fence_found,
                 'text_response': json.dumps({
                     "answer": "yes" if fence_found else "no",
-                    "confidence": 0.9 if fence_found else 0.1,
-                    "signals": [d.get('keyword', '') for d in definitions[:5]],
-                    "reason": f"Found {len(definitions)} fence definitions, {len(instances)} instances"
+                    "confidence": 0.9 if definitions else (llm_result["confidence"] if llm_result else 0.6),
+                    "signals": [d.get('keyword', '') for d in definitions[:5]] if definitions else (fallback_result.get("matched_keywords", []) if fallback_result else []),
+                    "reason": f"Found {len(definitions)} definitions, {len(instances)} instances" if definitions else (llm_result["reason"] if llm_result else f"Keyword match: {fallback_result.get('matched_keywords', [])}" if fallback_result else "No fence content")
                 }),
                 'text_snippet': text_snippet,
                 'definitions': definitions,
                 'instances': instances,
-                'fence_text_boxes_details': definitions + instances,  # Combined for compatibility
+                'keyword_matches': keyword_matches,  # NEW: Store keyword matches
+                'fallback_result': fallback_result,  # NEW: Store fallback result
+                'detection_method': detection_method,  # NEW: Track how fence was detected
+                'fence_text_boxes_details': definitions + instances + keyword_matches,  # Combined for compatibility
                 'highlight_fence_text_app_setting': highlight_fence_text_app,
                 'original_image_bytes': original_img_bytes,
                 'highlighted_image_bytes': highlighted_img_bytes,
@@ -504,7 +537,9 @@ if st.session_state.run_analysis_triggered and \
                         reasons.append("Definitions")
                     if instances:
                         reasons.append("Instances")
-                    if highlight_fence_text_app and (definitions or instances):
+                    if keyword_matches and not definitions:
+                        reasons.append("Keywords")
+                    if highlight_fence_text_app and (definitions or instances or keyword_matches):
                         reasons.append("Highlights")
                     if reasons:
                         exp_title += f" ({' & '.join(reasons)})"
@@ -527,6 +562,16 @@ if st.session_state.run_analysis_triggered and \
                             st.markdown(" ".join(dl_links), unsafe_allow_html=True)
                     
                     with det_col:
+                        # Detection method badge
+                        if detection_method == "ade":
+                            st.success("🎯 ADE Detection")
+                        elif detection_method == "llm_confirmed":
+                            st.warning("🔍 Keyword + LLM")
+                        elif detection_method == "keyword_only":
+                            st.warning("🔤 Keyword Match")
+                        else:
+                            st.info("❌ No Detection")
+                        
                         # ADE Stats (compact)
                         st.metric("ADE Chunks", len(chunks))
                         col_leg, col_fig = st.columns(2)
@@ -557,8 +602,6 @@ if st.session_state.run_analysis_triggered and \
                                 st.info("No definition details available.")
                         else:
                             st.dataframe(df_def, hide_index=True)
-                    else:
-                        st.info("No Legend Items found.")
                     
                     if instances:
                         st.markdown("### 🟣 Instances (Drawings)")
@@ -567,8 +610,29 @@ if st.session_state.run_analysis_triggered and \
                             st.dataframe(df_inst[["indicator"]], hide_index=True)
                         else:
                             st.dataframe(df_inst, hide_index=True)
-                    else:
-                        st.info("No Instances found in drawings.")
+                    
+                    # NEW: Show keyword matches from fallback detection
+                    if keyword_matches and not definitions:
+                        st.markdown("### 🟠 Keyword Matches (Fallback)")
+                        df_kw = pd.DataFrame(keyword_matches)
+                        if not df_kw.empty:
+                            display_cols = ["keyword", "text"]
+                            available_cols = [c for c in display_cols if c in df_kw.columns]
+                            if available_cols:
+                                # Deduplicate by text
+                                df_kw_unique = df_kw.drop_duplicates(subset=["text"])
+                                st.dataframe(df_kw_unique[available_cols], hide_index=True)
+                        
+                        # Show LLM reasoning if available
+                        if fallback_result and fallback_result.get("llm_result"):
+                            llm_res = fallback_result["llm_result"]
+                            st.markdown("**LLM Analysis:**")
+                            st.markdown(f"- Confidence: {llm_res.get('confidence', 0):.0%}")
+                            st.markdown(f"- Reason: {llm_res.get('reason', 'N/A')}")
+                    
+                    # Show message if nothing found
+                    if not definitions and not instances and not keyword_matches:
+                        st.info("No fence-related items found on this page.")
             
             # Update summary
             summary_placeholder.markdown(
@@ -663,14 +727,22 @@ elif st.session_state.processing_complete:
         for res_data_item in res_data_list:
             with target_column_res:
                 exp_title_res = f"Page {res_data_item['page_number']}"
+                definitions = res_data_item.get('definitions', [])
+                instances = res_data_item.get('instances', [])
+                keyword_matches = res_data_item.get('keyword_matches', [])
+                detection_method = res_data_item.get('detection_method', 'none')
+                fallback_result = res_data_item.get('fallback_result')
+                
                 if res_data_item.get('fence_found'):
                     reasons_res = []
-                    if res_data_item.get('definitions'):
+                    if definitions:
                         reasons_res.append("Definitions")
-                    if res_data_item.get('instances'):
+                    if instances:
                         reasons_res.append("Instances")
+                    if keyword_matches and not definitions:
+                        reasons_res.append("Keywords")
                     if res_data_item.get('highlight_fence_text_app_setting', True) and \
-                       (res_data_item.get('definitions') or res_data_item.get('instances')):
+                       (definitions or instances or keyword_matches):
                         reasons_res.append("Highlights")
                     if reasons_res:
                         exp_title_res += f" ({' & '.join(reasons_res)})"
@@ -700,6 +772,16 @@ elif st.session_state.processing_complete:
                             st.markdown(" ".join(dl_links_rerun), unsafe_allow_html=True)
                     
                     with det_col_r:
+                        # Detection method badge
+                        if detection_method == "ade":
+                            st.success("🎯 ADE Detection")
+                        elif detection_method == "llm_confirmed":
+                            st.warning("🔍 Keyword + LLM")
+                        elif detection_method == "keyword_only":
+                            st.warning("🔤 Keyword Match")
+                        else:
+                            st.info("❌ No Detection")
+                        
                         # ADE Stats (compact)
                         st.metric("ADE Chunks", res_data_item.get('chunk_count', 0))
                         col_leg_r, col_fig_r = st.columns(2)
@@ -715,9 +797,6 @@ elif st.session_state.processing_complete:
                     # Found Items Section (below the image/details row)
                     st.subheader("Found Items")
                     
-                    definitions = res_data_item.get('definitions', [])
-                    instances = res_data_item.get('instances', [])
-                    
                     if definitions:
                         st.markdown("### 🟢 Definitions (Legend)")
                         df_def = pd.DataFrame(definitions)
@@ -732,8 +811,6 @@ elif st.session_state.processing_complete:
                                 st.info("No definition details available.")
                         else:
                             st.dataframe(df_def, hide_index=True)
-                    else:
-                        st.info("No Legend Items found.")
                     
                     if instances:
                         st.markdown("### 🟣 Instances (Drawings)")
@@ -742,8 +819,29 @@ elif st.session_state.processing_complete:
                             st.dataframe(df_inst[["indicator"]], hide_index=True)
                         else:
                             st.dataframe(df_inst, hide_index=True)
-                    else:
-                        st.info("No Instances found in drawings.")
+                    
+                    # Show keyword matches from fallback detection
+                    if keyword_matches and not definitions:
+                        st.markdown("### 🟠 Keyword Matches (Fallback)")
+                        df_kw = pd.DataFrame(keyword_matches)
+                        if not df_kw.empty:
+                            display_cols = ["keyword", "text"]
+                            available_cols = [c for c in display_cols if c in df_kw.columns]
+                            if available_cols:
+                                # Deduplicate by text
+                                df_kw_unique = df_kw.drop_duplicates(subset=["text"])
+                                st.dataframe(df_kw_unique[available_cols], hide_index=True)
+                        
+                        # Show LLM reasoning if available
+                        if fallback_result and fallback_result.get("llm_result"):
+                            llm_res = fallback_result["llm_result"]
+                            st.markdown("**LLM Analysis:**")
+                            st.markdown(f"- Confidence: {llm_res.get('confidence', 0):.0%}")
+                            st.markdown(f"- Reason: {llm_res.get('reason', 'N/A')}")
+                    
+                    # Show message if nothing found
+                    if not definitions and not instances and not keyword_matches:
+                        st.info("No fence-related items found on this page.")
     
     display_page_result_expander(st.session_state.fence_pages, col_f_res)
     display_page_result_expander(st.session_state.non_fence_pages, col_nf_res)
