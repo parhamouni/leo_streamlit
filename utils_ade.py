@@ -99,18 +99,31 @@ def align_ade_chunks_to_page(ade_result: Dict, page_idx: int, page_width: float,
 
 
 def segment_chunks(chunks: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Segment chunks into legend-like (for definition extraction) and figure-like (for instance finding).
+    
+    A chunk is figure-like if:
+    - It's typed as 'figure' or 'architectural_drawing'
+    - AND it doesn't have strong legend indicators at the START of its text
+    
+    We check only the first 200 chars to avoid false positives from ADE's descriptive text.
+    """
     legend_like = []
     figure_like = []
     for chunk in chunks:
         raw_type = (chunk.get("type") or "").lower()
-        text_lower = (chunk.get("text") or "").lower()
+        text = chunk.get("text") or ""
+        # Only check the beginning of text for legend hints (avoid ADE descriptions)
+        text_start = text[:200].lower()
+        
         is_figure = raw_type in {"figure", "architectural_drawing"}
-        has_legend_hint = any(token in text_lower for token in {"legend", "keynote", "abbreviation", "symbol"})
+        # Check for explicit legend section headers
+        has_legend_hint = any(token in text_start for token in {"legend", "keynote", "abbreviation", "symbols"})
 
-        if not is_figure or has_legend_hint:
-            legend_like.append(chunk)
-        elif is_figure:
+        if is_figure and not has_legend_hint:
             figure_like.append(chunk)
+        else:
+            legend_like.append(chunk)
     print(f"[DEBUG] Segmented: {len(legend_like)} Legend-like chunks, {len(figure_like)} Figure-like chunks.")
     return legend_like, figure_like
 
