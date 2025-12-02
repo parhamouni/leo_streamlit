@@ -496,6 +496,8 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
     print(f"[DEBUG] Tokens inside figure chunks: {len(figure_tokens)} (out of {len(all_tokens)} total)")
     
     # Search for indicator matches
+    # For short numeric indicators (1-2 digits), require EXACT match to avoid false positives
+    # from dimensions, grid references, etc.
     found_positions = set()
     
     for token in figure_tokens:
@@ -503,15 +505,24 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
         if not token_text:
             continue
         
-        # Clean the token text
-        clean_text = re.sub(r'[^\w]', '', token_text)
-        
         # Check if this token matches any indicator
         matched_indicator = None
-        if token_text in indicators_to_find:
-            matched_indicator = token_text
-        elif clean_text in indicators_to_find:
-            matched_indicator = clean_text
+        
+        # For exact matching, the token text should match the indicator exactly
+        # (not be part of a larger number like "180" matching "18")
+        for ind in indicators_to_find:
+            # Check for exact match
+            if token_text == ind:
+                matched_indicator = ind
+                break
+            # Check if token is the indicator with parentheses like "(20)"
+            if token_text == f"({ind})" or token_text == f"[{ind}]":
+                matched_indicator = ind
+                break
+            # For indicators with special chars like "(20)", match the token
+            if ind.startswith("(") and token_text == ind:
+                matched_indicator = ind
+                break
         
         if matched_indicator:
             # Skip if in legend area (we already have it as definition)
@@ -531,7 +542,7 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
                 "x1": token["x1"], "y1": token["y1"],
                 "source": "figure_instance"
             })
-            print(f"[DEBUG] ✓ Found instance '{matched_indicator}' at ({token['x0']:.1f}, {token['y0']:.1f})")
+            print(f"[DEBUG] ✓ Found instance '{matched_indicator}' at ({token['x0']:.1f}, {token['y0']:.1f}) token='{token_text}'")
     
     print(f"[DEBUG] Total instances found: {len(instances)}")
     return instances
@@ -544,6 +555,7 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
 
 def highlight_page_image(page_image_bytes: bytes, definitions: List[Dict], instances: List[Dict], pdf_width: float, pdf_height: float) -> bytes:
     print("[DEBUG] Generating Highlighted Image...")
+    print(f"[DEBUG] Highlighting {len(definitions)} definitions and {len(instances)} instances")
     try:
         img = Image.open(BytesIO(page_image_bytes))
         draw = ImageDraw.Draw(img, "RGBA")
@@ -554,6 +566,13 @@ def highlight_page_image(page_image_bytes: bytes, definitions: List[Dict], insta
         print(f"[DEBUG] Image size: {img_w} x {img_h}")
         print(f"[DEBUG] PDF size: {pdf_width} x {pdf_height}")
         print(f"[DEBUG] Scale factors: x={scale_x:.4f}, y={scale_y:.4f}")
+        
+        # Sanity check: warn if scaled coordinates would be outside image
+        for i in instances[:3]:
+            sx = i.get('x0', 0) * scale_x
+            sy = i.get('y0', 0) * scale_y
+            if sx > img_w or sy > img_h:
+                print(f"[DEBUG] ⚠️ Instance '{i.get('indicator')}' scaled coords ({sx:.1f}, {sy:.1f}) OUTSIDE image bounds!")
 
         def scale_box(box_dict):
             scaled = [
