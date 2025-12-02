@@ -433,21 +433,39 @@ if st.session_state.run_analysis_triggered and \
                 )
             
             # Get all page tokens for instance finding
-            # IMPORTANT: Apply derotation matrix to handle rotated pages
+            # IMPORTANT: Transform MediaBox coords to display coords for rotated pages
             # page.get_text("words") returns coords in MediaBox space,
             # but the rendered image is in display space (after rotation)
             native_words = page.get_text("words")
-            derotation_matrix = page.derotation_matrix
+            rotation = page.rotation
+            mediabox_w = page.mediabox.width
+            mediabox_h = page.mediabox.height
+            print(f"[DEBUG] Page {page_num} rotation: {rotation}°, MediaBox: {mediabox_w:.0f}x{mediabox_h:.0f}")
+            
+            def transform_for_rotation(x0, y0, x1, y1):
+                """Transform MediaBox coords to display coords based on page rotation"""
+                if rotation == 0:
+                    return x0, y0, x1, y1
+                elif rotation == 90:
+                    return mediabox_h - y1, x0, mediabox_h - y0, x1
+                elif rotation == 180:
+                    return mediabox_w - x1, mediabox_h - y1, mediabox_w - x0, mediabox_h - y0
+                elif rotation == 270:
+                    return y0, mediabox_w - x1, y1, mediabox_w - x0
+                return x0, y0, x1, y1
+            
             all_page_tokens = []
             for w in native_words:
-                # Transform word bbox from MediaBox to display coordinates
-                orig_rect = fitz.Rect(w[0], w[1], w[2], w[3])
-                trans_rect = orig_rect * derotation_matrix
+                nx0, ny0, nx1, ny1 = transform_for_rotation(w[0], w[1], w[2], w[3])
                 all_page_tokens.append({
                     "text": w[4], 
-                    "x0": trans_rect.x0, "y0": trans_rect.y0, 
-                    "x1": trans_rect.x1, "y1": trans_rect.y1
+                    "x0": nx0, "y0": ny0, 
+                    "x1": nx1, "y1": ny1
                 })
+            # Debug: show sample transformed token
+            if all_page_tokens:
+                sample = all_page_tokens[0]
+                print(f"[DEBUG] Sample token after transform: '{sample['text']}' at ({sample['x0']:.1f}, {sample['y0']:.1f})")
             
             # Find instances in figures
             instances = []

@@ -251,12 +251,27 @@ def get_native_pdf_lines(page: fitz.Page) -> List[Dict]:
     """
     Extract text lines from PDF with coordinates in display space.
     
-    IMPORTANT: Applies derotation matrix to handle rotated pages.
+    IMPORTANT: Transforms MediaBox coords to display coords for rotated pages.
     PDF text coordinates are in MediaBox space, but we need display space
     to match the rendered image coordinates.
     """
     structure = page.get_text("dict")
-    derotation_matrix = page.derotation_matrix
+    rotation = page.rotation
+    mediabox_w = page.mediabox.width
+    mediabox_h = page.mediabox.height
+    
+    def transform_for_rotation(x0, y0, x1, y1):
+        """Transform MediaBox coords to display coords based on page rotation"""
+        if rotation == 0:
+            return x0, y0, x1, y1
+        elif rotation == 90:
+            return mediabox_h - y1, x0, mediabox_h - y0, x1
+        elif rotation == 180:
+            return mediabox_w - x1, mediabox_h - y1, mediabox_w - x0, mediabox_h - y0
+        elif rotation == 270:
+            return y0, mediabox_w - x1, y1, mediabox_w - x0
+        return x0, y0, x1, y1
+    
     lines = []
     for block in structure.get("blocks", []):
         if "lines" in block:
@@ -265,12 +280,11 @@ def get_native_pdf_lines(page: fitz.Page) -> List[Dict]:
                 bbox = line["bbox"]
                 if text:
                     # Transform from MediaBox to display coordinates
-                    orig_rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
-                    trans_rect = orig_rect * derotation_matrix
+                    nx0, ny0, nx1, ny1 = transform_for_rotation(bbox[0], bbox[1], bbox[2], bbox[3])
                     lines.append({
                         "text": text,
-                        "x0": trans_rect.x0, "y0": trans_rect.y0, 
-                        "x1": trans_rect.x1, "y1": trans_rect.y1,
+                        "x0": nx0, "y0": ny0, 
+                        "x1": nx1, "y1": ny1,
                         "source": "pdf_native"
                     })
     print(f"[DEBUG] PDF Native extraction: Found {len(lines)} lines.")
