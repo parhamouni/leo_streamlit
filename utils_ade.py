@@ -141,7 +141,13 @@ def get_docai_client(google_cloud_config: Dict):
         return None
 
 
-def run_google_ocr_blocks(page_bytes: bytes, google_cloud_config: Dict, w: float, h: float) -> List[Dict]:
+def run_google_ocr_blocks(page_bytes: bytes, google_cloud_config: Dict, pdf_width: float, pdf_height: float) -> List[Dict]:
+    """
+    Run Google Document AI OCR on a PDF page and return text blocks with PDF coordinates.
+    
+    IMPORTANT: normalized_vertices from Document AI are relative to the IMAGE dimensions.
+    We must convert them to PDF coordinate space using the correct scale factors.
+    """
     print("[DEBUG] Starting Google OCR...")
     client = get_docai_client(google_cloud_config)
     if not client:
@@ -163,6 +169,12 @@ def run_google_ocr_blocks(page_bytes: bytes, google_cloud_config: Dict, w: float
 
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
+    
+    # Store actual image dimensions for coordinate conversion
+    img_width = pix.width
+    img_height = pix.height
+    print(f"[DEBUG] Image dimensions: {img_width} x {img_height} pixels")
+    print(f"[DEBUG] PDF dimensions: {pdf_width:.1f} x {pdf_height:.1f} points")
 
     # --- JPEG COMPRESSION ---
     image_content = pix.tobytes("jpeg", jpg_quality=85)
@@ -184,6 +196,17 @@ def run_google_ocr_blocks(page_bytes: bytes, google_cloud_config: Dict, w: float
         return []
     ocr_page = doc_result.pages[0]
 
+    # Calculate scale factors to convert from image pixels to PDF points
+    # normalized_vertices are 0-1 relative to image, so:
+    # pixel_coord = normalized * img_dimension
+    # pdf_coord = pixel_coord * (pdf_dimension / img_dimension)
+    # Simplified: pdf_coord = normalized * pdf_dimension (since aspect ratio is preserved)
+    
+    # But to be safe, let's use explicit scale factors
+    scale_x = pdf_width / img_width if img_width > 0 else 1.0
+    scale_y = pdf_height / img_height if img_height > 0 else 1.0
+    print(f"[DEBUG] Scale factors: x={scale_x:.4f}, y={scale_y:.4f}")
+
     ocr_lines = []
 
     for paragraph in ocr_page.paragraphs:
@@ -200,17 +223,22 @@ def run_google_ocr_blocks(page_bytes: bytes, google_cloud_config: Dict, w: float
         if not vertices:
             continue
 
-        xs = [v.x for v in vertices]
-        ys = [v.y for v in vertices]
+        # Convert normalized (0-1) to pixel coordinates, then to PDF coordinates
+        xs = [v.x * img_width * scale_x for v in vertices if v.x is not None]
+        ys = [v.y * img_height * scale_y for v in vertices if v.y is not None]
+        
+        if not xs or not ys:
+            continue
 
         ocr_lines.append({
             "text": text_content,
-            "x0": min(xs) * w, "y0": min(ys) * h,
-            "x1": max(xs) * w, "y1": max(ys) * h,
+            "x0": min(xs), "y0": min(ys),
+            "x1": max(xs), "y1": max(ys),
             "source": "ocr_paragraph"
         })
 
     print(f"[DEBUG] OCR extraction complete. Found {len(ocr_lines)} paragraphs.")
+    doc.close()
     return ocr_lines
 
 
@@ -522,19 +550,30 @@ def highlight_page_image(page_image_bytes: bytes, definitions: List[Dict], insta
         img_w, img_h = img.size
         scale_x = img_w / pdf_width if pdf_width > 0 else 1.0
         scale_y = img_h / pdf_height if pdf_height > 0 else 1.0
+        
+        print(f"[DEBUG] Image size: {img_w} x {img_h}")
+        print(f"[DEBUG] PDF size: {pdf_width} x {pdf_height}")
+        print(f"[DEBUG] Scale factors: x={scale_x:.4f}, y={scale_y:.4f}")
 
         def scale_box(box_dict):
-            return [
+            scaled = [
                 box_dict.get("x0", 0) * scale_x,
                 box_dict.get("y0", 0) * scale_y,
                 box_dict.get("x1", 0) * scale_x,
                 box_dict.get("y1", 0) * scale_y
             ]
+            return scaled
 
         for d in definitions:
             box = scale_box(d)
+            print(f"[DEBUG] Definition box: orig=({d.get('x0'):.1f}, {d.get('y0'):.1f}) -> scaled=({box[0]:.1f}, {box[1]:.1f})")
             draw.rectangle(box, outline=(0, 255, 0, 255), width=3)
             draw.rectangle(box, fill=(0, 255, 0, 40))
+        
+        for idx, i in enumerate(instances[:5]):  # Log first 5 instances
+            box = scale_box(i)
+            print(f"[DEBUG] Instance {idx} '{i.get('indicator')}' box: orig=({i.get('x0'):.1f}, {i.get('y0'):.1f}, {i.get('x1'):.1f}, {i.get('y1'):.1f}) -> scaled=({box[0]:.1f}, {box[1]:.1f}, {box[2]:.1f}, {box[3]:.1f})")
+        
         for i in instances:
             box = scale_box(i)
             draw.rectangle(box, outline=(255, 0, 255, 255), width=3)
