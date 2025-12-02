@@ -405,29 +405,107 @@ def extract_legend_entries(
 
 
 def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Dict], all_tokens: List[Dict]) -> List[Dict]:
-    print("[DEBUG] Finding Instances in Figures...")
+    """
+    Find instances of legend indicators ONLY within figure/architectural_drawing chunks.
+    
+    Args:
+        legend_entries: List of definitions with 'indicator' field
+        figure_chunks: List of figure region bounding boxes (type=figure or architectural_drawing)
+        all_tokens: All text tokens from the page
+    """
+    print("[DEBUG] Finding Instances in Figure Chunks...")
+    print(f"[DEBUG] Figure chunks count: {len(figure_chunks)}")
+    for i, fc in enumerate(figure_chunks):
+        print(f"[DEBUG]   Figure {i}: type={fc.get('type')} bbox=({fc['x0']:.1f}, {fc['y0']:.1f}) - ({fc['x1']:.1f}, {fc['y1']:.1f})")
+    
     instances = []
-    indicators_to_find = {item["indicator"] for item in legend_entries if item["indicator"]}
-
+    
+    # Collect all indicators to search for
+    indicators_to_find = set()
+    for item in legend_entries:
+        ind = item.get("indicator", "").strip()
+        if ind:
+            indicators_to_find.add(ind)
+            # Also add cleaned version (remove special chars)
+            clean_ind = re.sub(r'[^\w]', '', ind)
+            if clean_ind:
+                indicators_to_find.add(clean_ind)
+    
+    print(f"[DEBUG] Looking for indicators: {indicators_to_find}")
+    
     if not indicators_to_find:
         return []
-
+    
+    if not figure_chunks:
+        print("[DEBUG] No figure chunks to search in!")
+        return []
+    
+    # Get legend bounding boxes to exclude (don't match indicators in legend area)
+    legend_bboxes = []
+    for entry in legend_entries:
+        if all(k in entry for k in ['x0', 'y0', 'x1', 'y1']):
+            legend_bboxes.append((entry['x0'], entry['y0'], entry['x1'], entry['y1']))
+    
+    def is_in_legend_area(token):
+        """Check if token is inside any legend bounding box (with margin)"""
+        margin = 20  # PDF units margin
+        tx, ty = (token['x0'] + token['x1']) / 2, (token['y0'] + token['y1']) / 2
+        for lx0, ly0, lx1, ly1 in legend_bboxes:
+            if lx0 - margin <= tx <= lx1 + margin and ly0 - margin <= ty <= ly1 + margin:
+                return True
+        return False
+    
+    # Filter tokens to only those inside figure chunks
     figure_tokens = []
     for chunk in figure_chunks:
         cx0, cy0, cx1, cy1 = chunk["x0"], chunk["y0"], chunk["x1"], chunk["y1"]
-        ft = [t for t in all_tokens if t["x0"] >= cx0 and t["y0"] >= cy0 and t["x1"] <= cx1 and t["y1"] <= cy1]
-        figure_tokens.extend(ft)
-
+        for t in all_tokens:
+            # Check if token center is inside chunk
+            tx, ty = (t['x0'] + t['x1']) / 2, (t['y0'] + t['y1']) / 2
+            if cx0 <= tx <= cx1 and cy0 <= ty <= cy1:
+                figure_tokens.append(t)
+    
+    print(f"[DEBUG] Tokens inside figure chunks: {len(figure_tokens)} (out of {len(all_tokens)} total)")
+    
+    # Search for indicator matches
+    found_positions = set()
+    
     for token in figure_tokens:
-        token_text = token["text"].strip()
+        token_text = token.get("text", "").strip()
+        if not token_text:
+            continue
+        
+        # Clean the token text
         clean_text = re.sub(r'[^\w]', '', token_text)
-        if clean_text in indicators_to_find:
+        
+        # Check if this token matches any indicator
+        matched_indicator = None
+        if token_text in indicators_to_find:
+            matched_indicator = token_text
+        elif clean_text in indicators_to_find:
+            matched_indicator = clean_text
+        
+        if matched_indicator:
+            # Skip if in legend area (we already have it as definition)
+            if is_in_legend_area(token):
+                print(f"[DEBUG] Skipping '{matched_indicator}' at ({token['x0']:.1f}, {token['y0']:.1f}) - in legend area")
+                continue
+            
+            # Create position key to avoid duplicates
+            pos_key = (round(token['x0']), round(token['y0']))
+            if pos_key in found_positions:
+                continue
+            found_positions.add(pos_key)
+            
             instances.append({
-                "indicator": clean_text,
-                "x0": token["x0"], "y0": token["y0"], "x1": token["x1"], "y1": token["y1"],
+                "indicator": matched_indicator,
+                "x0": token["x0"], "y0": token["y0"], 
+                "x1": token["x1"], "y1": token["y1"],
                 "source": "figure_instance"
             })
-    print(f"[DEBUG] Found {len(instances)} figure instances.")
+            print(f"[DEBUG] ✓ Found instance '{matched_indicator}' at ({token['x0']:.1f}, {token['y0']:.1f})")
+    
+    print(f"[DEBUG] Total instances found: {len(instances)}")
     return instances
 
 

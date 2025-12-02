@@ -432,15 +432,53 @@ if st.session_state.run_analysis_triggered and \
                     llm=llm_analysis_instance
                 )
             
+            # Get all page tokens for instance finding
+            native_words = page.get_text("words")
+            all_page_tokens = [
+                {"text": w[4], "x0": w[0], "y0": w[1], "x1": w[2], "y1": w[3]}
+                for w in native_words
+            ]
+            
             # Find instances in figures
             instances = []
             if definitions and figure_chunks:
-                native_words = page.get_text("words")
-                all_figure_tokens = [
-                    {"text": w[4], "x0": w[0], "y0": w[1], "x1": w[2], "y1": w[3]}
-                    for w in native_words
-                ]
-                instances = ade.find_instances_in_figures(definitions, figure_chunks, all_figure_tokens)
+                instances = ade.find_instances_in_figures(definitions, figure_chunks, all_page_tokens)
+            
+            # DEBUG: Show coordinate info if enabled
+            if DEBUG_MODE:
+                with st.expander(f"🔧 DEBUG Page {page_num}", expanded=True):
+                    st.markdown(f"**PDF size:** {pdf_width:.1f} x {pdf_height:.1f}")
+                    
+                    # All chunks info
+                    st.markdown(f"**All ADE Chunks:** {len(chunks)}")
+                    for i, c in enumerate(chunks[:10]):
+                        st.markdown(f"  - `{c.get('type')}`: ({c.get('x0'):.1f}, {c.get('y0'):.1f}) - ({c.get('x1'):.1f}, {c.get('y1'):.1f})")
+                    
+                    # Figure chunks
+                    st.markdown(f"**Figure/Architectural Chunks:** {len(figure_chunks)}")
+                    for i, fc in enumerate(figure_chunks):
+                        st.markdown(f"  - `{fc.get('type')}`: ({fc.get('x0'):.1f}, {fc.get('y0'):.1f}) - ({fc.get('x1'):.1f}, {fc.get('y1'):.1f})")
+                    
+                    # Legend chunks
+                    st.markdown(f"**Legend-like Chunks:** {len(legend_chunks)}")
+                    
+                    # Definitions
+                    st.markdown(f"**Definitions found:** {len(definitions)}")
+                    for i, d in enumerate(definitions[:5]):
+                        kw = d.get('keyword', '')[:30]
+                        st.markdown(f"  - `{d.get('indicator')}`: {kw}... @ ({d.get('x0'):.1f}, {d.get('y0'):.1f})")
+                    
+                    # Instances
+                    st.markdown(f"**Instances found:** {len(instances)}")
+                    for i, inst in enumerate(instances[:10]):
+                        st.markdown(f"  - `{inst.get('indicator')}` @ ({inst.get('x0'):.1f}, {inst.get('y0'):.1f})")
+                    
+                    # Show sample tokens
+                    st.markdown(f"**Total page tokens:** {len(all_page_tokens)}")
+                    if all_page_tokens:
+                        st.markdown(f"**Sample tokens (first 20):**")
+                        for t in all_page_tokens[:20]:
+                            st.markdown(f"  - `{t.get('text')}` @ ({t.get('x0'):.1f}, {t.get('y0'):.1f})")
             
             # Determine if this is a fence page (primary detection)
             fence_found = len(definitions) > 0 or len(instances) > 0
