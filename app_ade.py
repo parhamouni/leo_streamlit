@@ -62,8 +62,6 @@ def initialize_session_state(session_id_val):
         'highlighted_pdf_bytes_for_download': None,
         'last_uploaded_file_id': None,
         'selected_model_for_analysis': "gpt-4o-mini",
-        # ADE-specific state
-        'ade_result': None,
     }
     for key, value in default_state.items():
         if key not in st.session_state:
@@ -342,7 +340,6 @@ if uploaded_pdf_file_obj:
         st.session_state.original_pdf_bytes = uploaded_pdf_file_obj.getvalue()
         st.session_state.current_pdf_hash = hashlib.sha256(st.session_state.original_pdf_bytes).hexdigest()
         st.session_state.last_uploaded_file_id = current_file_id
-        st.session_state.ade_result = None
         
         st.cache_data.clear()
         print(f"SESSION {current_session_id} LOG: Cleared all @st.cache_data caches due to new file.")
@@ -398,166 +395,171 @@ if st.session_state.run_analysis_triggered and \
     status_txt_area = st.empty()
     
     try:
-        # Step 1: ADE Analysis (Full Document) - Only once
-        if not st.session_state.ade_result:
-            status_txt_area.text("Sending document to LandingAI ADE...")
-            print(f"SESSION {current_session_id} LOG: Sending document to LandingAI ADE...")
-            
-            ade_response = ade.ade_parse_document(file_bytes, ade_key)
-            
-            if not ade_response["success"]:
-                st.error(f"ADE Failed: {ade_response['error']}")
-                print(f"SESSION {current_session_id} ERROR: ADE Failed: {ade_response['error']}")
-                st.session_state.analysis_halted_due_to_error = True
-                st.stop()
-            
-            st.session_state.ade_result = ade_response
-            status_txt_area.text("✅ ADE Analysis Complete!")
-            print(f"SESSION {current_session_id} LOG: ADE Analysis Complete!")
-        
-        ade_data = st.session_state.ade_result["data"]
         total_pages = st.session_state.doc_total_pages
         
-        # Step 2: Process each page
+        # Process each page with pre-filtering
         for page_idx in range(total_pages):
             page_num = page_idx + 1
             st.session_state.total_pages_processed_count = page_num
             prog_bar.progress(page_num / total_pages)
-            status_txt_area.text(f"Processing Page {page_num}/{total_pages}...")
+            status_txt_area.text(f"Page {page_num}/{total_pages}: Checking for fence content...")
             print(f"SESSION {current_session_id} LOG: Processing page {page_num}.")
             
-            # Get page dimensions
+            # Get page dimensions and image
             page = doc_proc[page_idx]
             pdf_width, pdf_height = page.rect.width, page.rect.height
             page_img_bytes = page.get_pixmap(dpi=DISPLAY_IMAGE_DPI).tobytes("png")
             
-            # Align ADE chunks to this page
-            chunks = ade.align_ade_chunks_to_page(st.session_state.ade_result, page_idx, pdf_width, pdf_height)
-            legend_chunks, figure_chunks = ade.segment_chunks(chunks)
-            
-            # Get text lines for matching
+            # =====================================================================
+            # STEP 1: Extract text sources (PDF native + OCR)
+            # =====================================================================
             pdf_lines = ade.get_native_pdf_lines(page)
             
+            single_page_pdf = ade.create_single_page_pdf(file_bytes, page_idx)
             ocr_lines = []
             if google_cloud_config:
-                single_page_pdf = ade.create_single_page_pdf(file_bytes, page_idx)
                 ocr_lines = ade.run_google_ocr_blocks(single_page_pdf, google_cloud_config, pdf_width, pdf_height)
             
-            # Debug visualization
-            if DEBUG_MODE and (legend_chunks or pdf_lines or ocr_lines):
-                debug_bytes = ade.debug_visualize_coordinates(
-                    page_img_bytes, legend_chunks, pdf_lines, ocr_lines, pdf_width, pdf_height
-                )
-                st.image(debug_bytes, caption=f"DEBUG: Layers Page {page_num}", use_container_width=True)
+            # =====================================================================
+            # STEP 2: PRE-FILTER - Check if page is fence-related
+            # =====================================================================
+            status_txt_area.text(f"Page {page_num}/{total_pages}: Pre-filtering...")
+            prefilter_result = ade.fallback_fence_detection(
+                pdf_lines=pdf_lines,
+                ocr_lines=ocr_lines,
+                fence_keywords=FENCE_KEYWORDS_APP,
+                llm=llm_analysis_instance,
+                use_llm_confirmation=True
+            )
             
-            # Extract fence-related definitions from legend chunks
+            # Initialize variables
+            chunks = []
+            legend_chunks = []
+            figure_chunks = []
             definitions = []
-            if highlight_fence_text_app:
-                definitions = ade.extract_legend_entries(
-                    legend_chunks=legend_chunks,
-                    pdf_lines=pdf_lines,
-                    ocr_lines=ocr_lines,
-                    fence_keywords=FENCE_KEYWORDS_APP,
-                    llm=llm_analysis_instance
-                )
-            
-            # Get all page tokens for instance finding
-            # IMPORTANT: Transform MediaBox coords to display coords for rotated pages
-            # page.get_text("words") returns coords in MediaBox space,
-            # but the rendered image is in display space (after rotation)
-            native_words = page.get_text("words")
-            rotation = page.rotation
-            mediabox_w = page.mediabox.width
-            mediabox_h = page.mediabox.height
-            print(f"[DEBUG] Page {page_num} rotation: {rotation}°, MediaBox: {mediabox_w:.0f}x{mediabox_h:.0f}")
-            
-            def transform_for_rotation(x0, y0, x1, y1):
-                """Transform MediaBox coords to display coords based on page rotation"""
-                if rotation == 0:
-                    return x0, y0, x1, y1
-                elif rotation == 90:
-                    return mediabox_h - y1, x0, mediabox_h - y0, x1
-                elif rotation == 180:
-                    return mediabox_w - x1, mediabox_h - y1, mediabox_w - x0, mediabox_h - y0
-                elif rotation == 270:
-                    return y0, mediabox_w - x1, y1, mediabox_w - x0
-                return x0, y0, x1, y1
-            
-            all_page_tokens = []
-            for w in native_words:
-                nx0, ny0, nx1, ny1 = transform_for_rotation(w[0], w[1], w[2], w[3])
-                all_page_tokens.append({
-                    "text": w[4], 
-                    "x0": nx0, "y0": ny0, 
-                    "x1": nx1, "y1": ny1
-                })
-            # Debug: show sample transformed token
-            if all_page_tokens:
-                sample = all_page_tokens[0]
-                print(f"[DEBUG] Sample token after transform: '{sample['text']}' at ({sample['x0']:.1f}, {sample['y0']:.1f})")
-            
-            # Find instances in figures
             instances = []
-            if definitions and figure_chunks:
-                instances = ade.find_instances_in_figures(definitions, figure_chunks, all_page_tokens)
-            
-            # DEBUG: Show coordinate info if enabled
-            if DEBUG_MODE:
-                with st.expander(f"🔧 DEBUG Page {page_num}", expanded=True):
-                    st.markdown(f"**PDF size:** {pdf_width:.1f} x {pdf_height:.1f}")
-                    
-                    # All chunks info
-                    st.markdown(f"**All ADE Chunks:** {len(chunks)}")
-                    for i, c in enumerate(chunks[:10]):
-                        st.markdown(f"  - `{c.get('type')}`: ({c.get('x0'):.1f}, {c.get('y0'):.1f}) - ({c.get('x1'):.1f}, {c.get('y1'):.1f})")
-                    
-                    # Figure chunks
-                    st.markdown(f"**Figure/Architectural Chunks:** {len(figure_chunks)}")
-                    for i, fc in enumerate(figure_chunks):
-                        st.markdown(f"  - `{fc.get('type')}`: ({fc.get('x0'):.1f}, {fc.get('y0'):.1f}) - ({fc.get('x1'):.1f}, {fc.get('y1'):.1f})")
-                    
-                    # Legend chunks
-                    st.markdown(f"**Legend-like Chunks:** {len(legend_chunks)}")
-                    
-                    # Definitions
-                    st.markdown(f"**Definitions found:** {len(definitions)}")
-                    for i, d in enumerate(definitions[:5]):
-                        kw = d.get('keyword', '')[:30]
-                        st.markdown(f"  - `{d.get('indicator')}`: {kw}... @ ({d.get('x0'):.1f}, {d.get('y0'):.1f})")
-                    
-                    # Instances
-                    st.markdown(f"**Instances found:** {len(instances)}")
-                    for i, inst in enumerate(instances[:10]):
-                        st.markdown(f"  - `{inst.get('indicator')}` @ ({inst.get('x0'):.1f}, {inst.get('y0'):.1f})")
-                    
-                    # Show sample tokens
-                    st.markdown(f"**Total page tokens:** {len(all_page_tokens)}")
-                    if all_page_tokens:
-                        st.markdown(f"**Sample tokens (first 20):**")
-                        for t in all_page_tokens[:20]:
-                            st.markdown(f"  - `{t.get('text')}` @ ({t.get('x0'):.1f}, {t.get('y0'):.1f})")
-            
-            # Determine if this is a fence page (primary detection)
-            fence_found = len(definitions) > 0 or len(instances) > 0
-            
-            # FALLBACK: If ADE didn't find definitions, run keyword + LLM fallback
             fallback_result = None
             keyword_matches = []
+            fence_found = prefilter_result["fence_found"]
+            
             if not fence_found:
-                print(f"[APP] Page {page_num}: No ADE definitions found, running fallback detection...")
-                fallback_result = ade.fallback_fence_detection(
-                    pdf_lines=pdf_lines,
-                    ocr_lines=ocr_lines,
-                    fence_keywords=FENCE_KEYWORDS_APP,
-                    llm=llm_analysis_instance,
-                    use_llm_confirmation=True
-                )
-                fence_found = fallback_result["fence_found"]
-                keyword_matches = fallback_result.get("matched_lines", [])
+                # =====================================================================
+                # NON-FENCE PAGE: Skip ADE, build minimal result
+                # =====================================================================
+                print(f"[APP] Page {page_num}: Pre-filter says NOT fence-related, skipping ADE.")
+                detection_method = "none"
+            else:
+                # =====================================================================
+                # STEP 3: FENCE PAGE - Send single page to ADE
+                # =====================================================================
+                print(f"[APP] Page {page_num}: Pre-filter detected fence content via {prefilter_result['method']}")
+                status_txt_area.text(f"Page {page_num}/{total_pages}: Sending to ADE for detailed extraction...")
                 
-                if fence_found:
-                    print(f"[APP] Page {page_num}: Fallback detected fence content via {fallback_result['method']}")
-                    print(f"[APP] Page {page_num}: Matched keywords: {fallback_result['matched_keywords']}")
+                ade_response = ade.ade_parse_document(single_page_pdf, ade_key)
+                
+                if not ade_response["success"]:
+                    # ADE failed - use pre-filter results as fallback
+                    print(f"[APP] Page {page_num}: ADE failed ({ade_response['error']}), using pre-filter results.")
+                    fallback_result = prefilter_result
+                    keyword_matches = prefilter_result.get("matched_lines", [])
+                    detection_method = prefilter_result["method"]
+                else:
+                    # =====================================================================
+                    # STEP 4: Process ADE results (page_idx=0 since single-page PDF)
+                    # =====================================================================
+                    status_txt_area.text(f"Page {page_num}/{total_pages}: Extracting definitions...")
+                    
+                    chunks = ade.align_ade_chunks_to_page(ade_response, 0, pdf_width, pdf_height)
+                    legend_chunks, figure_chunks = ade.segment_chunks(chunks)
+                    
+                    # Debug visualization
+                    if DEBUG_MODE and (legend_chunks or pdf_lines or ocr_lines):
+                        debug_bytes = ade.debug_visualize_coordinates(
+                            page_img_bytes, legend_chunks, pdf_lines, ocr_lines, pdf_width, pdf_height
+                        )
+                        st.image(debug_bytes, caption=f"DEBUG: Layers Page {page_num}", use_container_width=True)
+                    
+                    # Extract fence-related definitions from legend chunks
+                    if highlight_fence_text_app and legend_chunks:
+                        definitions = ade.extract_legend_entries(
+                            legend_chunks=legend_chunks,
+                            pdf_lines=pdf_lines,
+                            ocr_lines=ocr_lines,
+                            fence_keywords=FENCE_KEYWORDS_APP,
+                            llm=llm_analysis_instance
+                        )
+                    
+                    # Get all page tokens for instance finding
+                    # IMPORTANT: Transform MediaBox coords to display coords for rotated pages
+                    native_words = page.get_text("words")
+                    rotation = page.rotation
+                    mediabox_w = page.mediabox.width
+                    mediabox_h = page.mediabox.height
+                    print(f"[DEBUG] Page {page_num} rotation: {rotation}°, MediaBox: {mediabox_w:.0f}x{mediabox_h:.0f}")
+                    
+                    def transform_for_rotation(x0, y0, x1, y1):
+                        """Transform MediaBox coords to display coords based on page rotation"""
+                        if rotation == 0:
+                            return x0, y0, x1, y1
+                        elif rotation == 90:
+                            return mediabox_h - y1, x0, mediabox_h - y0, x1
+                        elif rotation == 180:
+                            return mediabox_w - x1, mediabox_h - y1, mediabox_w - x0, mediabox_h - y0
+                        elif rotation == 270:
+                            return y0, mediabox_w - x1, y1, mediabox_w - x0
+                        return x0, y0, x1, y1
+                    
+                    all_page_tokens = []
+                    for w in native_words:
+                        nx0, ny0, nx1, ny1 = transform_for_rotation(w[0], w[1], w[2], w[3])
+                        all_page_tokens.append({
+                            "text": w[4], 
+                            "x0": nx0, "y0": ny0, 
+                            "x1": nx1, "y1": ny1
+                        })
+                    
+                    if all_page_tokens:
+                        sample = all_page_tokens[0]
+                        print(f"[DEBUG] Sample token after transform: '{sample['text']}' at ({sample['x0']:.1f}, {sample['y0']:.1f})")
+                    
+                    # Find instances in figures
+                    if definitions and figure_chunks:
+                        instances = ade.find_instances_in_figures(definitions, figure_chunks, all_page_tokens)
+                    
+                    # DEBUG: Show coordinate info if enabled
+                    if DEBUG_MODE:
+                        with st.expander(f"🔧 DEBUG Page {page_num}", expanded=True):
+                            st.markdown(f"**PDF size:** {pdf_width:.1f} x {pdf_height:.1f}")
+                            st.markdown(f"**All ADE Chunks:** {len(chunks)}")
+                            for i, c in enumerate(chunks[:10]):
+                                st.markdown(f"  - `{c.get('type')}`: ({c.get('x0'):.1f}, {c.get('y0'):.1f}) - ({c.get('x1'):.1f}, {c.get('y1'):.1f})")
+                            st.markdown(f"**Figure/Architectural Chunks:** {len(figure_chunks)}")
+                            for i, fc in enumerate(figure_chunks):
+                                st.markdown(f"  - `{fc.get('type')}`: ({fc.get('x0'):.1f}, {fc.get('y0'):.1f}) - ({fc.get('x1'):.1f}, {fc.get('y1'):.1f})")
+                            st.markdown(f"**Legend-like Chunks:** {len(legend_chunks)}")
+                            st.markdown(f"**Definitions found:** {len(definitions)}")
+                            for i, d in enumerate(definitions[:5]):
+                                kw = d.get('keyword', '')[:30]
+                                st.markdown(f"  - `{d.get('indicator')}`: {kw}... @ ({d.get('x0'):.1f}, {d.get('y0'):.1f})")
+                            st.markdown(f"**Instances found:** {len(instances)}")
+                            for i, inst in enumerate(instances[:10]):
+                                st.markdown(f"  - `{inst.get('indicator')}` @ ({inst.get('x0'):.1f}, {inst.get('y0'):.1f})")
+                            st.markdown(f"**Total page tokens:** {len(all_page_tokens)}")
+                            if all_page_tokens:
+                                st.markdown(f"**Sample tokens (first 20):**")
+                                for t in all_page_tokens[:20]:
+                                    st.markdown(f"  - `{t.get('text')}` @ ({t.get('x0'):.1f}, {t.get('y0'):.1f})")
+                    
+                    # Determine detection method
+                    if definitions or instances:
+                        detection_method = "ade"
+                        fence_found = True
+                    else:
+                        # ADE didn't find structured data, fall back to pre-filter results
+                        print(f"[APP] Page {page_num}: ADE found no definitions, using pre-filter results.")
+                        fallback_result = prefilter_result
+                        keyword_matches = prefilter_result.get("matched_lines", [])
+                        detection_method = prefilter_result["method"]
             
             # Build text snippet from definitions or fallback keywords
             text_snippet = None
@@ -584,7 +586,7 @@ if st.session_state.run_analysis_triggered and \
                     )
             
             # Build result structure (matching app.py format)
-            detection_method = "ade" if (definitions or instances) else (fallback_result["method"] if fallback_result else "none")
+            # detection_method already set above based on flow
             llm_result = fallback_result.get("llm_result") if fallback_result else None
             
             analysis_result = {
