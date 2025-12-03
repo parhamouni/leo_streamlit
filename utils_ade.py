@@ -98,12 +98,9 @@ def align_ade_chunks_to_page(ade_result: Dict, page_idx: int, page_width: float,
     return page_chunks
 
 
-def segment_chunks(chunks: List[Dict]) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+def segment_chunks(chunks: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     """
-    Segment chunks into:
-    - legend_like: chunks to search for fence definitions (includes all non-figure chunks)
-    - figure_like: chunks to search for indicator instances
-    - true_legend: chunks that are actual legend/keynote areas (for exclusion from instance finding)
+    Segment chunks into legend-like (for definition extraction) and figure-like (for instance finding).
     
     A chunk is figure-like if:
     - It's typed as 'figure' or 'architectural_drawing'
@@ -113,8 +110,6 @@ def segment_chunks(chunks: List[Dict]) -> Tuple[List[Dict], List[Dict], List[Dic
     """
     legend_like = []
     figure_like = []
-    true_legend = []  # Only chunks with explicit legend/keynote headers
-    
     for chunk in chunks:
         raw_type = (chunk.get("type") or "").lower()
         text = chunk.get("text") or ""
@@ -123,18 +118,14 @@ def segment_chunks(chunks: List[Dict]) -> Tuple[List[Dict], List[Dict], List[Dic
         
         is_figure = raw_type in {"figure", "architectural_drawing"}
         # Check for explicit legend section headers
-        has_legend_hint = any(token in text_start for token in {"legend", "keynote", "abbreviation", "symbols", "key notes"})
+        has_legend_hint = any(token in text_start for token in {"legend", "keynote", "abbreviation", "symbols"})
 
         if is_figure and not has_legend_hint:
             figure_like.append(chunk)
         else:
             legend_like.append(chunk)
-            # Only add to true_legend if it has explicit legend markers
-            if has_legend_hint:
-                true_legend.append(chunk)
-    
-    print(f"[DEBUG] Segmented: {len(legend_like)} Legend-like, {len(figure_like)} Figure-like, {len(true_legend)} True-legend chunks.")
-    return legend_like, figure_like, true_legend
+    print(f"[DEBUG] Segmented: {len(legend_like)} Legend-like chunks, {len(figure_like)} Figure-like chunks.")
+    return legend_like, figure_like
 
 
 # ==============================================================================
@@ -480,10 +471,9 @@ def extract_legend_entries(
     return results
 
 
-def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Dict], all_tokens: List[Dict], legend_chunks: List[Dict] = None) -> List[Dict]:
+def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Dict], all_tokens: List[Dict]) -> List[Dict]:
     """
     Find instances of legend indicators ONLY within figure/architectural_drawing chunks.
-    Excludes tokens that fall within legend chunk areas.
     
     Args:
         legend_entries: List of definitions with 'indicator' field
@@ -518,13 +508,7 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
         return []
     
     # Get legend bounding boxes to exclude (don't match indicators in legend area)
-    # Use legend_chunks (full ADE-detected legend regions) for better exclusion
     legend_bboxes = []
-    if legend_chunks:
-        for chunk in legend_chunks:
-            if all(k in chunk for k in ['x0', 'y0', 'x1', 'y1']):
-                legend_bboxes.append((chunk['x0'], chunk['y0'], chunk['x1'], chunk['y1']))
-    # Also add individual definition bboxes as fallback
     for entry in legend_entries:
         if all(k in entry for k in ['x0', 'y0', 'x1', 'y1']):
             legend_bboxes.append((entry['x0'], entry['y0'], entry['x1'], entry['y1']))
@@ -538,29 +522,17 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
                 return True
         return False
     
-    # Filter tokens to those inside or near figure chunks
-    # Expand figure boundaries to catch indicator callouts placed around the drawing
-    FIGURE_MARGIN = 100  # points (~1.4 inches) to expand figure boundary
-    
+    # Filter tokens to only those inside figure chunks
     figure_tokens = []
-    added_positions = set()  # Avoid duplicates
-    
     for chunk in figure_chunks:
-        # Expand the chunk boundary to catch nearby callouts
-        cx0 = max(0, chunk["x0"] - FIGURE_MARGIN)
-        cy0 = max(0, chunk["y0"] - FIGURE_MARGIN)
-        cx1 = chunk["x1"] + FIGURE_MARGIN
-        cy1 = chunk["y1"] + FIGURE_MARGIN
-        
+        cx0, cy0, cx1, cy1 = chunk["x0"], chunk["y0"], chunk["x1"], chunk["y1"]
         for t in all_tokens:
-            # Check if token center is inside expanded chunk
+            # Check if token center is inside chunk
             tx, ty = (t['x0'] + t['x1']) / 2, (t['y0'] + t['y1']) / 2
-            pos_key = (round(tx), round(ty))
-            if pos_key not in added_positions and cx0 <= tx <= cx1 and cy0 <= ty <= cy1:
+            if cx0 <= tx <= cx1 and cy0 <= ty <= cy1:
                 figure_tokens.append(t)
-                added_positions.add(pos_key)
     
-    print(f"[DEBUG] Tokens inside/near figure chunks: {len(figure_tokens)} (out of {len(all_tokens)} total)")
+    print(f"[DEBUG] Tokens inside figure chunks: {len(figure_tokens)} (out of {len(all_tokens)} total)")
     
     # Search for indicator matches
     # For short numeric indicators (1-2 digits), require EXACT match to avoid false positives

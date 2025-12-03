@@ -139,14 +139,32 @@ def generate_combined_highlighted_pdf(original_pdf_bytes, fence_pages_results_li
             output_doc.insert_pdf(input_doc, from_page=page_idx, to_page=page_idx)
             page_out = output_doc.load_page(len(output_doc) - 1)
             
-            # Get page dimensions for scaling
-            pdf_width = res_data.get('pdf_width', page_out.rect.width)
-            pdf_height = res_data.get('pdf_height', page_out.rect.height)
+            # Get page rotation and MediaBox dimensions for coordinate transform
+            # Coordinates in definitions/instances are in DISPLAY space (after rotation)
+            # but draw_rect expects MediaBox space, so we need to reverse the transform
+            rotation = page_out.rotation
+            mediabox_w = page_out.mediabox.width
+            mediabox_h = page_out.mediabox.height
+            
+            def reverse_rotation_transform(x0, y0, x1, y1):
+                """Transform display coords back to MediaBox coords for PDF annotation."""
+                if rotation == 0:
+                    return x0, y0, x1, y1
+                elif rotation == 90:
+                    # Display->MediaBox: (x,y) -> (y, mediabox_h - x)
+                    return y0, mediabox_h - x1, y1, mediabox_h - x0
+                elif rotation == 180:
+                    return mediabox_w - x1, mediabox_h - y1, mediabox_w - x0, mediabox_h - y0
+                elif rotation == 270:
+                    # Display->MediaBox: (x,y) -> (mediabox_w - y, x)
+                    return mediabox_w - y1, x0, mediabox_w - y0, x1
+                return x0, y0, x1, y1
             
             # Draw definition boxes (green)
             definitions = res_data.get('definitions', [])
             for d in definitions:
-                r = fitz.Rect(d['x0'], d['y0'], d['x1'], d['y1'])
+                mx0, my0, mx1, my1 = reverse_rotation_transform(d['x0'], d['y0'], d['x1'], d['y1'])
+                r = fitz.Rect(mx0, my0, mx1, my1)
                 r.normalize()
                 if not r.is_empty and r.is_valid:
                     page_out.draw_rect(r, color=(0, 0.9, 0), width=2.0, overlay=True)
@@ -154,10 +172,21 @@ def generate_combined_highlighted_pdf(original_pdf_bytes, fence_pages_results_li
             # Draw instance boxes (purple)
             instances = res_data.get('instances', [])
             for inst in instances:
-                r = fitz.Rect(inst['x0'], inst['y0'], inst['x1'], inst['y1'])
+                mx0, my0, mx1, my1 = reverse_rotation_transform(inst['x0'], inst['y0'], inst['x1'], inst['y1'])
+                r = fitz.Rect(mx0, my0, mx1, my1)
                 r.normalize()
                 if not r.is_empty and r.is_valid:
                     page_out.draw_rect(r, color=(0.9, 0, 0.9), width=2.0, overlay=True)
+            
+            # Draw keyword match boxes (orange) - for fallback detection
+            keyword_matches = res_data.get('keyword_matches', [])
+            for kw in keyword_matches:
+                if all(k in kw for k in ['x0', 'y0', 'x1', 'y1']):
+                    mx0, my0, mx1, my1 = reverse_rotation_transform(kw['x0'], kw['y0'], kw['x1'], kw['y1'])
+                    r = fitz.Rect(mx0, my0, mx1, my1)
+                    r.normalize()
+                    if not r.is_empty and r.is_valid:
+                        page_out.draw_rect(r, color=(1.0, 0.65, 0), width=2.0, overlay=True)
                     
         except Exception as e_pi:
             print(f"SESSION {session_id} Err process pg {page_idx} for PDF: {e_pi}")
@@ -404,7 +433,7 @@ if st.session_state.run_analysis_triggered and \
             
             # Align ADE chunks to this page
             chunks = ade.align_ade_chunks_to_page(st.session_state.ade_result, page_idx, pdf_width, pdf_height)
-            legend_chunks, figure_chunks, true_legend_chunks = ade.segment_chunks(chunks)
+            legend_chunks, figure_chunks = ade.segment_chunks(chunks)
             
             # Get text lines for matching
             pdf_lines = ade.get_native_pdf_lines(page)
@@ -467,10 +496,10 @@ if st.session_state.run_analysis_triggered and \
                 sample = all_page_tokens[0]
                 print(f"[DEBUG] Sample token after transform: '{sample['text']}' at ({sample['x0']:.1f}, {sample['y0']:.1f})")
             
-            # Find instances in figures (exclude true legend areas like KEY NOTES)
+            # Find instances in figures
             instances = []
             if definitions and figure_chunks:
-                instances = ade.find_instances_in_figures(definitions, figure_chunks, all_page_tokens, true_legend_chunks)
+                instances = ade.find_instances_in_figures(definitions, figure_chunks, all_page_tokens)
             
             # DEBUG: Show coordinate info if enabled
             if DEBUG_MODE:
