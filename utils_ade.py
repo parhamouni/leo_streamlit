@@ -661,8 +661,10 @@ def create_single_page_pdf(pdf_bytes: bytes, page_index: int) -> bytes:
 
 def scan_page_for_keywords(pdf_lines: List[Dict], ocr_lines: List[Dict], fence_keywords: List[str]) -> Dict:
     """
-    Scan page text for fence-related keywords.
+    Scan page text for fence-related keywords using word boundary matching.
     Returns dict with matched keywords and their locations.
+    
+    Uses regex word boundaries to avoid false positives like "gate" in "aggregate".
     """
     all_lines = pdf_lines + ocr_lines
     combined_text = " ".join(line.get("text", "") for line in all_lines).lower()
@@ -672,11 +674,14 @@ def scan_page_for_keywords(pdf_lines: List[Dict], ocr_lines: List[Dict], fence_k
     
     for keyword in fence_keywords:
         kw_lower = keyword.lower()
-        if kw_lower in combined_text:
+        # Use word boundary matching to avoid partial matches (e.g., "gate" in "aggregate")
+        pattern = r'\b' + re.escape(kw_lower) + r'\b'
+        if re.search(pattern, combined_text):
             matches.append(keyword)
-            # Find lines containing this keyword
+            # Find lines containing this keyword (with word boundary)
             for line in all_lines:
-                if kw_lower in line.get("text", "").lower():
+                line_text = line.get("text", "").lower()
+                if re.search(pattern, line_text):
                     matched_lines.append({
                         "keyword": keyword,
                         "text": line.get("text", ""),
