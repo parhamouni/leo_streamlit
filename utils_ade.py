@@ -665,6 +665,7 @@ def scan_page_for_keywords(pdf_lines: List[Dict], ocr_lines: List[Dict], fence_k
     Returns dict with matched keywords and their locations.
     
     Uses regex word boundaries to avoid false positives like "gate" in "aggregate".
+    Also handles common plural forms (gate -> gates, fence -> fences, etc.)
     """
     all_lines = pdf_lines + ocr_lines
     combined_text = " ".join(line.get("text", "") for line in all_lines).lower()
@@ -674,8 +675,9 @@ def scan_page_for_keywords(pdf_lines: List[Dict], ocr_lines: List[Dict], fence_k
     
     for keyword in fence_keywords:
         kw_lower = keyword.lower()
-        # Use word boundary matching to avoid partial matches (e.g., "gate" in "aggregate")
-        pattern = r'\b' + re.escape(kw_lower) + r'\b'
+        # Use word boundary matching with optional plural suffix (s, es, ing)
+        # This matches: gate, gates, gating; fence, fences, fencing; etc.
+        pattern = r'\b' + re.escape(kw_lower) + r'(?:s|es|ing)?\b'
         if re.search(pattern, combined_text):
             matches.append(keyword)
             # Find lines containing this keyword (with word boundary)
@@ -708,8 +710,9 @@ def llm_classify_page(llm, page_text: str, fence_keywords: List[str]) -> Dict:
     if not llm or not page_text:
         return {"is_fence_related": False, "confidence": 0.0, "reason": "No LLM or text"}
     
-    # Truncate if too long
-    text_for_llm = page_text[:8000] if len(page_text) > 8000 else page_text
+    # FIX 1: Increase text limit from 8000 to 16000 to capture fence content
+    # that often appears at the end of pages (legends, notes, schedules)
+    text_for_llm = page_text[:16000] if len(page_text) > 16000 else page_text
     keywords_hint = ", ".join(fence_keywords[:15])
     
     prompt = f"""You are analyzing an engineering drawing page to determine if it contains fence-related content.
@@ -784,7 +787,27 @@ def fallback_fence_detection(
     
     print(f"[DEBUG] Keywords found: {keyword_result['matched_keywords']}")
     
-    # Step 2: LLM confirmation (if enabled and available)
+    # FIX 2: High-signal keywords that should NOT be overridden by LLM rejection
+    # These are specific fence-related terms that strongly indicate fence content
+    HIGH_SIGNAL_KEYWORDS = {
+        'fence', 'fencing', 'gate', 'gates', 'chain link', 'guardrail', 
+        'railing', 'handrail', 'bollard', 'barrier'
+    }
+    
+    matched_lower = {kw.lower() for kw in keyword_result["matched_keywords"]}
+    has_high_signal = bool(matched_lower & HIGH_SIGNAL_KEYWORDS)
+    
+    if has_high_signal:
+        print(f"[DEBUG] High-signal keywords found: {matched_lower & HIGH_SIGNAL_KEYWORDS} - trusting keywords over LLM")
+        return {
+            "fence_found": True,
+            "method": "keyword_high_signal",
+            "matched_keywords": keyword_result["matched_keywords"],
+            "matched_lines": keyword_result["matched_lines"],
+            "llm_result": None
+        }
+    
+    # Step 2: LLM confirmation (if enabled and available) for lower-signal keywords
     llm_result = None
     if use_llm_confirmation and llm:
         all_lines = pdf_lines + ocr_lines
