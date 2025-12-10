@@ -61,7 +61,7 @@ def initialize_session_state(session_id_val):
         'current_pdf_hash': None,
         'highlighted_pdf_bytes_for_download': None,
         'last_uploaded_file_id': None,
-        'selected_model_for_analysis': "gpt-4o-mini",
+        'selected_model_for_analysis': "gpt-5.1",
     }
     for key, value in default_state.items():
         if key not in st.session_state:
@@ -230,8 +230,7 @@ with st.sidebar:
     if not ade_key:
         ade_key = st.text_input("Enter LandingAI API Key", type="password", key="ade_key_input_sidebar")
     
-    # 3. Google Cloud Config (JSON)
-    st.markdown("---")
+    # 3. Google Cloud Config (JSON) - load silently without UI messages
     google_cloud_config = None
     try:
         if "google_cloud" in secrets and "gcp_service_account" in secrets:
@@ -241,31 +240,9 @@ with st.sidebar:
                 "processor_id": secrets["google_cloud"]["processor_id"],
                 "service_account_info": dict(secrets["gcp_service_account"])
             }
-            st.success("✅ Google Cloud OCR Config Loaded")
             print(f"SESSION {current_session_id} LOG: Google Cloud config loaded from secrets")
     except Exception as e:
         print(f"SESSION {current_session_id} WARNING: Could not load Google Cloud config: {e}")
-    
-    if not google_cloud_config:
-        st.warning("⚠️ Google Cloud Config Missing (OCR disabled)")
-    
-    # Model Selection
-    st.markdown("---")
-    st.subheader("Model Selection")
-    model_options = {
-        "gpt-4o-mini (fast, recommended for ADE)": "gpt-4o-mini",
-        "gpt-4o (128k context)": "gpt-4o",
-        "gpt-4-turbo (128k context)": "gpt-4-turbo",
-        "gpt-3.5-turbo (16k context, fastest)": "gpt-3.5-turbo"
-    }
-    current_model_val = st.session_state.selected_model_for_analysis
-    if current_model_val not in model_options.values():
-        current_model_val = list(model_options.values())[0]
-    st.session_state.selected_model_for_analysis = current_model_val
-    default_model_idx = list(model_options.values()).index(current_model_val)
-    selected_label = st.radio("Select LLM:", list(model_options.keys()), key="model_selector_radio", index=default_model_idx)
-    st.session_state.selected_model_for_analysis = model_options[selected_label]
-    st.info(f"Using: **{st.session_state.selected_model_for_analysis}**")
     
     # Highlight toggle
     st.markdown("---")
