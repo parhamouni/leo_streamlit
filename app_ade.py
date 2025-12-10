@@ -271,6 +271,9 @@ with st.sidebar:
     st.markdown("---")
     highlight_fence_text_app = st.toggle("🔍 Highlight text & indicators", value=True, key="highlight_toggle")
     
+    # ADE usage toggle
+    use_ade = st.toggle("🧠 Use ADE (LandingAI)", value=True, key="use_ade_toggle")
+    
     # Debug mode
     DEBUG_MODE = st.checkbox("🛠️ Enable Debug View", value=False)
     
@@ -345,7 +348,8 @@ if uploaded_pdf_file_obj:
         print(f"SESSION {current_session_id} LOG: Cleared all @st.cache_data caches due to new file.")
         st.rerun()
     
-    if openai_key and ade_key and llm_analysis_instance and \
+    if openai_key and llm_analysis_instance and \
+       (ade_key or not use_ade) and \
        not st.session_state.run_analysis_triggered and \
        not st.session_state.processing_complete and \
        not st.session_state.analysis_halted_due_to_error:
@@ -360,7 +364,7 @@ if uploaded_pdf_file_obj:
 if st.session_state.run_analysis_triggered and \
    st.session_state.original_pdf_bytes and \
    llm_analysis_instance and \
-   ade_key and \
+   (ade_key or not use_ade) and \
    not st.session_state.analysis_halted_due_to_error and \
    not st.session_state.processing_complete:
     
@@ -450,27 +454,34 @@ if st.session_state.run_analysis_triggered and \
                 detection_method = "none"
             else:
                 # =====================================================================
-                # STEP 3: FENCE PAGE - Send single page to ADE
+                # STEP 3: FENCE PAGE - optionally send single page to ADE
                 # =====================================================================
-                print(f"[APP] Page {page_num}: Pre-filter detected fence content via {prefilter_result['method']}")
-                status_txt_area.text(f"Page {page_num}/{total_pages}: Sending to ADE for detailed extraction...")
-                
-                ade_response = ade.ade_parse_document(single_page_pdf, ade_key)
-                
-                if not ade_response["success"]:
-                    # ADE failed - use pre-filter results as fallback
-                    print(f"[APP] Page {page_num}: ADE failed ({ade_response['error']}), using pre-filter results.")
+                if use_ade and ade_key:
+                    print(f"[APP] Page {page_num}: Pre-filter detected fence content via {prefilter_result['method']}, sending to ADE...")
+                    status_txt_area.text(f"Page {page_num}/{total_pages}: Sending to ADE for detailed extraction...")
+                    
+                    ade_response = ade.ade_parse_document(single_page_pdf, ade_key)
+                    
+                    if not ade_response["success"]:
+                        # ADE failed - use pre-filter results as fallback
+                        print(f"[APP] Page {page_num}: ADE failed ({ade_response['error']}), using pre-filter results.")
+                        fallback_result = prefilter_result
+                        keyword_matches = prefilter_result.get("matched_lines", [])
+                        detection_method = prefilter_result["method"]
+                    else:
+                        # =====================================================================
+                        # STEP 4: Process ADE results (page_idx=0 since single-page PDF)
+                        # =====================================================================
+                        status_txt_area.text(f"Page {page_num}/{total_pages}: Extracting definitions...")
+                        
+                        chunks = ade.align_ade_chunks_to_page(ade_response, 0, pdf_width, pdf_height)
+                        legend_chunks, figure_chunks = ade.segment_chunks(chunks)
+                else:
+                    # ADE disabled or no key: rely solely on pre-filter result
+                    print(f"[APP] Page {page_num}: ADE is disabled or missing key; using pre-filter result only.")
                     fallback_result = prefilter_result
                     keyword_matches = prefilter_result.get("matched_lines", [])
                     detection_method = prefilter_result["method"]
-                else:
-                    # =====================================================================
-                    # STEP 4: Process ADE results (page_idx=0 since single-page PDF)
-                    # =====================================================================
-                    status_txt_area.text(f"Page {page_num}/{total_pages}: Extracting definitions...")
-                    
-                    chunks = ade.align_ade_chunks_to_page(ade_response, 0, pdf_width, pdf_height)
-                    legend_chunks, figure_chunks = ade.segment_chunks(chunks)
                     
                     # Debug visualization
                     if DEBUG_MODE and (legend_chunks or pdf_lines or ocr_lines):
