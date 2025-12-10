@@ -251,8 +251,8 @@ with st.sidebar:
     # ADE usage toggle
     use_ade = st.toggle("🧠 Use ADE (LandingAI)", value=True, key="use_ade_toggle")
     
-    # Debug mode
-    DEBUG_MODE = st.checkbox("🛠️ Enable Debug View", value=False)
+    # Debug mode (disabled in UI)
+    DEBUG_MODE = False
     
     # Fence Keywords
     st.markdown("---")

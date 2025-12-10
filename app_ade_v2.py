@@ -244,8 +244,8 @@ with st.sidebar:
     st.markdown("---")
     highlight_fence_text_app = st.toggle("🔍 Highlight text & indicators", value=True, key="highlight_toggle")
     
-    # Debug mode
-    DEBUG_MODE = st.checkbox("🛠️ Enable Debug View", value=False)
+    # Debug mode (disabled in UI)
+    DEBUG_MODE = False
     
     # Fence Keywords
     st.markdown("---")

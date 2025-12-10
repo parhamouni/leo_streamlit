@@ -235,7 +235,8 @@ with st.sidebar:
     )
     FENCE_KEYWORDS = [k.strip() for k in fence_keywords_str.split(",") if k.strip()]
     
-    DEBUG_MODE = st.checkbox("🛠️ Debug Mode", value=False)
+    # Debug mode (disabled in UI)
+    DEBUG_MODE = False
 
 # ==============================================================================
 # Main Processing

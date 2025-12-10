@@ -57,8 +57,8 @@ with st.sidebar:
     )
     FENCE_KEYWORDS = [k.strip() for k in fence_keywords_str.split(",") if k.strip()]
 
-    st.markdown("---")
-    DEBUG_MODE = st.checkbox("🛠️ Enable Debug View", value=False)
+    # Debug mode (disabled in UI)
+    DEBUG_MODE = False
 
 # ==============================================================================
 # 2. Main Logic
