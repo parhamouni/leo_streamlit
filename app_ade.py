@@ -763,6 +763,8 @@ if st.session_state.run_analysis_triggered and \
                             st.info("📂 Method: Layer-based (fence layers detected)")
                         elif method == "proximity":
                             st.info("🎯 Method: Proximity-based (fallback)")
+                        elif method == "no_layers":
+                            st.error("❌ No fence layers found in PDF - measurement not available")
                         
                         # Show scale info
                         if page_info.get('scale_detected'):

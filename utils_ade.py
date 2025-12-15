@@ -1204,56 +1204,11 @@ def measure_fence_elements(
         print(f"[DEBUG] Layer-based measurement: {len(final_fence_lines)} lines")
     
     else:
-        # FALLBACK: Use proximity-based connected-line tracing
-        measurement_method = "proximity"
-        all_page_lines = extract_vector_lines(page)
-        
-        # Only search within figure bboxes
-        if figure_bboxes:
-            all_page_lines = [l for l in all_page_lines if line_in_any_bbox(l, figure_bboxes)]
-        
-        print(f"[DEBUG] Fallback proximity search in {len(all_page_lines)} lines")
-        
-        seen_line_ids = set()
-        
-        for item in list(fence_instances) + list(fence_definitions):
-            ind = item.get("indicator", "") or item.get("keyword", "")
-            if not ind:
-                continue
-            
-            bbox = (item.get("x0", 0), item.get("y0", 0), 
-                    item.get("x1", 0), item.get("y1", 0))
-            
-            if bbox[2] - bbox[0] < 1:
-                continue
-            
-            # Find connected run from this indicator
-            connected_run = find_fence_run_from_indicator(
-                all_page_lines, bbox,
-                max_initial_distance=80.0,
-                connection_tolerance=5.0
-            )
-            
-            if connected_run:
-                new_lines = [l for l in connected_run if id(l) not in seen_line_ids]
-                final_fence_lines.extend(new_lines)
-                for l in new_lines:
-                    seen_line_ids.add(id(l))
-                
-                total = calculate_total_length(connected_run, scale_factor)
-                if ind not in indicator_measurements:
-                    indicator_measurements[ind] = {
-                        'instance_count': 0,
-                        'run_segment_count': 0,
-                        'run_length_feet': 0.0,
-                        'run_length_pts': 0.0
-                    }
-                indicator_measurements[ind]['instance_count'] += 1
-                indicator_measurements[ind]['run_segment_count'] += total['segment_count']
-                indicator_measurements[ind]['run_length_feet'] += total['total_feet']
-                indicator_measurements[ind]['run_length_pts'] += total['total_pts']
-        
-        print(f"[DEBUG] Proximity-based measurement: {len(final_fence_lines)} lines")
+        # NO FENCE LAYERS FOUND - Skip proximity fallback as it's unreliable
+        # (Parking stripes and other repeating patterns get incorrectly detected)
+        measurement_method = "no_layers"
+        print(f"[DEBUG] No fence layers found - measurement skipped (proximity fallback disabled)")
+        print(f"[DEBUG] Hint: PDFs without layer information cannot be reliably measured")
     
     # Round indicator measurements
     for ind in indicator_measurements:
