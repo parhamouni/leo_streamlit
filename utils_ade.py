@@ -1206,14 +1206,14 @@ def measure_fence_elements(
     else:
         # ALTERNATIVE: For layerless PDFs, use length-based filtering
         # Analysis shows: parking stripes are tiny segments (<10 pts avg)
-        # while fence lines tend to have segments > 30 pts
+        # while fence lines tend to have segments > 80 pts
         measurement_method = "length_filter"
         print(f"[DEBUG] No fence layers found - using length-based filtering")
         
         all_page_lines = extract_vector_lines(page)
         
-        # Filter 1: Only consider lines > 30 pts (excludes 95% of hatching/patterns)
-        MIN_LINE_LENGTH = 30.0
+        # Filter 1: Only consider lines > 80 pts (stricter filter)
+        MIN_LINE_LENGTH = 80.0
         candidate_lines = [l for l in all_page_lines if l.length_pts > MIN_LINE_LENGTH]
         print(f"[DEBUG] Lines > {MIN_LINE_LENGTH} pts: {len(candidate_lines)} (from {len(all_page_lines)})")
         
@@ -1222,7 +1222,7 @@ def measure_fence_elements(
             candidate_lines = [l for l in candidate_lines if line_in_any_bbox(l, figure_bboxes)]
             print(f"[DEBUG] After figure constraint: {len(candidate_lines)}")
         
-        # Find lines near each indicator using simple proximity (no connected tracing)
+        # Find lines near each indicator using STRICT proximity (margin=50)
         seen_line_ids = set()
         
         for item in list(fence_instances) + list(fence_definitions):
@@ -1236,8 +1236,8 @@ def measure_fence_elements(
             if bbox[2] - bbox[0] < 1:
                 continue
             
-            # Find lines near this indicator (simple proximity, no tracing)
-            nearby = find_lines_near_bbox(candidate_lines, bbox, margin=100.0)
+            # Find lines VERY close to this indicator (strict proximity)
+            nearby = find_lines_near_bbox(candidate_lines, bbox, margin=50.0)
             
             if nearby:
                 new_lines = [l for l in nearby if id(l) not in seen_line_ids]
