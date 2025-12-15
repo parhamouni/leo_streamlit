@@ -1114,43 +1114,70 @@ def measure_fence_elements(
             'runs': group_measurements[:10]  # Top 10 runs
         }
     
-    # Try to associate measurements with detected indicators
+    # =========================================================================
+    # PROXIMITY-BASED MEASUREMENT: Find lines near each indicator instance
+    # =========================================================================
+    # Extract ALL lines from the page (not just fence layers) for proximity matching
+    all_page_lines = extract_vector_lines(page)
+    print(f"[DEBUG] Total lines on page: {len(all_page_lines)}")
+    
     indicator_measurements = {}
-    for instance in fence_instances:
-        ind = instance.get("indicator", "")
+    proximity_lines = []  # Lines associated with indicators
+    
+    # Combine instances and definitions for proximity search
+    all_indicator_locations = list(fence_instances) + list(fence_definitions)
+    
+    for item in all_indicator_locations:
+        ind = item.get("indicator", "") or item.get("keyword", "")
         if not ind:
             continue
         
-        # Get bbox center
-        cx = (instance.get("x0", 0) + instance.get("x1", 0)) / 2
-        cy = (instance.get("y0", 0) + instance.get("y1", 0)) / 2
-        bbox = (instance.get("x0", 0), instance.get("y0", 0), 
-                instance.get("x1", 0), instance.get("y1", 0))
+        # Get bbox
+        bbox = (item.get("x0", 0), item.get("y0", 0), 
+                item.get("x1", 0), item.get("y1", 0))
         
-        # Find lines near this indicator
-        nearby_lines = find_lines_near_bbox(fence_lines, bbox, margin=100.0)
+        # Skip if bbox is invalid
+        if bbox[2] - bbox[0] < 1 or bbox[3] - bbox[1] < 1:
+            continue
+        
+        # Find lines near this indicator with larger margin (200 pts = ~2.8 inches)
+        nearby_lines = find_lines_near_bbox(all_page_lines, bbox, margin=200.0)
         
         if nearby_lines:
+            proximity_lines.extend(nearby_lines)
             nearby_total = calculate_total_length(nearby_lines, scale_factor)
+            
             if ind not in indicator_measurements:
                 indicator_measurements[ind] = {
                     'instance_count': 0,
                     'nearby_segment_count': 0,
-                    'nearby_length_feet': 0.0
+                    'nearby_length_feet': 0.0,
+                    'nearby_length_pts': 0.0
                 }
             indicator_measurements[ind]['instance_count'] += 1
             indicator_measurements[ind]['nearby_segment_count'] += nearby_total['segment_count']
             indicator_measurements[ind]['nearby_length_feet'] += nearby_total['total_feet']
+            indicator_measurements[ind]['nearby_length_pts'] += nearby_total['total_pts']
     
     # Round indicator measurements
     for ind in indicator_measurements:
         indicator_measurements[ind]['nearby_length_feet'] = round(
             indicator_measurements[ind]['nearby_length_feet'], 2
         )
+        indicator_measurements[ind]['nearby_length_pts'] = round(
+            indicator_measurements[ind]['nearby_length_pts'], 1
+        )
     
-    # Calculate grand totals
+    # Deduplicate proximity lines for visualization
+    proximity_lines_unique = list({id(l): l for l in proximity_lines}.values())
+    print(f"[DEBUG] Proximity-based lines: {len(proximity_lines_unique)}")
+    
+    # Calculate grand totals from layer-based (for backward compatibility)
     grand_total_segments = sum(m['total_segments'] for m in layer_measurements.values())
     grand_total_feet = sum(m['total_length_feet'] for m in layer_measurements.values())
+    
+    # Calculate proximity-based totals
+    proximity_total = calculate_total_length(proximity_lines_unique, scale_factor) if proximity_lines_unique else {}
     
     result = {
         'page_info': {
@@ -1161,9 +1188,14 @@ def measure_fence_elements(
             'scale_detected': scale_factor != 1.0
         },
         'fence_layers': fence_layers,
-        'all_fence_lines': fence_lines,  # Return lines for visualization
+        'all_fence_lines': proximity_lines_unique if proximity_lines_unique else fence_lines,  # Prefer proximity lines
         'layer_measurements': layer_measurements,
         'indicator_measurements': indicator_measurements,
+        'proximity_totals': {
+            'total_segments': proximity_total.get('segment_count', 0),
+            'total_length_feet': round(proximity_total.get('total_feet', 0), 2),
+            'total_length_pts': round(proximity_total.get('total_pts', 0), 1)
+        },
         'totals': {
             'total_layers': len(layer_measurements),
             'total_segments': grand_total_segments,
@@ -1171,7 +1203,7 @@ def measure_fence_elements(
         }
     }
     
-    print(f"[DEBUG] Measurement complete: {grand_total_feet:.1f} ft across {grand_total_segments} segments")
+    print(f"[DEBUG] Measurement complete: Layer-based={grand_total_feet:.1f} ft, Proximity-based={proximity_total.get('total_feet', 0):.1f} ft")
     return result
 
 

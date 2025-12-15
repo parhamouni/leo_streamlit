@@ -746,38 +746,53 @@ if st.session_state.run_analysis_triggered and \
                             st.markdown("**LLM Analysis:**")
                             st.markdown(f"- Confidence: {llm_res.get('confidence', 0):.0%}")
                             st.markdown(f"- Reason: {llm_res.get('reason', 'N/A')}")
+                    
+                    # Show Measurements (for ALL fence pages, not just keyword matches)
+                    if measurement_result and (measurement_result.get('indicator_measurements') or measurement_result.get('totals', {}).get('total_length_feet', 0) > 0):
+                        st.markdown("---")
+                        st.markdown("### 📏 Fence Measurements")
                         
-                        # Show Measurements
-                        if measurement_result and measurement_result.get('totals', {}).get('total_length_feet', 0) > 0:
-                            st.markdown("---")
-                            st.markdown("### 📏 Fence Measurements")
-                            
-                            totals = measurement_result['totals']
-                            page_info = measurement_result.get('page_info', {})
-                            scale_factor = page_info.get('scale_factor', 1.0)
-                            
-                            # Show scale info
-                            if page_info.get('scale_detected'):
-                                st.success(f"✅ Scale Auto-Detected: 1\" = {scale_factor/12:.0f}'")
-                            else:
-                                st.warning("⚠️ Scale not detected - using 1:1 (unscaled)")
-                            
-                            # Show totals in both units
-                            col_px, col_ft = st.columns(2)
-                            with col_px:
-                                st.metric("Total (Pixels/Pts)", f"{totals.get('total_segments', 0):,} segments")
+                        page_info = measurement_result.get('page_info', {})
+                        scale_factor = page_info.get('scale_factor', 1.0)
+                        
+                        # Show scale info prominently
+                        if page_info.get('scale_detected'):
+                            st.success(f"✅ Scale Auto-Detected: 1\" = {scale_factor/12:.0f}' (factor: {scale_factor})")
+                        else:
+                            st.warning("⚠️ Scale not detected - showing raw measurements")
+                        
+                        # Show proximity-based measurements (primary)
+                        prox_totals = measurement_result.get('proximity_totals', {})
+                        if prox_totals.get('total_segments', 0) > 0:
+                            st.markdown("#### 🎯 Near Detected Indicators:")
+                            col_pts, col_ft = st.columns(2)
+                            with col_pts:
+                                st.metric("Total (Points)", f"{prox_totals.get('total_length_pts', 0):,.0f} pts")
                             with col_ft:
-                                st.metric("Total (Scaled)", f"{totals['total_length_feet']:.1f} ft")
+                                st.metric("Total (Scaled)", f"{prox_totals.get('total_length_feet', 0):.1f} ft")
                             
-                            # Layer breakdown with both units
-                            if measurement_result.get('fence_layers'):
-                                st.markdown("**Layer Breakdown:**")
+                            # Per-indicator breakdown
+                            indicator_meas = measurement_result.get('indicator_measurements', {})
+                            if indicator_meas:
+                                st.markdown("**Per-Indicator:**")
+                                for ind, stats in indicator_meas.items():
+                                    pts = stats.get('nearby_length_pts', 0)
+                                    ft = stats.get('nearby_length_feet', 0)
+                                    segs = stats.get('nearby_segment_count', 0)
+                                    count = stats.get('instance_count', 0)
+                                    st.markdown(f"- **{ind}**: {pts:,.0f} pts | **{ft:.1f} ft** ({segs} segs, {count} instances)")
+                        
+                        # Layer breakdown (secondary)
+                        if measurement_result.get('fence_layers'):
+                            with st.expander("📂 Layer-Based Breakdown", expanded=False):
+                                totals = measurement_result.get('totals', {})
+                                st.caption(f"Total from layers: {totals.get('total_segments', 0)} segs, {totals.get('total_length_feet', 0):.1f} ft")
                                 for layer in measurement_result['fence_layers']:
                                     l_stats = measurement_result['layer_measurements'].get(layer, {})
-                                    pts = l_stats.get('total_segments', 0)
+                                    segs = l_stats.get('total_segments', 0)
                                     ft = l_stats.get('total_length_feet', 0)
                                     runs = l_stats.get('connected_runs', 0)
-                                    st.markdown(f"- `{layer}`: **{pts} segs** | **{ft:.1f} ft** ({runs} runs)")
+                                    st.markdown(f"- `{layer}`: {segs} segs | {ft:.1f} ft ({runs} runs)")
                     
                     # Show message if nothing found
                     if not definitions and not instances and not keyword_matches:
@@ -990,36 +1005,51 @@ elif st.session_state.processing_complete:
                         
                         # Show Measurements
                         measurements = res_data_item.get('measurements')
-                        if measurements and measurements.get('totals', {}).get('total_length_feet', 0) > 0:
+                        if measurements and (measurements.get('indicator_measurements') or measurements.get('totals', {}).get('total_length_feet', 0) > 0):
                             st.markdown("---")
                             st.markdown("### 📏 Fence Measurements")
                             
-                            totals = measurements['totals']
                             page_info = measurements.get('page_info', {})
                             scale_factor = page_info.get('scale_factor', 1.0)
                             
-                            # Show scale info
+                            # Show scale info prominently
                             if page_info.get('scale_detected'):
-                                st.success(f"✅ Scale Auto-Detected: 1\" = {scale_factor/12:.0f}'")
+                                st.success(f"✅ Scale Auto-Detected: 1\" = {scale_factor/12:.0f}' (factor: {scale_factor})")
                             else:
-                                st.warning("⚠️ Scale not detected - using 1:1 (unscaled)")
+                                st.warning("⚠️ Scale not detected - showing raw measurements")
                             
-                            # Show totals in both units
-                            col_px, col_ft = st.columns(2)
-                            with col_px:
-                                st.metric("Total (Pixels/Pts)", f"{totals.get('total_segments', 0):,} segments")
-                            with col_ft:
-                                st.metric("Total (Scaled)", f"{totals['total_length_feet']:.1f} ft")
+                            # Show proximity-based measurements (primary)
+                            prox_totals = measurements.get('proximity_totals', {})
+                            if prox_totals.get('total_segments', 0) > 0:
+                                st.markdown("#### 🎯 Near Detected Indicators:")
+                                col_pts, col_ft = st.columns(2)
+                                with col_pts:
+                                    st.metric("Total (Points)", f"{prox_totals.get('total_length_pts', 0):,.0f} pts")
+                                with col_ft:
+                                    st.metric("Total (Scaled)", f"{prox_totals.get('total_length_feet', 0):.1f} ft")
+                                
+                                # Per-indicator breakdown
+                                indicator_meas = measurements.get('indicator_measurements', {})
+                                if indicator_meas:
+                                    st.markdown("**Per-Indicator:**")
+                                    for ind, stats in indicator_meas.items():
+                                        pts = stats.get('nearby_length_pts', 0)
+                                        ft = stats.get('nearby_length_feet', 0)
+                                        segs = stats.get('nearby_segment_count', 0)
+                                        count = stats.get('instance_count', 0)
+                                        st.markdown(f"- **{ind}**: {pts:,.0f} pts | **{ft:.1f} ft** ({segs} segs, {count} instances)")
                             
-                            # Layer breakdown with both units
+                            # Layer breakdown (secondary)
                             if measurements.get('fence_layers'):
-                                st.markdown("**Layer Breakdown:**")
-                                for layer in measurements['fence_layers']:
-                                    l_stats = measurements['layer_measurements'].get(layer, {})
-                                    pts = l_stats.get('total_segments', 0)
-                                    ft = l_stats.get('total_length_feet', 0)
-                                    runs = l_stats.get('connected_runs', 0)
-                                    st.markdown(f"- `{layer}`: **{pts} segs** | **{ft:.1f} ft** ({runs} runs)")
+                                with st.expander("📂 Layer-Based Breakdown", expanded=False):
+                                    totals = measurements.get('totals', {})
+                                    st.caption(f"Total from layers: {totals.get('total_segments', 0)} segs, {totals.get('total_length_feet', 0):.1f} ft")
+                                    for layer in measurements['fence_layers']:
+                                        l_stats = measurements['layer_measurements'].get(layer, {})
+                                        segs = l_stats.get('total_segments', 0)
+                                        ft = l_stats.get('total_length_feet', 0)
+                                        runs = l_stats.get('connected_runs', 0)
+                                        st.markdown(f"- `{layer}`: {segs} segs | {ft:.1f} ft ({runs} runs)")
                     
                     # Show message if nothing found
                     if not definitions and not instances and not keyword_matches:
