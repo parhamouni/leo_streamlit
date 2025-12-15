@@ -424,6 +424,7 @@ if st.session_state.run_analysis_triggered and \
             instances = []
             fallback_result = None
             keyword_matches = []
+            measurement_result = {}  # Initialize to empty dict to prevent undefined errors
             # Default detection method based on prefilter; can be overridden later
             detection_method = prefilter_result.get("method", "none")
             fence_found = prefilter_result["fence_found"]
