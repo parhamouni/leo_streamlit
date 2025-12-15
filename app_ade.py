@@ -421,6 +421,8 @@ if st.session_state.run_analysis_triggered and \
             instances = []
             fallback_result = None
             keyword_matches = []
+            # Default detection method based on prefilter; can be overridden later
+            detection_method = prefilter_result.get("method", "none")
             fence_found = prefilter_result["fence_found"]
             
             if not fence_found:
@@ -458,96 +460,99 @@ if st.session_state.run_analysis_triggered and \
                     print(f"[APP] Page {page_num}: ADE is disabled or missing key; using pre-filter result only.")
                     fallback_result = prefilter_result
                     keyword_matches = prefilter_result.get("matched_lines", [])
-                    detection_method = prefilter_result["method"]
-                    
-                    # Debug visualization
-                    if DEBUG_MODE and (legend_chunks or pdf_lines or ocr_lines):
-                        debug_bytes = ade.debug_visualize_coordinates(
-                            page_img_bytes, legend_chunks, pdf_lines, ocr_lines, pdf_width, pdf_height
-                        )
-                        st.image(debug_bytes, caption=f"DEBUG: Layers Page {page_num}", use_container_width=True)
-                    
-                    # Extract fence-related definitions from legend chunks
-                    if highlight_fence_text_app and legend_chunks:
-                        definitions = ade.extract_legend_entries(
-                            legend_chunks=legend_chunks,
-                            pdf_lines=pdf_lines,
-                            ocr_lines=ocr_lines,
-                            fence_keywords=FENCE_KEYWORDS_APP,
-                            llm=llm_analysis_instance
-                        )
-                    
-                    # Get all page tokens for instance finding
-                    # IMPORTANT: Transform MediaBox coords to display coords for rotated pages
-                    native_words = page.get_text("words")
-                    rotation = page.rotation
-                    mediabox_w = page.mediabox.width
-                    mediabox_h = page.mediabox.height
-                    print(f"[DEBUG] Page {page_num} rotation: {rotation}°, MediaBox: {mediabox_w:.0f}x{mediabox_h:.0f}")
-                    
-                    def transform_for_rotation(x0, y0, x1, y1):
-                        """Transform MediaBox coords to display coords based on page rotation"""
-                        if rotation == 0:
-                            return x0, y0, x1, y1
-                        elif rotation == 90:
-                            return mediabox_h - y1, x0, mediabox_h - y0, x1
-                        elif rotation == 180:
-                            return mediabox_w - x1, mediabox_h - y1, mediabox_w - x0, mediabox_h - y0
-                        elif rotation == 270:
-                            return y0, mediabox_w - x1, y1, mediabox_w - x0
+                
+                # =====================================================================
+                # STEP 5: Process chunks (runs for ALL fence pages)
+                # =====================================================================
+                # Debug visualization
+                if DEBUG_MODE and (legend_chunks or pdf_lines or ocr_lines):
+                    debug_bytes = ade.debug_visualize_coordinates(
+                        page_img_bytes, legend_chunks, pdf_lines, ocr_lines, pdf_width, pdf_height
+                    )
+                    st.image(debug_bytes, caption=f"DEBUG: Layers Page {page_num}", use_container_width=True)
+                
+                # Extract fence-related definitions from legend chunks
+                if highlight_fence_text_app and legend_chunks:
+                    definitions = ade.extract_legend_entries(
+                        legend_chunks=legend_chunks,
+                        pdf_lines=pdf_lines,
+                        ocr_lines=ocr_lines,
+                        fence_keywords=FENCE_KEYWORDS_APP,
+                        llm=llm_analysis_instance
+                    )
+                
+                # Get all page tokens for instance finding
+                # IMPORTANT: Transform MediaBox coords to display coords for rotated pages
+                native_words = page.get_text("words")
+                rotation = page.rotation
+                mediabox_w = page.mediabox.width
+                mediabox_h = page.mediabox.height
+                print(f"[DEBUG] Page {page_num} rotation: {rotation}°, MediaBox: {mediabox_w:.0f}x{mediabox_h:.0f}")
+                
+                def transform_for_rotation(x0, y0, x1, y1):
+                    """Transform MediaBox coords to display coords based on page rotation"""
+                    if rotation == 0:
                         return x0, y0, x1, y1
-                    
-                    all_page_tokens = []
-                    for w in native_words:
-                        nx0, ny0, nx1, ny1 = transform_for_rotation(w[0], w[1], w[2], w[3])
-                        all_page_tokens.append({
-                            "text": w[4], 
-                            "x0": nx0, "y0": ny0, 
-                            "x1": nx1, "y1": ny1
-                        })
-                    
-                    if all_page_tokens:
-                        sample = all_page_tokens[0]
-                        print(f"[DEBUG] Sample token after transform: '{sample['text']}' at ({sample['x0']:.1f}, {sample['y0']:.1f})")
-                    
-                    # Find instances in figures
-                    if definitions and figure_chunks:
-                        instances = ade.find_instances_in_figures(definitions, figure_chunks, all_page_tokens)
-                    
-                    # DEBUG: Show coordinate info if enabled
-                    if DEBUG_MODE:
-                        with st.expander(f"🔧 DEBUG Page {page_num}", expanded=True):
-                            st.markdown(f"**PDF size:** {pdf_width:.1f} x {pdf_height:.1f}")
-                            st.markdown(f"**All ADE Chunks:** {len(chunks)}")
-                            for i, c in enumerate(chunks[:10]):
-                                st.markdown(f"  - `{c.get('type')}`: ({c.get('x0'):.1f}, {c.get('y0'):.1f}) - ({c.get('x1'):.1f}, {c.get('y1'):.1f})")
-                            st.markdown(f"**Figure/Architectural Chunks:** {len(figure_chunks)}")
-                            for i, fc in enumerate(figure_chunks):
-                                st.markdown(f"  - `{fc.get('type')}`: ({fc.get('x0'):.1f}, {fc.get('y0'):.1f}) - ({fc.get('x1'):.1f}, {fc.get('y1'):.1f})")
-                            st.markdown(f"**Legend-like Chunks:** {len(legend_chunks)}")
-                            st.markdown(f"**Definitions found:** {len(definitions)}")
-                            for i, d in enumerate(definitions[:5]):
-                                kw = d.get('keyword', '')[:30]
-                                st.markdown(f"  - `{d.get('indicator')}`: {kw}... @ ({d.get('x0'):.1f}, {d.get('y0'):.1f})")
-                            st.markdown(f"**Instances found:** {len(instances)}")
-                            for i, inst in enumerate(instances[:10]):
-                                st.markdown(f"  - `{inst.get('indicator')}` @ ({inst.get('x0'):.1f}, {inst.get('y0'):.1f})")
-                            st.markdown(f"**Total page tokens:** {len(all_page_tokens)}")
-                            if all_page_tokens:
-                                st.markdown(f"**Sample tokens (first 20):**")
-                                for t in all_page_tokens[:20]:
-                                    st.markdown(f"  - `{t.get('text')}` @ ({t.get('x0'):.1f}, {t.get('y0'):.1f})")
-                    
-                    # Determine detection method
-                    if definitions or instances:
-                        detection_method = "ade"
-                        fence_found = True
-                    else:
-                        # ADE didn't find structured data, fall back to pre-filter results
-                        print(f"[APP] Page {page_num}: ADE found no definitions, using pre-filter results.")
+                    elif rotation == 90:
+                        return mediabox_h - y1, x0, mediabox_h - y0, x1
+                    elif rotation == 180:
+                        return mediabox_w - x1, mediabox_h - y1, mediabox_w - x0, mediabox_h - y0
+                    elif rotation == 270:
+                        return y0, mediabox_w - x1, y1, mediabox_w - x0
+                    return x0, y0, x1, y1
+                
+                all_page_tokens = []
+                for w in native_words:
+                    nx0, ny0, nx1, ny1 = transform_for_rotation(w[0], w[1], w[2], w[3])
+                    all_page_tokens.append({
+                        "text": w[4], 
+                        "x0": nx0, "y0": ny0, 
+                        "x1": nx1, "y1": ny1
+                    })
+                
+                if all_page_tokens:
+                    sample = all_page_tokens[0]
+                    print(f"[DEBUG] Sample token after transform: '{sample['text']}' at ({sample['x0']:.1f}, {sample['y0']:.1f})")
+                
+                # Find instances in figures
+                if definitions and figure_chunks:
+                    instances = ade.find_instances_in_figures(definitions, figure_chunks, all_page_tokens)
+                
+                # DEBUG: Show coordinate info if enabled
+                if DEBUG_MODE:
+                    with st.expander(f"🔧 DEBUG Page {page_num}", expanded=True):
+                        st.markdown(f"**PDF size:** {pdf_width:.1f} x {pdf_height:.1f}")
+                        st.markdown(f"**All ADE Chunks:** {len(chunks)}")
+                        for i, c in enumerate(chunks[:10]):
+                            st.markdown(f"  - `{c.get('type')}`: ({c.get('x0'):.1f}, {c.get('y0'):.1f}) - ({c.get('x1'):.1f}, {c.get('y1'):.1f})")
+                        st.markdown(f"**Figure/Architectural Chunks:** {len(figure_chunks)}")
+                        for i, fc in enumerate(figure_chunks):
+                            st.markdown(f"  - `{fc.get('type')}`: ({fc.get('x0'):.1f}, {fc.get('y0'):.1f}) - ({fc.get('x1'):.1f}, {fc.get('y1'):.1f})")
+                        st.markdown(f"**Legend-like Chunks:** {len(legend_chunks)}")
+                        st.markdown(f"**Definitions found:** {len(definitions)}")
+                        for i, d in enumerate(definitions[:5]):
+                            kw = d.get('keyword', '')[:30]
+                            st.markdown(f"  - `{d.get('indicator')}`: {kw}... @ ({d.get('x0'):.1f}, {d.get('y0'):.1f})")
+                        st.markdown(f"**Instances found:** {len(instances)}")
+                        for i, inst in enumerate(instances[:10]):
+                            st.markdown(f"  - `{inst.get('indicator')}` @ ({inst.get('x0'):.1f}, {inst.get('y0'):.1f})")
+                        st.markdown(f"**Total page tokens:** {len(all_page_tokens)}")
+                        if all_page_tokens:
+                            st.markdown(f"**Sample tokens (first 20):**")
+                            for t in all_page_tokens[:20]:
+                                st.markdown(f"  - `{t.get('text')}` @ ({t.get('x0'):.1f}, {t.get('y0'):.1f})")
+                
+                # Determine detection method
+                if definitions or instances:
+                    detection_method = "ade"
+                    fence_found = True
+                else:
+                    # No structured data found, fall back to pre-filter results
+                    if not fallback_result:
+                        print(f"[APP] Page {page_num}: No definitions found, using pre-filter results.")
                         fallback_result = prefilter_result
                         keyword_matches = prefilter_result.get("matched_lines", [])
-                        detection_method = prefilter_result["method"]
+                    detection_method = prefilter_result.get("method", "none")
             
             # Build text snippet from definitions or fallback keywords
             text_snippet = None
