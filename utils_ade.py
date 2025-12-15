@@ -1204,11 +1204,61 @@ def measure_fence_elements(
         print(f"[DEBUG] Layer-based measurement: {len(final_fence_lines)} lines")
     
     else:
-        # NO FENCE LAYERS FOUND - Skip proximity fallback as it's unreliable
-        # (Parking stripes and other repeating patterns get incorrectly detected)
-        measurement_method = "no_layers"
-        print(f"[DEBUG] No fence layers found - measurement skipped (proximity fallback disabled)")
-        print(f"[DEBUG] Hint: PDFs without layer information cannot be reliably measured")
+        # ALTERNATIVE: For layerless PDFs, use length-based filtering
+        # Analysis shows: parking stripes are tiny segments (<10 pts avg)
+        # while fence lines tend to have segments > 30 pts
+        measurement_method = "length_filter"
+        print(f"[DEBUG] No fence layers found - using length-based filtering")
+        
+        all_page_lines = extract_vector_lines(page)
+        
+        # Filter 1: Only consider lines > 30 pts (excludes 95% of hatching/patterns)
+        MIN_LINE_LENGTH = 30.0
+        candidate_lines = [l for l in all_page_lines if l.length_pts > MIN_LINE_LENGTH]
+        print(f"[DEBUG] Lines > {MIN_LINE_LENGTH} pts: {len(candidate_lines)} (from {len(all_page_lines)})")
+        
+        # Filter 2: Apply figure bbox constraint
+        if figure_bboxes:
+            candidate_lines = [l for l in candidate_lines if line_in_any_bbox(l, figure_bboxes)]
+            print(f"[DEBUG] After figure constraint: {len(candidate_lines)}")
+        
+        # Find lines near each indicator using simple proximity (no connected tracing)
+        seen_line_ids = set()
+        
+        for item in list(fence_instances) + list(fence_definitions):
+            ind = item.get("indicator", "") or item.get("keyword", "")
+            if not ind:
+                continue
+            
+            bbox = (item.get("x0", 0), item.get("y0", 0), 
+                    item.get("x1", 0), item.get("y1", 0))
+            
+            if bbox[2] - bbox[0] < 1:
+                continue
+            
+            # Find lines near this indicator (simple proximity, no tracing)
+            nearby = find_lines_near_bbox(candidate_lines, bbox, margin=100.0)
+            
+            if nearby:
+                new_lines = [l for l in nearby if id(l) not in seen_line_ids]
+                final_fence_lines.extend(new_lines)
+                for l in new_lines:
+                    seen_line_ids.add(id(l))
+                
+                total = calculate_total_length(nearby, scale_factor)
+                if ind not in indicator_measurements:
+                    indicator_measurements[ind] = {
+                        'instance_count': 0,
+                        'run_segment_count': 0,
+                        'run_length_feet': 0.0,
+                        'run_length_pts': 0.0
+                    }
+                indicator_measurements[ind]['instance_count'] += 1
+                indicator_measurements[ind]['run_segment_count'] += total['segment_count']
+                indicator_measurements[ind]['run_length_feet'] += total['total_feet']
+                indicator_measurements[ind]['run_length_pts'] += total['total_pts']
+        
+        print(f"[DEBUG] Length-filtered measurement: {len(final_fence_lines)} lines")
     
     # Round indicator measurements
     for ind in indicator_measurements:
