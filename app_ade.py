@@ -529,7 +529,9 @@ if st.session_state.run_analysis_triggered and \
                     try:
                         status_txt_area.text(f"Page {page_num}/{total_pages}: Measuring fence elements...")
                         measurement_result = ade.measure_fence_elements(
-                            page, definitions, instances, llm=llm_analysis_instance
+                            page, definitions, instances, 
+                            figure_chunks=figure_chunks,  # Pass figure areas for boundary
+                            llm=llm_analysis_instance
                         )
                     except Exception as e:
                         print(f"[APP] Measurement error: {e}")

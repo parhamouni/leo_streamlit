@@ -1018,6 +1018,7 @@ def measure_fence_elements(
     page: fitz.Page,
     fence_definitions: List[Dict],
     fence_instances: List[Dict],
+    figure_chunks: List[Dict] = None,
     llm=None,
     scale_factor: Optional[float] = None
 ) -> Dict:
@@ -1027,14 +1028,15 @@ def measure_fence_elements(
     This function:
     1. Extracts all layer names from the page
     2. Uses LLM to identify fence-related layers
-    3. Extracts vector lines from those layers
+    3. Extracts vector lines from those layers (constrained to figure areas)
     4. Matches lines to detected indicator instances
     5. Calculates measurements
     
     Args:
         page: PDF page object
         fence_definitions: Detected fence definitions from legend
-        fence_instances: Detected fence instances in figures  
+        fence_instances: Detected fence instances in figures
+        figure_chunks: ADE-detected figure/drawing areas for boundary constraint
         llm: Language model for layer identification (optional)
         scale_factor: Drawing scale override (if None, auto-inferred)
     
@@ -1117,20 +1119,22 @@ def measure_fence_elements(
     
     # =========================================================================
     # FIGURE-CONSTRAINED MEASUREMENT:
-    # Only measure lines that are INSIDE ADE-detected figure bounding boxes
+    # Only measure lines that are INSIDE ADE-detected figure/drawing areas
     # =========================================================================
     
-    # Get figure bounding boxes from instances
+    # Get figure bounding boxes from ADE figure_chunks (the actual drawing areas)
     figure_bboxes = []
-    for instance in fence_instances:
-        x0 = instance.get("x0", 0)
-        y0 = instance.get("y0", 0)
-        x1 = instance.get("x1", 0)
-        y1 = instance.get("y1", 0)
-        if x1 - x0 > 10 and y1 - y0 > 10:  # Valid bbox
-            figure_bboxes.append((x0, y0, x1, y1))
+    if figure_chunks:
+        for chunk in figure_chunks:
+            x0 = chunk.get("x0", 0)
+            y0 = chunk.get("y0", 0)
+            x1 = chunk.get("x1", 0)
+            y1 = chunk.get("y1", 0)
+            # Only use chunks that are large enough to be actual drawing areas
+            if x1 - x0 > 100 and y1 - y0 > 100:
+                figure_bboxes.append((x0, y0, x1, y1))
     
-    print(f"[DEBUG] Found {len(figure_bboxes)} figure bounding boxes")
+    print(f"[DEBUG] Found {len(figure_bboxes)} figure/drawing area bounding boxes")
     
     # Filter fence_lines to only those inside figure bboxes
     def line_in_any_bbox(line, bboxes, margin=50.0):
