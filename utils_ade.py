@@ -905,3 +905,316 @@ def debug_visualize_coordinates(page_bytes: bytes, ade_chunks: List[Dict], pdf_l
     except Exception as e:
         print(f"[DEBUG] Debug Viz Error: {e}")
         return page_bytes
+
+
+# ==============================================================================
+# 9. Smart Fence Measurement (LLM-based Layer Identification)
+# ==============================================================================
+
+# Import vector utilities
+try:
+    from utils_vector import (
+        extract_vector_lines, 
+        extract_layer_names,
+        extract_lines_by_layers,
+        group_lines_by_layer,
+        group_connected_lines,
+        calculate_total_length,
+        find_lines_near_bbox,
+        infer_scale_from_page,
+        VectorLine
+    )
+    VECTOR_UTILS_AVAILABLE = True
+except ImportError:
+    VECTOR_UTILS_AVAILABLE = False
+    print("[DEBUG] utils_vector.py not found - fence measurement disabled")
+
+
+def llm_identify_fence_layers(llm, layer_names: List[str], fence_definitions: List[Dict]) -> List[str]:
+    """
+    Use LLM to intelligently identify which layers contain fence-related elements.
+    
+    Args:
+        llm: Language model instance
+        layer_names: List of all layer names in the PDF
+        fence_definitions: Already-detected fence indicators from ADE
+    
+    Returns:
+        List of layer names that likely contain fence elements
+    """
+    if not llm or not layer_names:
+        return []
+    
+    # Format fence definitions for the prompt
+    indicators_text = ""
+    if fence_definitions:
+        for defn in fence_definitions[:10]:  # Limit to first 10
+            ind = defn.get("indicator", "")
+            kw = defn.get("keyword", "")
+            desc = defn.get("description", "")
+            if ind or kw:
+                indicators_text += f'  - "{ind}" → "{kw}" ({desc})\n'
+    
+    if not indicators_text:
+        indicators_text = "  (No fence indicators detected yet)"
+    
+    layers_list = "\n".join(f"  - {layer}" for layer in layer_names[:50])  # Limit to 50 layers
+    
+    prompt = f"""You are analyzing an engineering/architectural PDF drawing. 
+Given the layer names from this drawing and the detected fence-related indicators, 
+identify which layers likely contain fence-related geometric elements (lines, polylines).
+
+LAYER NAMES FROM PDF:
+{layers_list}
+
+DETECTED FENCE INDICATORS:
+{indicators_text}
+
+Based on typical CAD/PDF layer naming conventions, identify layers that might contain:
+- Fence lines (chain link, wood, metal, etc.)
+- Gate elements
+- Barriers, guardrails, handrails
+- Property boundaries
+- Perimeter/enclosure elements
+
+Return ONLY a JSON array of matching layer names. If unsure, include layers with related terms.
+Example response: ["V-SITE-FENCE", "A-BARRIER", "SITE-PERIMETER"]
+
+If no layers seem fence-related, return: []
+"""
+
+    try:
+        raw_response = llm.invoke(prompt) if hasattr(llm, "invoke") else llm(prompt)
+        response_text = getattr(raw_response, "content", str(raw_response))
+        
+        # Parse JSON array from response
+        json_match = re.search(r'\[.*?\]', response_text, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group(0))
+            if isinstance(result, list):
+                # Validate that returned layers exist in the actual layer names
+                valid_layers = []
+                for res_layer in result:
+                    if res_layer in layer_names:
+                        valid_layers.append(res_layer)
+                    else:
+                        # Try to find partial match (e.g. LLM returns "V-SITE-FENCE" for "SITE BASE|V-SITE-FENC")
+                        matches = [l for l in layer_names if res_layer in l]
+                        if matches:
+                            valid_layers.extend(matches)
+                
+                # Deduplicate
+                valid_layers = list(set(valid_layers))
+                print(f"[DEBUG] LLM identified fence layers: {valid_layers}")
+                return valid_layers
+    except Exception as e:
+        print(f"[DEBUG] LLM layer identification failed: {e}")
+    
+    return []
+
+
+def measure_fence_elements(
+    page: fitz.Page,
+    fence_definitions: List[Dict],
+    fence_instances: List[Dict],
+    llm=None,
+    scale_factor: Optional[float] = None
+) -> Dict:
+    """
+    Measure fence-related vector elements based on detected indicators.
+    
+    This function:
+    1. Extracts all layer names from the page
+    2. Uses LLM to identify fence-related layers
+    3. Extracts vector lines from those layers
+    4. Matches lines to detected indicator instances
+    5. Calculates measurements
+    
+    Args:
+        page: PDF page object
+        fence_definitions: Detected fence definitions from legend
+        fence_instances: Detected fence instances in figures  
+        llm: Language model for layer identification (optional)
+        scale_factor: Drawing scale override (if None, auto-inferred)
+    
+    Returns:
+        Dictionary with measurement results
+    """
+    if not VECTOR_UTILS_AVAILABLE:
+        return {"error": "Vector utilities not available", "measurements": {}}
+    
+    print("[DEBUG] Starting fence element measurement...")
+    
+    # Get page info
+    page_width = page.rect.width
+    page_height = page.rect.height
+    rotation = page.rotation
+    
+    # Auto-infer scale if not provided
+    if scale_factor is None:
+        scale_factor = infer_scale_from_page(page)
+        if scale_factor:
+            print(f"[DEBUG] Auto-detected scale factor: {scale_factor}")
+        else:
+            scale_factor = 1.0
+            print("[DEBUG] Could not detect scale, using 1.0")
+    layer_names = extract_layer_names(page)
+    print(f"[DEBUG] Found {len(layer_names)} layers on page")
+    
+    # Use LLM to identify fence-related layers
+    fence_layers = []
+    if llm:
+        fence_layers = llm_identify_fence_layers(llm, layer_names, fence_definitions)
+    
+    # If LLM didn't find layers, fall back to keyword matching
+    if not fence_layers:
+        print("[DEBUG] Falling back to keyword-based layer detection")
+        fence_keywords = ['FENC', 'WALL', 'BARRIER', 'GUARD', 'RAIL', 'GATE', 'PERIM', 'BNDY', 'BOUND']
+        for layer in layer_names:
+            layer_upper = layer.upper()
+            if any(kw in layer_upper for kw in fence_keywords):
+                fence_layers.append(layer)
+        print(f"[DEBUG] Keyword-matched fence layers: {fence_layers}")
+    
+    # Extract lines from fence-related layers
+    if fence_layers:
+        fence_lines = extract_lines_by_layers(page, fence_layers)
+    else:
+        fence_lines = []
+    print(f"[DEBUG] Extracted {len(fence_lines)} lines from fence layers")
+    
+    # Group lines by layer for per-layer measurements
+    lines_by_layer = group_lines_by_layer(fence_lines)
+    
+    # Calculate measurements per layer
+    layer_measurements = {}
+    for layer, lines in lines_by_layer.items():
+        # Group connected lines
+        connected_groups = group_connected_lines(lines)
+        
+        # Calculate total measurement
+        total = calculate_total_length(lines, scale_factor)
+        
+        # Calculate per-group measurements
+        group_measurements = []
+        for group in connected_groups:
+            group_total = calculate_total_length(group, scale_factor)
+            group_measurements.append({
+                'segment_count': group_total['segment_count'],
+                'length_feet': round(group_total['total_feet'], 2)
+            })
+        
+        # Sort groups by length (largest first)
+        group_measurements.sort(key=lambda x: x['length_feet'], reverse=True)
+        
+        layer_measurements[layer] = {
+            'total_segments': total['segment_count'],
+            'total_length_feet': round(total['total_feet'], 2),
+            'connected_runs': len(connected_groups),
+            'runs': group_measurements[:10]  # Top 10 runs
+        }
+    
+    # Try to associate measurements with detected indicators
+    indicator_measurements = {}
+    for instance in fence_instances:
+        ind = instance.get("indicator", "")
+        if not ind:
+            continue
+        
+        # Get bbox center
+        cx = (instance.get("x0", 0) + instance.get("x1", 0)) / 2
+        cy = (instance.get("y0", 0) + instance.get("y1", 0)) / 2
+        bbox = (instance.get("x0", 0), instance.get("y0", 0), 
+                instance.get("x1", 0), instance.get("y1", 0))
+        
+        # Find lines near this indicator
+        nearby_lines = find_lines_near_bbox(fence_lines, bbox, margin=100.0)
+        
+        if nearby_lines:
+            nearby_total = calculate_total_length(nearby_lines, scale_factor)
+            if ind not in indicator_measurements:
+                indicator_measurements[ind] = {
+                    'instance_count': 0,
+                    'nearby_segment_count': 0,
+                    'nearby_length_feet': 0.0
+                }
+            indicator_measurements[ind]['instance_count'] += 1
+            indicator_measurements[ind]['nearby_segment_count'] += nearby_total['segment_count']
+            indicator_measurements[ind]['nearby_length_feet'] += nearby_total['total_feet']
+    
+    # Round indicator measurements
+    for ind in indicator_measurements:
+        indicator_measurements[ind]['nearby_length_feet'] = round(
+            indicator_measurements[ind]['nearby_length_feet'], 2
+        )
+    
+    # Calculate grand totals
+    grand_total_segments = sum(m['total_segments'] for m in layer_measurements.values())
+    grand_total_feet = sum(m['total_length_feet'] for m in layer_measurements.values())
+    
+    result = {
+        'page_info': {
+            'width': page_width,
+            'height': page_height,
+            'rotation': rotation,
+            'scale_factor': scale_factor,
+            'scale_detected': scale_factor != 1.0
+        },
+        'fence_layers': fence_layers,
+        'all_fence_lines': fence_lines,  # Return lines for visualization
+        'layer_measurements': layer_measurements,
+        'indicator_measurements': indicator_measurements,
+        'totals': {
+            'total_layers': len(layer_measurements),
+            'total_segments': grand_total_segments,
+            'total_length_feet': round(grand_total_feet, 2)
+        }
+    }
+    
+    print(f"[DEBUG] Measurement complete: {grand_total_feet:.1f} ft across {grand_total_segments} segments")
+    return result
+
+
+def highlight_fence_lines(
+    page_image_bytes: bytes,
+    fence_lines: List,  # List of VectorLine
+    pdf_width: float,
+    pdf_height: float
+) -> bytes:
+    """
+    Highlight measured fence lines on the page image.
+    
+    Args:
+        page_image_bytes: Original page image
+        fence_lines: List of VectorLine objects to highlight
+        pdf_width, pdf_height: PDF page dimensions
+    
+    Returns:
+        Image bytes with highlighted lines
+    """
+    if not fence_lines:
+        return page_image_bytes
+    
+    try:
+        img = Image.open(BytesIO(page_image_bytes))
+        draw = ImageDraw.Draw(img, "RGBA")
+        img_w, img_h = img.size
+        scale_x = img_w / pdf_width if pdf_width > 0 else 1.0
+        scale_y = img_h / pdf_height if pdf_height > 0 else 1.0
+        
+        for line in fence_lines:
+            x1 = line.start[0] * scale_x
+            y1 = line.start[1] * scale_y
+            x2 = line.end[0] * scale_x
+            y2 = line.end[1] * scale_y
+            
+            # Draw line in cyan color
+            draw.line([(x1, y1), (x2, y2)], fill=(0, 255, 255, 200), width=3)
+        
+        out = BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue()
+    except Exception as e:
+        print(f"[DEBUG] Fence line highlight error: {e}")
+        return page_image_bytes
+

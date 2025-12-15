@@ -251,6 +251,9 @@ with st.sidebar:
     # ADE usage toggle
     use_ade = st.toggle("🧠 Use ADE (LandingAI)", value=True, key="use_ade_toggle")
     
+    # Fence Measurement toggle
+    enable_fence_measurement = st.toggle("📏 Measure fence elements", value=True, key="measurement_toggle")
+    
     # Debug mode (disabled in UI)
     DEBUG_MODE = False
     
@@ -518,6 +521,20 @@ if st.session_state.run_analysis_triggered and \
                 if definitions and figure_chunks:
                     instances = ade.find_instances_in_figures(definitions, figure_chunks, all_page_tokens)
                 
+                # =====================================================================
+                # STEP 6: Smart Fence Measurement (if enabled)
+                # =====================================================================
+                measurement_result = {}
+                if enable_fence_measurement and (definitions or instances):
+                    try:
+                        status_txt_area.text(f"Page {page_num}/{total_pages}: Measuring fence elements...")
+                        measurement_result = ade.measure_fence_elements(
+                            page, definitions, instances, llm=llm_analysis_instance
+                        )
+                    except Exception as e:
+                        print(f"[APP] Measurement error: {e}")
+
+                
                 # DEBUG: Show coordinate info if enabled
                 if DEBUG_MODE:
                     with st.expander(f"🔧 DEBUG Page {page_num}", expanded=True):
@@ -577,6 +594,14 @@ if st.session_state.run_analysis_triggered and \
                     highlighted_img_bytes = ade.highlight_keyword_matches(
                         page_img_bytes, keyword_matches, pdf_width, pdf_height
                     )
+                
+                # Highlight measured fence lines (cyan)
+                if measurement_result and measurement_result.get('all_fence_lines'):
+                    highlighted_img_bytes = ade.highlight_fence_lines(
+                        highlighted_img_bytes or page_img_bytes,
+                        measurement_result['all_fence_lines'],
+                        pdf_width, pdf_height
+                    )
             
             # Build result structure (matching app.py format)
             # detection_method already set above based on flow
@@ -596,8 +621,10 @@ if st.session_state.run_analysis_triggered and \
                 'text_snippet': text_snippet,
                 'definitions': definitions,
                 'instances': instances,
+                'instances': instances,
                 'keyword_matches': keyword_matches,  # NEW: Store keyword matches
                 'fallback_result': fallback_result,  # NEW: Store fallback result
+                'measurements': measurement_result,  # NEW: Store measurements
                 'detection_method': detection_method,  # NEW: Track how fence was detected
                 'fence_text_boxes_details': definitions + instances + keyword_matches,  # Combined for compatibility
                 'highlight_fence_text_app_setting': highlight_fence_text_app,
@@ -719,6 +746,38 @@ if st.session_state.run_analysis_triggered and \
                             st.markdown("**LLM Analysis:**")
                             st.markdown(f"- Confidence: {llm_res.get('confidence', 0):.0%}")
                             st.markdown(f"- Reason: {llm_res.get('reason', 'N/A')}")
+                        
+                        # Show Measurements
+                        if measurement_result and measurement_result.get('totals', {}).get('total_length_feet', 0) > 0:
+                            st.markdown("---")
+                            st.markdown("### 📏 Fence Measurements")
+                            
+                            totals = measurement_result['totals']
+                            page_info = measurement_result.get('page_info', {})
+                            scale_factor = page_info.get('scale_factor', 1.0)
+                            
+                            # Show scale info
+                            if page_info.get('scale_detected'):
+                                st.success(f"✅ Scale Auto-Detected: 1\" = {scale_factor/12:.0f}'")
+                            else:
+                                st.warning("⚠️ Scale not detected - using 1:1 (unscaled)")
+                            
+                            # Show totals in both units
+                            col_px, col_ft = st.columns(2)
+                            with col_px:
+                                st.metric("Total (Pixels/Pts)", f"{totals.get('total_segments', 0):,} segments")
+                            with col_ft:
+                                st.metric("Total (Scaled)", f"{totals['total_length_feet']:.1f} ft")
+                            
+                            # Layer breakdown with both units
+                            if measurement_result.get('fence_layers'):
+                                st.markdown("**Layer Breakdown:**")
+                                for layer in measurement_result['fence_layers']:
+                                    l_stats = measurement_result['layer_measurements'].get(layer, {})
+                                    pts = l_stats.get('total_segments', 0)
+                                    ft = l_stats.get('total_length_feet', 0)
+                                    runs = l_stats.get('connected_runs', 0)
+                                    st.markdown(f"- `{layer}`: **{pts} segs** | **{ft:.1f} ft** ({runs} runs)")
                     
                     # Show message if nothing found
                     if not definitions and not instances and not keyword_matches:
@@ -832,7 +891,7 @@ elif st.session_state.processing_complete:
                     if keyword_matches and not definitions:
                         reasons_res.append("Keywords")
                     if res_data_item.get('highlight_fence_text_app_setting', True) and \
-                       (definitions or instances or keyword_matches):
+                       (definitions or instances or keyword_matches or res_data_item.get('measurements')):
                         reasons_res.append("Highlights")
                     if reasons_res:
                         exp_title_res += f" ({' & '.join(reasons_res)})"
@@ -928,6 +987,39 @@ elif st.session_state.processing_complete:
                             st.markdown("**LLM Analysis:**")
                             st.markdown(f"- Confidence: {llm_res.get('confidence', 0):.0%}")
                             st.markdown(f"- Reason: {llm_res.get('reason', 'N/A')}")
+                        
+                        # Show Measurements
+                        measurements = res_data_item.get('measurements')
+                        if measurements and measurements.get('totals', {}).get('total_length_feet', 0) > 0:
+                            st.markdown("---")
+                            st.markdown("### 📏 Fence Measurements")
+                            
+                            totals = measurements['totals']
+                            page_info = measurements.get('page_info', {})
+                            scale_factor = page_info.get('scale_factor', 1.0)
+                            
+                            # Show scale info
+                            if page_info.get('scale_detected'):
+                                st.success(f"✅ Scale Auto-Detected: 1\" = {scale_factor/12:.0f}'")
+                            else:
+                                st.warning("⚠️ Scale not detected - using 1:1 (unscaled)")
+                            
+                            # Show totals in both units
+                            col_px, col_ft = st.columns(2)
+                            with col_px:
+                                st.metric("Total (Pixels/Pts)", f"{totals.get('total_segments', 0):,} segments")
+                            with col_ft:
+                                st.metric("Total (Scaled)", f"{totals['total_length_feet']:.1f} ft")
+                            
+                            # Layer breakdown with both units
+                            if measurements.get('fence_layers'):
+                                st.markdown("**Layer Breakdown:**")
+                                for layer in measurements['fence_layers']:
+                                    l_stats = measurements['layer_measurements'].get(layer, {})
+                                    pts = l_stats.get('total_segments', 0)
+                                    ft = l_stats.get('total_length_feet', 0)
+                                    runs = l_stats.get('connected_runs', 0)
+                                    st.markdown(f"- `{layer}`: **{pts} segs** | **{ft:.1f} ft** ({runs} runs)")
                     
                     # Show message if nothing found
                     if not definitions and not instances and not keyword_matches:
