@@ -748,23 +748,29 @@ if st.session_state.run_analysis_triggered and \
                             st.markdown(f"- Reason: {llm_res.get('reason', 'N/A')}")
                     
                     # Show Measurements (for ALL fence pages, not just keyword matches)
-                    if measurement_result and (measurement_result.get('indicator_measurements') or measurement_result.get('totals', {}).get('total_length_feet', 0) > 0):
+                    if measurement_result and (measurement_result.get('indicator_measurements') or measurement_result.get('proximity_totals', {}).get('total_segments', 0) > 0):
                         st.markdown("---")
                         st.markdown("### 📏 Fence Measurements")
                         
                         page_info = measurement_result.get('page_info', {})
                         scale_factor = page_info.get('scale_factor', 1.0)
+                        method = measurement_result.get('measurement_method', 'unknown')
                         
-                        # Show scale info prominently
+                        # Show method badge
+                        if method == "layer":
+                            st.info("📂 Method: Layer-based (fence layers detected)")
+                        elif method == "proximity":
+                            st.info("🎯 Method: Proximity-based (fallback)")
+                        
+                        # Show scale info
                         if page_info.get('scale_detected'):
-                            st.success(f"✅ Scale Auto-Detected: 1\" = {scale_factor/12:.0f}' (factor: {scale_factor})")
+                            st.success(f"✅ Scale: 1\" = {scale_factor/12:.0f}' (factor: {scale_factor})")
                         else:
-                            st.warning("⚠️ Scale not detected - showing raw measurements")
+                            st.warning("⚠️ Scale not detected - raw measurements")
                         
-                        # Show proximity-based measurements (primary)
+                        # Show totals
                         prox_totals = measurement_result.get('proximity_totals', {})
                         if prox_totals.get('total_segments', 0) > 0:
-                            st.markdown("#### 🎯 Near Detected Indicators:")
                             col_pts, col_ft = st.columns(2)
                             with col_pts:
                                 st.metric("Total (Points)", f"{prox_totals.get('total_length_pts', 0):,.0f} pts")

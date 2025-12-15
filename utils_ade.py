@@ -1116,63 +1116,140 @@ def measure_fence_elements(
         }
     
     # =========================================================================
-    # SMART PROXIMITY-BASED MEASUREMENT: 
-    # Find closest line to each indicator, then trace connected lines
+    # FIGURE-CONSTRAINED MEASUREMENT:
+    # Only measure lines that are INSIDE ADE-detected figure bounding boxes
     # =========================================================================
-    all_page_lines = extract_vector_lines(page)
-    print(f"[DEBUG] Total lines on page: {len(all_page_lines)}")
+    
+    # Get figure bounding boxes from instances
+    figure_bboxes = []
+    for instance in fence_instances:
+        x0 = instance.get("x0", 0)
+        y0 = instance.get("y0", 0)
+        x1 = instance.get("x1", 0)
+        y1 = instance.get("y1", 0)
+        if x1 - x0 > 10 and y1 - y0 > 10:  # Valid bbox
+            figure_bboxes.append((x0, y0, x1, y1))
+    
+    print(f"[DEBUG] Found {len(figure_bboxes)} figure bounding boxes")
+    
+    # Filter fence_lines to only those inside figure bboxes
+    def line_in_any_bbox(line, bboxes, margin=50.0):
+        """Check if a line is inside or near any bounding box."""
+        for (x0, y0, x1, y1) in bboxes:
+            # Expand bbox by margin
+            x0m, y0m = x0 - margin, y0 - margin
+            x1m, y1m = x1 + margin, y1 + margin
+            # Check if either endpoint is inside
+            sx, sy = line.start
+            ex, ey = line.end
+            if (x0m <= sx <= x1m and y0m <= sy <= y1m) or \
+               (x0m <= ex <= x1m and y0m <= ey <= y1m):
+                return True
+        return False
+    
+    # If we have figure bboxes, filter fence_lines
+    if figure_bboxes and fence_lines:
+        filtered_fence_lines = [l for l in fence_lines if line_in_any_bbox(l, figure_bboxes)]
+        print(f"[DEBUG] Filtered to {len(filtered_fence_lines)} lines inside figures (from {len(fence_lines)})")
+    else:
+        filtered_fence_lines = fence_lines
+    
+    # =========================================================================
+    # LAYER-FIRST APPROACH:
+    # Use layer-based lines if we found any, otherwise fall back to proximity
+    # =========================================================================
     
     indicator_measurements = {}
-    proximity_lines = []  # Lines associated with indicators
-    seen_line_ids = set()  # Avoid duplicates across indicators
+    final_fence_lines = []
+    measurement_method = "none"
     
-    # Combine instances and definitions for proximity search
-    all_indicator_locations = list(fence_instances) + list(fence_definitions)
+    if filtered_fence_lines:
+        # PRIMARY: Use layer-based lines (already filtered to figures)
+        measurement_method = "layer"
+        final_fence_lines = filtered_fence_lines
+        
+        # Calculate per-indicator measurements by proximity within filtered lines
+        for item in list(fence_instances) + list(fence_definitions):
+            ind = item.get("indicator", "") or item.get("keyword", "")
+            if not ind:
+                continue
+            
+            bbox = (item.get("x0", 0), item.get("y0", 0), 
+                    item.get("x1", 0), item.get("y1", 0))
+            
+            if bbox[2] - bbox[0] < 1:
+                continue
+            
+            # Find lines near this indicator (within filtered lines)
+            nearby = find_lines_near_bbox(filtered_fence_lines, bbox, margin=80.0)
+            
+            if nearby:
+                total = calculate_total_length(nearby, scale_factor)
+                if ind not in indicator_measurements:
+                    indicator_measurements[ind] = {
+                        'instance_count': 0,
+                        'run_segment_count': 0,
+                        'run_length_feet': 0.0,
+                        'run_length_pts': 0.0
+                    }
+                indicator_measurements[ind]['instance_count'] += 1
+                indicator_measurements[ind]['run_segment_count'] += total['segment_count']
+                indicator_measurements[ind]['run_length_feet'] += total['total_feet']
+                indicator_measurements[ind]['run_length_pts'] += total['total_pts']
+        
+        print(f"[DEBUG] Layer-based measurement: {len(final_fence_lines)} lines")
     
-    for item in all_indicator_locations:
-        ind = item.get("indicator", "") or item.get("keyword", "")
-        if not ind:
-            continue
+    else:
+        # FALLBACK: Use proximity-based connected-line tracing
+        measurement_method = "proximity"
+        all_page_lines = extract_vector_lines(page)
         
-        # Get bbox
-        bbox = (item.get("x0", 0), item.get("y0", 0), 
-                item.get("x1", 0), item.get("y1", 0))
+        # Only search within figure bboxes
+        if figure_bboxes:
+            all_page_lines = [l for l in all_page_lines if line_in_any_bbox(l, figure_bboxes)]
         
-        # Skip if bbox is invalid
-        if bbox[2] - bbox[0] < 1 or bbox[3] - bbox[1] < 1:
-            continue
+        print(f"[DEBUG] Fallback proximity search in {len(all_page_lines)} lines")
         
-        # SMART: Find the closest line and trace connected lines
-        connected_run = find_fence_run_from_indicator(
-            all_page_lines, 
-            bbox,
-            max_initial_distance=100.0,  # Max distance to starting line
-            connection_tolerance=5.0      # Tolerance for line connections
-        )
+        seen_line_ids = set()
         
-        if connected_run:
-            # Add to proximity lines (avoiding duplicates)
-            new_lines = [l for l in connected_run if id(l) not in seen_line_ids]
-            proximity_lines.extend(new_lines)
-            for l in new_lines:
-                seen_line_ids.add(id(l))
+        for item in list(fence_instances) + list(fence_definitions):
+            ind = item.get("indicator", "") or item.get("keyword", "")
+            if not ind:
+                continue
             
-            # Calculate measurements for this run
-            run_total = calculate_total_length(connected_run, scale_factor)
+            bbox = (item.get("x0", 0), item.get("y0", 0), 
+                    item.get("x1", 0), item.get("y1", 0))
             
-            if ind not in indicator_measurements:
-                indicator_measurements[ind] = {
-                    'instance_count': 0,
-                    'run_segment_count': 0,
-                    'run_length_feet': 0.0,
-                    'run_length_pts': 0.0
-                }
-            indicator_measurements[ind]['instance_count'] += 1
-            indicator_measurements[ind]['run_segment_count'] += run_total['segment_count']
-            indicator_measurements[ind]['run_length_feet'] += run_total['total_feet']
-            indicator_measurements[ind]['run_length_pts'] += run_total['total_pts']
+            if bbox[2] - bbox[0] < 1:
+                continue
             
-            print(f"[DEBUG] Indicator '{ind}': Found run with {len(connected_run)} connected segments")
+            # Find connected run from this indicator
+            connected_run = find_fence_run_from_indicator(
+                all_page_lines, bbox,
+                max_initial_distance=80.0,
+                connection_tolerance=5.0
+            )
+            
+            if connected_run:
+                new_lines = [l for l in connected_run if id(l) not in seen_line_ids]
+                final_fence_lines.extend(new_lines)
+                for l in new_lines:
+                    seen_line_ids.add(id(l))
+                
+                total = calculate_total_length(connected_run, scale_factor)
+                if ind not in indicator_measurements:
+                    indicator_measurements[ind] = {
+                        'instance_count': 0,
+                        'run_segment_count': 0,
+                        'run_length_feet': 0.0,
+                        'run_length_pts': 0.0
+                    }
+                indicator_measurements[ind]['instance_count'] += 1
+                indicator_measurements[ind]['run_segment_count'] += total['segment_count']
+                indicator_measurements[ind]['run_length_feet'] += total['total_feet']
+                indicator_measurements[ind]['run_length_pts'] += total['total_pts']
+        
+        print(f"[DEBUG] Proximity-based measurement: {len(final_fence_lines)} lines")
     
     # Round indicator measurements
     for ind in indicator_measurements:
@@ -1183,16 +1260,11 @@ def measure_fence_elements(
             indicator_measurements[ind]['run_length_pts'], 1
         )
     
-    # Deduplicate proximity lines for visualization
-    proximity_lines_unique = list({id(l): l for l in proximity_lines}.values())
-    print(f"[DEBUG] Proximity-based lines: {len(proximity_lines_unique)}")
-    
-    # Calculate grand totals from layer-based (for backward compatibility)
+    # Calculate totals
     grand_total_segments = sum(m['total_segments'] for m in layer_measurements.values())
     grand_total_feet = sum(m['total_length_feet'] for m in layer_measurements.values())
     
-    # Calculate proximity-based totals
-    proximity_total = calculate_total_length(proximity_lines_unique, scale_factor) if proximity_lines_unique else {}
+    final_total = calculate_total_length(final_fence_lines, scale_factor) if final_fence_lines else {}
     
     result = {
         'page_info': {
@@ -1202,14 +1274,15 @@ def measure_fence_elements(
             'scale_factor': scale_factor,
             'scale_detected': scale_factor != 1.0
         },
+        'measurement_method': measurement_method,
         'fence_layers': fence_layers,
-        'all_fence_lines': proximity_lines_unique if proximity_lines_unique else fence_lines,  # Prefer proximity lines
+        'all_fence_lines': final_fence_lines,
         'layer_measurements': layer_measurements,
         'indicator_measurements': indicator_measurements,
         'proximity_totals': {
-            'total_segments': proximity_total.get('segment_count', 0),
-            'total_length_feet': round(proximity_total.get('total_feet', 0), 2),
-            'total_length_pts': round(proximity_total.get('total_pts', 0), 1)
+            'total_segments': final_total.get('segment_count', 0),
+            'total_length_feet': round(final_total.get('total_feet', 0), 2),
+            'total_length_pts': round(final_total.get('total_pts', 0), 1)
         },
         'totals': {
             'total_layers': len(layer_measurements),
@@ -1218,7 +1291,7 @@ def measure_fence_elements(
         }
     }
     
-    print(f"[DEBUG] Measurement complete: Layer-based={grand_total_feet:.1f} ft, Proximity-based={proximity_total.get('total_feet', 0):.1f} ft")
+    print(f"[DEBUG] Measurement complete ({measurement_method}): {final_total.get('total_feet', 0):.1f} ft from {len(final_fence_lines)} lines")
     return result
 
 
