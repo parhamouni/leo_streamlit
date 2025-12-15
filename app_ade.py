@@ -776,9 +776,9 @@ if st.session_state.run_analysis_triggered and \
                             if indicator_meas:
                                 st.markdown("**Per-Indicator:**")
                                 for ind, stats in indicator_meas.items():
-                                    pts = stats.get('nearby_length_pts', 0)
-                                    ft = stats.get('nearby_length_feet', 0)
-                                    segs = stats.get('nearby_segment_count', 0)
+                                    pts = stats.get('run_length_pts', 0)
+                                    ft = stats.get('run_length_feet', 0)
+                                    segs = stats.get('run_segment_count', 0)
                                     count = stats.get('instance_count', 0)
                                     st.markdown(f"- **{ind}**: {pts:,.0f} pts | **{ft:.1f} ft** ({segs} segs, {count} instances)")
                         
@@ -1033,9 +1033,9 @@ elif st.session_state.processing_complete:
                                 if indicator_meas:
                                     st.markdown("**Per-Indicator:**")
                                     for ind, stats in indicator_meas.items():
-                                        pts = stats.get('nearby_length_pts', 0)
-                                        ft = stats.get('nearby_length_feet', 0)
-                                        segs = stats.get('nearby_segment_count', 0)
+                                        pts = stats.get('run_length_pts', 0)
+                                        ft = stats.get('run_length_feet', 0)
+                                        segs = stats.get('run_segment_count', 0)
                                         count = stats.get('instance_count', 0)
                                         st.markdown(f"- **{ind}**: {pts:,.0f} pts | **{ft:.1f} ft** ({segs} segs, {count} instances)")
                             

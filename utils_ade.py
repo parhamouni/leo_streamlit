@@ -921,6 +921,7 @@ try:
         group_connected_lines,
         calculate_total_length,
         find_lines_near_bbox,
+        find_fence_run_from_indicator,
         infer_scale_from_page,
         VectorLine
     )
@@ -1115,14 +1116,15 @@ def measure_fence_elements(
         }
     
     # =========================================================================
-    # PROXIMITY-BASED MEASUREMENT: Find lines near each indicator instance
+    # SMART PROXIMITY-BASED MEASUREMENT: 
+    # Find closest line to each indicator, then trace connected lines
     # =========================================================================
-    # Extract ALL lines from the page (not just fence layers) for proximity matching
     all_page_lines = extract_vector_lines(page)
     print(f"[DEBUG] Total lines on page: {len(all_page_lines)}")
     
     indicator_measurements = {}
     proximity_lines = []  # Lines associated with indicators
+    seen_line_ids = set()  # Avoid duplicates across indicators
     
     # Combine instances and definitions for proximity search
     all_indicator_locations = list(fence_instances) + list(fence_definitions)
@@ -1140,32 +1142,45 @@ def measure_fence_elements(
         if bbox[2] - bbox[0] < 1 or bbox[3] - bbox[1] < 1:
             continue
         
-        # Find lines near this indicator with larger margin (200 pts = ~2.8 inches)
-        nearby_lines = find_lines_near_bbox(all_page_lines, bbox, margin=200.0)
+        # SMART: Find the closest line and trace connected lines
+        connected_run = find_fence_run_from_indicator(
+            all_page_lines, 
+            bbox,
+            max_initial_distance=100.0,  # Max distance to starting line
+            connection_tolerance=5.0      # Tolerance for line connections
+        )
         
-        if nearby_lines:
-            proximity_lines.extend(nearby_lines)
-            nearby_total = calculate_total_length(nearby_lines, scale_factor)
+        if connected_run:
+            # Add to proximity lines (avoiding duplicates)
+            new_lines = [l for l in connected_run if id(l) not in seen_line_ids]
+            proximity_lines.extend(new_lines)
+            for l in new_lines:
+                seen_line_ids.add(id(l))
+            
+            # Calculate measurements for this run
+            run_total = calculate_total_length(connected_run, scale_factor)
             
             if ind not in indicator_measurements:
                 indicator_measurements[ind] = {
                     'instance_count': 0,
-                    'nearby_segment_count': 0,
-                    'nearby_length_feet': 0.0,
-                    'nearby_length_pts': 0.0
+                    'run_segment_count': 0,
+                    'run_length_feet': 0.0,
+                    'run_length_pts': 0.0
                 }
             indicator_measurements[ind]['instance_count'] += 1
-            indicator_measurements[ind]['nearby_segment_count'] += nearby_total['segment_count']
-            indicator_measurements[ind]['nearby_length_feet'] += nearby_total['total_feet']
-            indicator_measurements[ind]['nearby_length_pts'] += nearby_total['total_pts']
+            indicator_measurements[ind]['run_segment_count'] += run_total['segment_count']
+            indicator_measurements[ind]['run_length_feet'] += run_total['total_feet']
+            indicator_measurements[ind]['run_length_pts'] += run_total['total_pts']
+            
+            print(f"[DEBUG] Indicator '{ind}': Found run with {len(connected_run)} connected segments")
     
     # Round indicator measurements
     for ind in indicator_measurements:
-        indicator_measurements[ind]['nearby_length_feet'] = round(
-            indicator_measurements[ind]['nearby_length_feet'], 2
+        indicator_measurements[ind]['run_length_feet'] = round(
+            indicator_measurements[ind]['run_length_feet'], 2
         )
-        indicator_measurements[ind]['nearby_length_pts'] = round(
-            indicator_measurements[ind]['nearby_length_pts'], 1
+        indicator_measurements[ind]['run_length_pts'] = round(
+            indicator_measurements[ind]['run_length_pts'], 1
         )
     
     # Deduplicate proximity lines for visualization

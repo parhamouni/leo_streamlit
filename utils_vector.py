@@ -326,6 +326,156 @@ def find_lines_near_bbox(
     return nearby
 
 
+def distance_point_to_line_segment(
+    point: Tuple[float, float],
+    line_start: Tuple[float, float],
+    line_end: Tuple[float, float]
+) -> float:
+    """
+    Calculate the shortest distance from a point to a line segment.
+    """
+    px, py = point
+    x1, y1 = line_start
+    x2, y2 = line_end
+    
+    dx = x2 - x1
+    dy = y2 - y1
+    
+    if dx == 0 and dy == 0:
+        # Line is a point
+        return math.sqrt((px - x1)**2 + (py - y1)**2)
+    
+    # Parameter t for the closest point on the line
+    t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
+    
+    # Closest point on the segment
+    closest_x = x1 + t * dx
+    closest_y = y1 + t * dy
+    
+    return math.sqrt((px - closest_x)**2 + (py - closest_y)**2)
+
+
+def find_closest_line_to_point(
+    lines: List[VectorLine],
+    point: Tuple[float, float]
+) -> Optional[Tuple[VectorLine, float]]:
+    """
+    Find the line closest to a given point.
+    
+    Args:
+        lines: List of VectorLine objects
+        point: (x, y) coordinates
+    
+    Returns:
+        Tuple of (closest_line, distance) or None if no lines
+    """
+    if not lines:
+        return None
+    
+    closest = None
+    min_dist = float('inf')
+    
+    for line in lines:
+        dist = distance_point_to_line_segment(point, line.start, line.end)
+        if dist < min_dist:
+            min_dist = dist
+            closest = line
+    
+    return (closest, min_dist) if closest else None
+
+
+def trace_connected_lines_from_start(
+    start_line: VectorLine,
+    all_lines: List[VectorLine],
+    tolerance: float = 5.0,
+    max_lines: int = 500
+) -> List[VectorLine]:
+    """
+    Trace all lines connected to a starting line using flood-fill.
+    
+    Args:
+        start_line: The line to start tracing from
+        all_lines: All available lines to search
+        tolerance: Maximum distance to consider points connected
+        max_lines: Maximum lines to include (safety limit)
+    
+    Returns:
+        List of connected VectorLine objects
+    """
+    connected = [start_line]
+    used_indices = {id(start_line)}
+    
+    # Create index for faster lookup
+    line_ids = {id(line): line for line in all_lines}
+    
+    # BFS to find connected lines
+    queue = [start_line]
+    
+    while queue and len(connected) < max_lines:
+        current = queue.pop(0)
+        
+        for line in all_lines:
+            if id(line) in used_indices:
+                continue
+            
+            # Check if this line connects to current
+            if (points_close(current.start, line.start, tolerance) or
+                points_close(current.start, line.end, tolerance) or
+                points_close(current.end, line.start, tolerance) or
+                points_close(current.end, line.end, tolerance)):
+                connected.append(line)
+                used_indices.add(id(line))
+                queue.append(line)
+    
+    return connected
+
+
+def find_fence_run_from_indicator(
+    all_lines: List[VectorLine],
+    indicator_bbox: Tuple[float, float, float, float],
+    max_initial_distance: float = 50.0,
+    connection_tolerance: float = 5.0
+) -> List[VectorLine]:
+    """
+    Smart fence run detection: find the closest line to an indicator,
+    then trace all connected lines to get the complete fence run.
+    
+    Args:
+        all_lines: All vector lines on the page
+        indicator_bbox: Bounding box of the indicator (x0, y0, x1, y1)
+        max_initial_distance: Maximum distance to the starting line
+        connection_tolerance: Tolerance for connecting lines
+    
+    Returns:
+        List of VectorLine objects that form the fence run
+    """
+    # Get indicator center point
+    cx = (indicator_bbox[0] + indicator_bbox[2]) / 2
+    cy = (indicator_bbox[1] + indicator_bbox[3]) / 2
+    indicator_center = (cx, cy)
+    
+    # Find the closest line to the indicator
+    result = find_closest_line_to_point(all_lines, indicator_center)
+    
+    if not result:
+        return []
+    
+    closest_line, distance = result
+    
+    # If the closest line is too far, skip
+    if distance > max_initial_distance:
+        return []
+    
+    # Trace all connected lines from this starting point
+    connected_lines = trace_connected_lines_from_start(
+        closest_line, 
+        all_lines, 
+        tolerance=connection_tolerance
+    )
+    
+    return connected_lines
+
+
 def infer_scale_from_text(text: str) -> Optional[float]:
     """
     Attempt to infer the drawing scale factor from text.
