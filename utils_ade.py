@@ -1014,6 +1014,86 @@ If no layers seem fence-related, return: []
     return []
 
 
+def llm_suggest_filter_params(llm, line_stats: dict, page_context: str = "") -> dict:
+    """
+    Ask LLM to suggest filtering parameters based on line statistics.
+    
+    Args:
+        llm: LangChain LLM instance
+        line_stats: Dictionary with line statistics
+        page_context: Additional context about the page
+    
+    Returns:
+        Dictionary with suggested parameters
+    """
+    if not llm:
+        return {'min_length': 80.0, 'proximity_margin': 50.0, 'reasoning': 'No LLM - using defaults'}
+    
+    prompt = f"""You are analyzing vector line statistics from an architectural site plan PDF.
+
+PAGE CONTEXT: {page_context if page_context else 'Site plan drawing'}
+
+LINE STATISTICS:
+- Total lines: {line_stats.get('total', 0):,}
+- Length distribution:
+  - Under 10 pts: {line_stats.get('under_10', 0):,} ({line_stats.get('pct_under_10', 0):.1f}%)
+  - 10-50 pts: {line_stats.get('range_10_50', 0):,} ({line_stats.get('pct_10_50', 0):.1f}%)
+  - 50-100 pts: {line_stats.get('range_50_100', 0):,} ({line_stats.get('pct_50_100', 0):.1f}%)
+  - Over 100 pts: {line_stats.get('over_100', 0):,} ({line_stats.get('pct_over_100', 0):.1f}%)
+- Layers found: {line_stats.get('layers', 'None')}
+- Detected fence indicators: {line_stats.get('indicators', 'Unknown')}
+
+TASK: Suggest filtering parameters to identify FENCE/WALL/BARRIER lines while EXCLUDING:
+- Parking stripes (repeating short parallel lines in parking areas)
+- Hatching patterns (tiny connected segments for area fills)
+- Text and annotation lines
+
+Based on the statistics, suggest:
+1. min_length_pts: Minimum line length to consider (fence lines are typically continuous)
+2. proximity_margin_pts: How close a line must be to a fence indicator to be included
+
+IMPORTANT: 
+- If most lines are tiny (<10 pts), the drawing likely has lots of hatching - use higher min_length
+- If there are layer names with FENC/WALL, those should be prioritized (return 0 for min_length)
+- Fence lines are typically 50-500+ pts, not tiny segments
+
+Respond with ONLY valid JSON (no markdown):
+{{"min_length_pts": <number>, "proximity_margin_pts": <number>, "reasoning": "<brief explanation>"}}"""
+
+    try:
+        response = llm.invoke(prompt)
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        
+        # Parse JSON from response
+        import json
+        import re
+        
+        # Try to extract JSON
+        json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group())
+            min_len = float(result.get('min_length_pts', 80))
+            margin = float(result.get('proximity_margin_pts', 50))
+            reasoning = result.get('reasoning', 'LLM suggested')
+            
+            # Sanity bounds
+            min_len = max(10, min(200, min_len))
+            margin = max(20, min(150, margin))
+            
+            print(f"[DEBUG] LLM suggested: min_length={min_len}, margin={margin}")
+            print(f"[DEBUG] Reasoning: {reasoning}")
+            
+            return {
+                'min_length': min_len,
+                'proximity_margin': margin,
+                'reasoning': reasoning
+            }
+    except Exception as e:
+        print(f"[DEBUG] LLM filter suggestion failed: {e}")
+    
+    return {'min_length': 80.0, 'proximity_margin': 50.0, 'reasoning': 'Fallback defaults'}
+
+
 def measure_fence_elements(
     page: fitz.Page,
     fence_definitions: List[Dict],
@@ -1204,16 +1284,41 @@ def measure_fence_elements(
         print(f"[DEBUG] Layer-based measurement: {len(final_fence_lines)} lines")
     
     else:
-        # ALTERNATIVE: For layerless PDFs, use length-based filtering
-        # Analysis shows: parking stripes are tiny segments (<10 pts avg)
-        # while fence lines tend to have segments > 80 pts
-        measurement_method = "length_filter"
-        print(f"[DEBUG] No fence layers found - using length-based filtering")
+        # ALTERNATIVE: For layerless PDFs, use LLM-guided filtering
+        measurement_method = "llm_guided"
+        print(f"[DEBUG] No fence layers found - using LLM-guided filtering")
         
         all_page_lines = extract_vector_lines(page)
         
-        # Filter 1: Only consider lines > 80 pts (stricter filter)
-        MIN_LINE_LENGTH = 80.0
+        # Compute line statistics for LLM
+        total_lines = len(all_page_lines)
+        under_10 = sum(1 for l in all_page_lines if l.length_pts < 10)
+        range_10_50 = sum(1 for l in all_page_lines if 10 <= l.length_pts < 50)
+        range_50_100 = sum(1 for l in all_page_lines if 50 <= l.length_pts < 100)
+        over_100 = sum(1 for l in all_page_lines if l.length_pts >= 100)
+        
+        line_stats = {
+            'total': total_lines,
+            'under_10': under_10,
+            'range_10_50': range_10_50,
+            'range_50_100': range_50_100,
+            'over_100': over_100,
+            'pct_under_10': (under_10 / total_lines * 100) if total_lines > 0 else 0,
+            'pct_10_50': (range_10_50 / total_lines * 100) if total_lines > 0 else 0,
+            'pct_50_100': (range_50_100 / total_lines * 100) if total_lines > 0 else 0,
+            'pct_over_100': (over_100 / total_lines * 100) if total_lines > 0 else 0,
+            'layers': 'None detected',
+            'indicators': [d.get('indicator', '') for d in fence_definitions][:5]
+        }
+        
+        # Get LLM-suggested parameters
+        filter_params = llm_suggest_filter_params(llm, line_stats)
+        MIN_LINE_LENGTH = filter_params['min_length']
+        PROXIMITY_MARGIN = filter_params['proximity_margin']
+        
+        print(f"[DEBUG] LLM params: min_length={MIN_LINE_LENGTH}, margin={PROXIMITY_MARGIN}")
+        
+        # Filter 1: Apply LLM-suggested length filter
         candidate_lines = [l for l in all_page_lines if l.length_pts > MIN_LINE_LENGTH]
         print(f"[DEBUG] Lines > {MIN_LINE_LENGTH} pts: {len(candidate_lines)} (from {len(all_page_lines)})")
         
@@ -1222,7 +1327,7 @@ def measure_fence_elements(
             candidate_lines = [l for l in candidate_lines if line_in_any_bbox(l, figure_bboxes)]
             print(f"[DEBUG] After figure constraint: {len(candidate_lines)}")
         
-        # Find lines near each indicator using STRICT proximity (margin=50)
+        # Find lines near each indicator using LLM-suggested proximity
         seen_line_ids = set()
         
         for item in list(fence_instances) + list(fence_definitions):
@@ -1236,8 +1341,8 @@ def measure_fence_elements(
             if bbox[2] - bbox[0] < 1:
                 continue
             
-            # Find lines VERY close to this indicator (strict proximity)
-            nearby = find_lines_near_bbox(candidate_lines, bbox, margin=50.0)
+            # Find lines near this indicator using LLM-suggested margin
+            nearby = find_lines_near_bbox(candidate_lines, bbox, margin=PROXIMITY_MARGIN)
             
             if nearby:
                 new_lines = [l for l in nearby if id(l) not in seen_line_ids]
