@@ -1094,6 +1094,135 @@ Respond with ONLY valid JSON (no markdown):
     return {'min_length': 80.0, 'proximity_margin': 50.0, 'reasoning': 'Fallback defaults'}
 
 
+def detect_dimension_lines(
+    page: fitz.Page,
+    scale_factor: float = 30.0,
+    search_radius: float = 150.0,
+    min_length_ft: float = 2.0,
+    max_length_ft: float = 500.0
+) -> Dict:
+    """
+    Detect fence measurements by finding numeric dimension text and matching to nearby lines.
+    
+    This method looks for dimension-style annotations (numbers with units like "45'" or "120 LF")
+    and finds the vector line whose length best matches the annotated measurement.
+    
+    Args:
+        page: PDF page object
+        scale_factor: Drawing scale (e.g., 30 means 1" = 30')
+        search_radius: Max distance (pts) to search for matching lines
+        min_length_ft: Minimum fence length to consider (feet)
+        max_length_ft: Maximum fence length to consider (feet)
+    
+    Returns:
+        Dictionary with detected dimension lines and measurements
+    """
+    if not VECTOR_UTILS_AVAILABLE:
+        return {"success": False, "error": "Vector utilities not available", "measurements": []}
+    
+    print("[DEBUG] Starting dimension line detection...")
+    
+    # Extract text and find numeric measurements
+    text_dict = page.get_text('dict')
+    measurements = []
+    
+    for block in text_dict.get('blocks', []):
+        if 'lines' not in block:
+            continue
+        for line in block['lines']:
+            for span in line['spans']:
+                text = span['text'].strip()
+                bbox = span['bbox']
+                
+                # Look for patterns like: "45", "45'", "45'-0\"", "45 LF", "120'-6\""
+                match = re.match(r'^(\d+\.?\d*)\s*[\'\"\-LF]*', text)
+                if match:
+                    try:
+                        num = float(match.group(1))
+                        # Filter to reasonable fence lengths
+                        if min_length_ft <= num <= max_length_ft:
+                            measurements.append({
+                                'value_ft': num,
+                                'text': text,
+                                'bbox': bbox,
+                                'center': ((bbox[0]+bbox[2])/2, (bbox[1]+bbox[3])/2)
+                            })
+                    except:
+                        pass
+    
+    print(f"[DEBUG] Found {len(measurements)} potential dimension texts")
+    
+    # Extract all lines from page
+    all_lines = extract_vector_lines(page, min_length=5.0)
+    print(f"[DEBUG] Extracted {len(all_lines)} vector lines")
+    
+    matched_dimensions = []
+    matched_lines = []
+    
+    for meas in measurements:
+        px, py = meas['center']
+        # Convert expected length from feet to points
+        expected_pts = meas['value_ft'] * 12.0 / scale_factor * 72.0
+        
+        best_line = None
+        best_score = float('inf')
+        
+        for line in all_lines:
+            sx, sy = line.start
+            ex, ey = line.end
+            mx, my = (sx + ex) / 2, (sy + ey) / 2
+            
+            # Distance from measurement text to line (any point)
+            dist = min(
+                ((sx-px)**2 + (sy-py)**2)**0.5,
+                ((ex-px)**2 + (ey-py)**2)**0.5,
+                ((mx-px)**2 + (my-py)**2)**0.5
+            )
+            
+            if dist > search_radius:
+                continue
+            
+            # Score: prioritize length match, penalize distance
+            length_diff_pct = abs(line.length_pts - expected_pts) / expected_pts if expected_pts > 0 else 1
+            score = length_diff_pct + (dist / search_radius) * 0.3
+            
+            if score < best_score:
+                best_score = score
+                best_line = line
+        
+        # Only include good matches (score < 1.0 means length match is within 70%)
+        if best_line and best_score < 1.0:
+            actual_ft = (best_line.length_pts / 72.0) * scale_factor / 12.0
+            matched_dimensions.append({
+                'expected_ft': meas['value_ft'],
+                'actual_ft': actual_ft,
+                'measurement_text': meas['text'],
+                'text_bbox': meas['bbox'],
+                'line_start': best_line.start,
+                'line_end': best_line.end,
+                'match_score': best_score,
+                'error_pct': abs(actual_ft - meas['value_ft']) / meas['value_ft'] * 100 if meas['value_ft'] > 0 else 0
+            })
+            matched_lines.append(best_line)
+    
+    # Calculate totals
+    total_expected_ft = sum(m['expected_ft'] for m in matched_dimensions)
+    total_actual_ft = sum(m['actual_ft'] for m in matched_dimensions)
+    
+    print(f"[DEBUG] Matched {len(matched_dimensions)} dimension lines")
+    print(f"[DEBUG] Total: expected={total_expected_ft:.0f}ft, actual={total_actual_ft:.0f}ft")
+    
+    return {
+        'success': True,
+        'method': 'dimension_line',
+        'measurements': matched_dimensions,
+        'matched_lines': matched_lines,
+        'total_expected_ft': total_expected_ft,
+        'total_actual_ft': total_actual_ft,
+        'dimension_count': len(matched_dimensions)
+    }
+
+
 def measure_fence_elements(
     page: fitz.Page,
     fence_definitions: List[Dict],
@@ -1380,6 +1509,35 @@ def measure_fence_elements(
     
     final_total = calculate_total_length(final_fence_lines, scale_factor) if final_fence_lines else {}
     
+    # =========================================================================
+    # DIMENSION LINE DETECTION (supplementary method)
+    # Find numeric measurements in text and match to nearby lines
+    # =========================================================================
+    dimension_result = detect_dimension_lines(page, scale_factor)
+    
+    # Add dimension lines to final fence lines if they found new ones
+    if dimension_result.get('success') and dimension_result.get('matched_lines'):
+        dim_lines = dimension_result['matched_lines']
+        # Avoid duplicates by checking line endpoints
+        existing_endpoints = set()
+        for line in final_fence_lines:
+            existing_endpoints.add((round(line.start[0], 1), round(line.start[1], 1), 
+                                   round(line.end[0], 1), round(line.end[1], 1)))
+        
+        new_dim_lines = []
+        for line in dim_lines:
+            key = (round(line.start[0], 1), round(line.start[1], 1),
+                   round(line.end[0], 1), round(line.end[1], 1))
+            if key not in existing_endpoints:
+                new_dim_lines.append(line)
+                existing_endpoints.add(key)
+        
+        if new_dim_lines:
+            final_fence_lines.extend(new_dim_lines)
+            print(f"[DEBUG] Added {len(new_dim_lines)} new lines from dimension detection")
+            # Recalculate total
+            final_total = calculate_total_length(final_fence_lines, scale_factor)
+    
     result = {
         'page_info': {
             'width': page_width,
@@ -1393,6 +1551,7 @@ def measure_fence_elements(
         'all_fence_lines': final_fence_lines,
         'layer_measurements': layer_measurements,
         'indicator_measurements': indicator_measurements,
+        'dimension_measurements': dimension_result.get('measurements', []),  # NEW: dimension line results
         'proximity_totals': {
             'total_segments': final_total.get('segment_count', 0),
             'total_length_feet': round(final_total.get('total_feet', 0), 2),
@@ -1406,6 +1565,8 @@ def measure_fence_elements(
     }
     
     print(f"[DEBUG] Measurement complete ({measurement_method}): {final_total.get('total_feet', 0):.1f} ft from {len(final_fence_lines)} lines")
+    if dimension_result.get('dimension_count', 0) > 0:
+        print(f"[DEBUG] Dimension lines: {dimension_result['dimension_count']} matched, {dimension_result.get('total_actual_ft', 0):.0f} ft")
     return result
 
 
