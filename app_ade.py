@@ -808,6 +808,16 @@ if st.session_state.run_analysis_triggered and \
                                     ft = l_stats.get('total_length_feet', 0)
                                     runs = l_stats.get('connected_runs', 0)
                                     st.markdown(f"- `{layer}`: {segs} segs | {ft:.1f} ft ({runs} runs)")
+                        
+                        # Dimension line measurements
+                        dim_measurements = measurement_result.get('dimension_measurements', [])
+                        if dim_measurements:
+                            with st.expander("📐 Dimension Line Measurements", expanded=False):
+                                st.caption(f"Found {len(dim_measurements)} dimension annotations")
+                                for dm in dim_measurements[:10]:
+                                    ft = dm.get('actual_ft', 0)
+                                    txt = dm.get('measurement_text', '')
+                                    st.markdown(f"- **{txt}**: {ft:.1f} ft")
                     
                     # Show message if nothing found
                     if not definitions and not instances and not keyword_matches:
@@ -1065,6 +1075,16 @@ elif st.session_state.processing_complete:
                                         ft = l_stats.get('total_length_feet', 0)
                                         runs = l_stats.get('connected_runs', 0)
                                         st.markdown(f"- `{layer}`: {segs} segs | {ft:.1f} ft ({runs} runs)")
+                            
+                            # Dimension line measurements
+                            dim_measurements = measurements.get('dimension_measurements', [])
+                            if dim_measurements:
+                                with st.expander("📐 Dimension Line Measurements", expanded=False):
+                                    st.caption(f"Found {len(dim_measurements)} dimension annotations")
+                                    for dm in dim_measurements[:10]:
+                                        ft = dm.get('actual_ft', 0)
+                                        txt = dm.get('measurement_text', '')
+                                        st.markdown(f"- **{txt}**: {ft:.1f} ft")
                     
                     # Show message if nothing found
                     if not definitions and not instances and not keyword_matches:

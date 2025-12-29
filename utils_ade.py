@@ -1511,6 +1511,29 @@ def measure_fence_elements(
     
     final_total = calculate_total_length(final_fence_lines, scale_factor) if final_fence_lines else {}
     
+    # Run dimension line detection (find measurement text and match to lines)
+    dimension_result = detect_dimension_lines(page, scale_factor)
+    
+    # Add dimension lines to final fence lines if found
+    if dimension_result.get('success') and dimension_result.get('matched_lines'):
+        dim_lines = dimension_result['matched_lines']
+        existing_endpoints = set()
+        for line in final_fence_lines:
+            existing_endpoints.add((round(line.start[0], 1), round(line.start[1], 1), 
+                                   round(line.end[0], 1), round(line.end[1], 1)))
+        
+        new_dim_lines = []
+        for line in dim_lines:
+            key = (round(line.start[0], 1), round(line.start[1], 1),
+                   round(line.end[0], 1), round(line.end[1], 1))
+            if key not in existing_endpoints:
+                new_dim_lines.append(line)
+                existing_endpoints.add(key)
+        
+        if new_dim_lines:
+            final_fence_lines.extend(new_dim_lines)
+            final_total = calculate_total_length(final_fence_lines, scale_factor)
+    
     result = {
         'page_info': {
             'width': page_width,
@@ -1524,6 +1547,7 @@ def measure_fence_elements(
         'all_fence_lines': final_fence_lines,
         'layer_measurements': layer_measurements,
         'indicator_measurements': indicator_measurements,
+        'dimension_measurements': dimension_result.get('measurements', []),
         'proximity_totals': {
             'total_segments': final_total.get('segment_count', 0),
             'total_length_feet': round(final_total.get('total_feet', 0), 2),
