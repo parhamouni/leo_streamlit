@@ -808,18 +808,6 @@ if st.session_state.run_analysis_triggered and \
                                     ft = l_stats.get('total_length_feet', 0)
                                     runs = l_stats.get('connected_runs', 0)
                                     st.markdown(f"- `{layer}`: {segs} segs | {ft:.1f} ft ({runs} runs)")
-                        
-                        # Dimension line detection results (NEW)
-                        dim_measurements = measurement_result.get('dimension_measurements', [])
-                        if dim_measurements:
-                            with st.expander("📐 Dimension Line Detection", expanded=False):
-                                st.caption(f"Found {len(dim_measurements)} dimension annotations matched to lines")
-                                for dm in dim_measurements[:10]:  # Show top 10
-                                    exp_ft = dm.get('expected_ft', 0)
-                                    act_ft = dm.get('actual_ft', 0)
-                                    err = dm.get('error_pct', 0)
-                                    txt = dm.get('measurement_text', '')
-                                    st.markdown(f"- **{txt}**: expected {exp_ft:.0f}ft → detected {act_ft:.1f}ft (error: {err:.0f}%)")
                     
                     # Show message if nothing found
                     if not definitions and not instances and not keyword_matches:
@@ -1077,18 +1065,6 @@ elif st.session_state.processing_complete:
                                         ft = l_stats.get('total_length_feet', 0)
                                         runs = l_stats.get('connected_runs', 0)
                                         st.markdown(f"- `{layer}`: {segs} segs | {ft:.1f} ft ({runs} runs)")
-                            
-                            # Dimension line detection results (NEW)
-                            dim_measurements = measurements.get('dimension_measurements', [])
-                            if dim_measurements:
-                                with st.expander("📐 Dimension Line Detection", expanded=False):
-                                    st.caption(f"Found {len(dim_measurements)} dimension annotations matched to lines")
-                                    for dm in dim_measurements[:10]:
-                                        exp_ft = dm.get('expected_ft', 0)
-                                        act_ft = dm.get('actual_ft', 0)
-                                        err = dm.get('error_pct', 0)
-                                        txt = dm.get('measurement_text', '')
-                                        st.markdown(f"- **{txt}**: expected {exp_ft:.0f}ft → detected {act_ft:.1f}ft (error: {err:.0f}%)")
                     
                     # Show message if nothing found
                     if not definitions and not instances and not keyword_matches:
