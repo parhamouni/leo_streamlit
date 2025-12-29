@@ -1153,8 +1153,10 @@ def detect_dimension_lines(
     print(f"[DEBUG] Found {len(measurements)} potential dimension texts")
     
     # Extract all lines from page
-    all_lines = extract_vector_lines(page, min_length=5.0)
-    print(f"[DEBUG] Extracted {len(all_lines)} vector lines")
+    all_lines = extract_vector_lines(page)
+    # Filter to minimum length
+    all_lines = [l for l in all_lines if l.length_pts >= 5.0]
+    print(f"[DEBUG] Extracted {len(all_lines)} vector lines (min 5 pts)")
     
     matched_dimensions = []
     matched_lines = []
