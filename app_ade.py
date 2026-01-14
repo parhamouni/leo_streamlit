@@ -53,7 +53,7 @@ def initialize_session_state(session_id_val):
             'fence', 'fencing', 'gate', 'barrier', 'guardrail', 'post', 'mesh',
             'panel', 'chain link', 'masonry', 'fence details', 'canopy shading',
             'adot specifications', 'mag specifications', 'rail', 'railing',
-            'bollards', 'handrails', 'wall', 'cmu', 'keynote'
+            'bollards', 'handrails', 'wall', 'cmu',
         ],
         'run_analysis_triggered': False,
         'uploaded_pdf_name': None,
@@ -276,21 +276,25 @@ with st.sidebar:
 
 
 # ==============================================================================
-# Initialize LLM
+# Initialize LLM (cached to avoid re-init on every rerun)
 # ==============================================================================
+
+@st.cache_resource
+def get_llm_instance(api_key: str, model: str):
+    """Cache LLM instance to avoid slow re-initialization on every page load."""
+    print(f"LOG: Creating cached LLM instance for model {model}")
+    return ChatOpenAI(
+        model=model,
+        temperature=0,
+        openai_api_key=api_key,
+        timeout=180,
+        max_retries=2
+    )
 
 llm_analysis_instance = None
 if openai_key:
     try:
-        print(f"SESSION {current_session_id} LOG: Initializing LLM instance.")
-        llm_analysis_instance = ChatOpenAI(
-            model=st.session_state.selected_model_for_analysis,
-            temperature=0,
-            openai_api_key=openai_key,
-            timeout=180,
-            max_retries=2
-        )
-        print(f"SESSION {current_session_id} LOG: LLM instance initialized.")
+        llm_analysis_instance = get_llm_instance(openai_key, st.session_state.selected_model_for_analysis)
     except Exception as e:
         st.error(f"LLM Init Error: {e}")
         openai_key = None
