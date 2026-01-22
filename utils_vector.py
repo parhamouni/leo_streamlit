@@ -527,6 +527,347 @@ def infer_scale_from_page(page: fitz.Page) -> Optional[float]:
     return infer_scale_from_text(text)
 
 
+def verify_scale_with_bar(page: fitz.Page) -> Dict:
+    """
+    Verify scale factor by measuring the scale bar line element.
+    
+    This handles cases where PDF was resized during export.
+    
+    Steps:
+    1. Find scale text (e.g., "1" = 30'") and its bounding box
+    2. Find horizontal lines near the scale text (the scale bar)
+    3. Measure scale bar length in PDF points
+    4. Calculate true scale based on actual line measurement
+    
+    Args:
+        page: PyMuPDF page object
+    
+    Returns:
+        Dict with:
+        - 'success': bool
+        - 'text_scale': scale from text parsing (or None)
+        - 'verified_scale': scale verified via bar measurement (or None)
+        - 'scale_bar_length_pts': measured bar length in points
+        - 'confidence': 'high', 'medium', 'low'
+        - 'message': explanation
+    """
+    result = {
+        'success': False,
+        'text_scale': None,
+        'verified_scale': None,
+        'scale_bar_length_pts': None,
+        'confidence': 'low',
+        'message': ''
+    }
+    
+    # Step 1: Find scale text with location
+    text_dict = page.get_text("dict")
+    scale_text_bbox = None
+    scale_text_value = None
+    
+    # Patterns to find scale notation
+    scale_patterns = [
+        (r'1["\']?\s*=\s*(\d+)[\'′\-]', 'feet'),      # 1" = 30'
+        (r'1\s*[:/]\s*(\d+)', 'ratio'),               # 1:30 or 1/30
+        (r'1["\']?\s*=\s*(\d+)["\'](?!\s*-)', 'inches')  # 1" = 30"
+    ]
+    
+    for block in text_dict.get("blocks", []):
+        if block.get("type") != 0:  # text block
+            continue
+        for line in block.get("lines", []):
+            line_text = ""
+            line_bbox = None
+            for span in line.get("spans", []):
+                line_text += span.get("text", "")
+                if line_bbox is None:
+                    line_bbox = list(span.get("bbox", [0,0,0,0]))
+                else:
+                    # Expand bbox
+                    sb = span.get("bbox", [0,0,0,0])
+                    line_bbox[0] = min(line_bbox[0], sb[0])
+                    line_bbox[1] = min(line_bbox[1], sb[1])
+                    line_bbox[2] = max(line_bbox[2], sb[2])
+                    line_bbox[3] = max(line_bbox[3], sb[3])
+            
+            # Check for scale patterns
+            for pattern, unit_type in scale_patterns:
+                match = re.search(pattern, line_text, re.IGNORECASE)
+                if match:
+                    value = float(match.group(1))
+                    if unit_type == 'feet':
+                        scale_text_value = value * 12  # convert to inches
+                    else:
+                        scale_text_value = value
+                    scale_text_bbox = line_bbox
+                    break
+            if scale_text_bbox:
+                break
+        if scale_text_bbox:
+            break
+    
+    result['text_scale'] = scale_text_value
+    
+    if not scale_text_bbox:
+        result['message'] = "No scale text found on page"
+        return result
+    
+    # Step 2: Find horizontal lines near the scale text
+    # Expand search area below and around the scale text
+    search_bbox = (
+        scale_text_bbox[0] - 50,      # left
+        scale_text_bbox[1] - 20,      # top (slightly above)
+        scale_text_bbox[2] + 100,     # right (scale bar may extend)
+        scale_text_bbox[3] + 60       # bottom (scale bar usually below)
+    )
+    
+    # Extract all vector lines from page
+    all_lines = extract_vector_lines(page)
+    
+    # Find horizontal lines in search area
+    horizontal_lines = []
+    for line in all_lines:
+        sx, sy = line.start
+        ex, ey = line.end
+        
+        # Check if line is roughly horizontal (within 5 degrees)
+        dy = abs(ey - sy)
+        dx = abs(ex - sx)
+        if dx > 10 and dy < dx * 0.1:  # horizontal threshold
+            # Check if line intersects search bbox
+            min_x, max_x = min(sx, ex), max(sx, ex)
+            min_y, max_y = min(sy, ey), max(sy, ey)
+            
+            if (min_x < search_bbox[2] and max_x > search_bbox[0] and
+                min_y < search_bbox[3] and max_y > search_bbox[1]):
+                horizontal_lines.append(line)
+    
+    if not horizontal_lines:
+        result['message'] = f"Scale text found ('{scale_text_value}') but no scale bar line detected nearby"
+        result['confidence'] = 'low'
+        result['verified_scale'] = scale_text_value  # Use text scale as fallback
+        result['success'] = True
+        return result
+    
+    # Step 3: Find the most likely scale bar (typically a clean horizontal line)
+    # Sort by length and pick the longest reasonable one
+    horizontal_lines.sort(key=lambda l: l.length_pts, reverse=True)
+    
+    # The scale bar is typically 1 inch (72 pts) or a fraction thereof
+    # Look for lines close to common scale bar lengths
+    common_lengths = [72, 36, 144, 18, 90]  # 1", 0.5", 2", 0.25", 1.25"
+    
+    best_line = None
+    best_score = float('inf')
+    
+    for line in horizontal_lines[:10]:  # Check top 10 longest
+        for common_len in common_lengths:
+            score = abs(line.length_pts - common_len)
+            if score < best_score:
+                best_score = score
+                best_line = line
+    
+    if not best_line:
+        best_line = horizontal_lines[0]  # fallback to longest
+    
+    bar_length_pts = best_line.length_pts
+    result['scale_bar_length_pts'] = bar_length_pts
+    
+    # Step 4: Calculate verified scale
+    # If text says "1" = X'" and bar is supposed to be 1", 
+    # then: verified_scale = text_scale * (72 / bar_length_pts)
+    # This corrects for any PDF resizing
+    
+    if scale_text_value and bar_length_pts > 0:
+        # Assume the scale bar represents 1 inch on drawing
+        # If bar measures 72 pts, no correction needed
+        # If bar measures 36 pts (PDF scaled 50%), multiply scale by 2
+        correction_factor = 72.0 / bar_length_pts
+        verified_scale = scale_text_value * correction_factor
+        
+        result['verified_scale'] = verified_scale
+        result['success'] = True
+        
+        # Determine confidence
+        if 0.9 <= correction_factor <= 1.1:
+            result['confidence'] = 'high'
+            result['message'] = f"Scale verified: bar={bar_length_pts:.1f}pts (≈1\"), scale={verified_scale:.0f}\""
+        elif 0.5 <= correction_factor <= 2.0:
+            result['confidence'] = 'medium'
+            result['message'] = f"PDF appears resized ({correction_factor:.2f}x). Adjusted scale: {verified_scale:.0f}\""
+        else:
+            result['confidence'] = 'low'
+            result['message'] = f"Unusual correction ({correction_factor:.2f}x). Using adjusted scale: {verified_scale:.0f}\""
+    
+    return result
+
+
+def find_lines_in_bbox(
+    lines: List[VectorLine],
+    bbox: Tuple[float, float, float, float],
+    require_both_endpoints: bool = False
+) -> List[VectorLine]:
+    """
+    Find all lines that are inside or intersect a bounding box.
+    
+    Args:
+        lines: List of VectorLine objects
+        bbox: (x0, y0, x1, y1) bounding box in PDF coordinates
+        require_both_endpoints: If True, both endpoints must be inside bbox.
+                                If False, at least one endpoint must be inside.
+    
+    Returns:
+        List of VectorLine objects inside the bbox
+    """
+    x0, y0, x1, y1 = bbox
+    # Normalize bbox (ensure x0 < x1, y0 < y1)
+    if x0 > x1:
+        x0, x1 = x1, x0
+    if y0 > y1:
+        y0, y1 = y1, y0
+    
+    matched = []
+    for line in lines:
+        sx, sy = line.start
+        ex, ey = line.end
+        
+        start_in = x0 <= sx <= x1 and y0 <= sy <= y1
+        end_in = x0 <= ex <= x1 and y0 <= ey <= y1
+        
+        if require_both_endpoints:
+            if start_in and end_in:
+                matched.append(line)
+        else:
+            if start_in or end_in:
+                matched.append(line)
+    
+    return matched
+
+
+def measure_lines_in_selection(
+    page: fitz.Page,
+    selection_bbox: Tuple[float, float, float, float],
+    scale_factor: float = 1.0,
+    min_line_length: float = 5.0
+) -> Dict:
+    """
+    Measure all vector lines within a user-selected bounding box.
+    
+    Args:
+        page: PyMuPDF page object
+        selection_bbox: (x0, y0, x1, y1) selection area in PDF coordinates
+        scale_factor: Drawing scale factor (e.g., 360 means 1" = 30')
+        min_line_length: Minimum line length in points to include
+    
+    Returns:
+        Dictionary with measurement results
+    """
+    # Extract all lines from the page
+    all_lines = extract_vector_lines(page, apply_rotation=True)
+    
+    # Filter to lines within selection
+    selected_lines = find_lines_in_bbox(all_lines, selection_bbox, require_both_endpoints=False)
+    
+    # Filter out tiny lines (hatching, etc.)
+    selected_lines = [l for l in selected_lines if l.length_pts >= min_line_length]
+    
+    if not selected_lines:
+        return {
+            'success': True,
+            'line_count': 0,
+            'total_length_pts': 0,
+            'total_length_feet': 0,
+            'scale_factor': scale_factor,
+            'lines': [],
+            'layers': []
+        }
+    
+    # Calculate measurements
+    total_pts = sum(l.length_pts for l in selected_lines)
+    total_inches_scaled = (total_pts / 72.0) * scale_factor
+    total_feet = total_inches_scaled / 12.0
+    
+    # Get layer breakdown
+    layer_lengths = {}
+    for line in selected_lines:
+        layer = line.layer or 'Unknown'
+        if layer not in layer_lengths:
+            layer_lengths[layer] = {'count': 0, 'length_pts': 0}
+        layer_lengths[layer]['count'] += 1
+        layer_lengths[layer]['length_pts'] += line.length_pts
+    
+    # Convert layer lengths to feet
+    for layer in layer_lengths:
+        pts = layer_lengths[layer]['length_pts']
+        layer_lengths[layer]['length_feet'] = (pts / 72.0) * scale_factor / 12.0
+    
+    return {
+        'success': True,
+        'line_count': len(selected_lines),
+        'total_length_pts': total_pts,
+        'total_length_feet': total_feet,
+        'scale_factor': scale_factor,
+        'lines': selected_lines,
+        'layers': layer_lengths
+    }
+
+
+def measure_at_click_point(
+    page: fitz.Page,
+    click_point: Tuple[float, float],
+    scale_factor: float = 1.0,
+    search_radius: float = 30.0,
+    trace_connected: bool = True
+) -> Dict:
+    """
+    Measure lines near a click point, optionally tracing connected lines.
+    
+    Args:
+        page: PyMuPDF page object
+        click_point: (x, y) in PDF coordinates
+        scale_factor: Drawing scale factor
+        search_radius: Radius to search for lines near click
+        trace_connected: If True, trace all connected lines from nearest line
+    
+    Returns:
+        Dictionary with measurement results
+    """
+    all_lines = extract_vector_lines(page, apply_rotation=True)
+    
+    # Find closest line to click point
+    result = find_closest_line_to_point(all_lines, click_point)
+    
+    if not result or result[1] > search_radius:
+        return {
+            'success': False,
+            'error': 'No line found near click point',
+            'line_count': 0,
+            'total_length_feet': 0
+        }
+    
+    closest_line, distance = result
+    
+    if trace_connected:
+        # Trace all connected lines
+        connected = trace_connected_lines_from_start(closest_line, all_lines, tolerance=5.0)
+    else:
+        connected = [closest_line]
+    
+    # Calculate measurements
+    total_pts = sum(l.length_pts for l in connected)
+    total_feet = (total_pts / 72.0) * scale_factor / 12.0
+    
+    return {
+        'success': True,
+        'line_count': len(connected),
+        'total_length_pts': total_pts,
+        'total_length_feet': total_feet,
+        'scale_factor': scale_factor,
+        'click_distance': distance,
+        'lines': connected
+    }
+
+
 if __name__ == "__main__":
     # Simple test
     import sys

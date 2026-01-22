@@ -11,9 +11,21 @@ from pathlib import Path
 from io import BytesIO
 import pandas as pd
 import fitz  # PyMuPDF
+from PIL import Image
 
 # Import our consolidated ADE utilities
 import utils_ade as ade
+
+# Interactive image click for measurement
+from streamlit_image_coordinates import streamlit_image_coordinates
+
+# Vector measurement utilities
+from utils_vector import (
+    measure_lines_in_selection,
+    measure_at_click_point,
+    infer_scale_from_page,
+    extract_vector_lines
+)
 
 # Optional: LLM client
 from langchain_openai import ChatOpenAI
@@ -22,7 +34,7 @@ from langchain_openai import ChatOpenAI
 HIGHLIGHT_COLOR_UI = (0, 0.9, 0)  # Green for definitions
 HIGHLIGHT_COLOR_INSTANCE = (0.9, 0, 0.9)  # Purple for instances
 HIGHLIGHT_WIDTH_UI = 2.0
-DISPLAY_IMAGE_DPI = 96
+DISPLAY_IMAGE_DPI = 150
 
 st.set_page_config(page_title="ADE Fence Detector", layout="wide")
 st.markdown("""<style> /* Your CSS */ </style>""", unsafe_allow_html=True)
@@ -253,6 +265,9 @@ with st.sidebar:
     
     # Fence Measurement toggle
     enable_fence_measurement = st.toggle("📏 Measure fence elements", value=True, key="measurement_toggle")
+    
+    # Interactive Measurement toggle
+    enable_interactive_measurement = st.toggle("🖱️ Interactive line selection", value=False, key="interactive_measurement_toggle")
     
     # Debug mode (disabled in UI)
     DEBUG_MODE = False
@@ -1096,6 +1111,328 @@ elif st.session_state.processing_complete:
     
     display_page_result_expander(st.session_state.fence_pages, col_f_res)
     display_page_result_expander(st.session_state.non_fence_pages, col_nf_res)
+
+
+# ==============================================================================
+# Interactive Measurement Tool
+# ==============================================================================
+
+if st.session_state.processing_complete and st.session_state.fence_pages and enable_interactive_measurement:
+    st.markdown("---")
+    st.markdown("<h2>📏 Interactive Measurement Tool</h2>", unsafe_allow_html=True)
+    st.caption("Click on lines in the image to select/deselect them. Selected lines shown in green.")
+    
+    # Auto-detect and verify scale from first fence page
+    from utils_vector import verify_scale_with_bar
+    
+    scale_info = None
+    if 'verified_scale_info' not in st.session_state:
+        try:
+            with fitz.open(stream=BytesIO(st.session_state.original_pdf_bytes), filetype="pdf") as doc:
+                first_fence_page = st.session_state.fence_pages[0]
+                page_idx = first_fence_page['page_index_in_original_doc']
+                pdf_page = doc[page_idx]
+                scale_info = verify_scale_with_bar(pdf_page)
+                st.session_state.verified_scale_info = scale_info
+        except Exception as e:
+            st.session_state.verified_scale_info = {'success': False, 'verified_scale': None, 'message': str(e)}
+    else:
+        scale_info = st.session_state.verified_scale_info
+    
+    auto_scale = scale_info.get('verified_scale') if scale_info else None
+    
+    # Global scale settings
+    col_g1, col_g2, col_g3 = st.columns([1, 1, 1])
+    with col_g1:
+        default_scale = auto_scale if auto_scale else 360.0
+        global_scale = st.number_input(
+            "Scale factor (inches)",
+            min_value=1.0,
+            max_value=1200.0,
+            value=float(default_scale),
+            step=12.0,
+            help="E.g., 360 means 1\" = 30' actual",
+            key="global_scale_input"
+        )
+        st.caption(f"= 1\" = {global_scale/12:.1f}' actual")
+    with col_g2:
+        min_line_pts = st.number_input(
+            "Min line length (pts)",
+            min_value=5,
+            max_value=200,
+            value=30,
+            step=5,
+            help="Filter out short lines (hatching, text)",
+            key="min_line_pts_input"
+        )
+    with col_g3:
+        if scale_info and scale_info.get('success'):
+            confidence = scale_info.get('confidence', 'low')
+            bar_len = scale_info.get('scale_bar_length_pts')
+            if confidence == 'high':
+                st.success(f"✓ Verified: 1\"={auto_scale/12:.0f}'")
+            elif confidence == 'medium':
+                st.warning(f"⚠ Adjusted: 1\"={auto_scale/12:.0f}'")
+            else:
+                st.info(f"Scale: 1\"={auto_scale/12:.0f}'")
+            if bar_len:
+                st.caption(f"Bar: {bar_len:.1f}pts | {scale_info.get('message', '')}")
+        elif auto_scale:
+            st.info(f"Text scale: 1\"={auto_scale/12:.0f}'")
+        else:
+            st.warning("Scale not detected")
+    
+    # Zoom slider
+    zoom_level = st.slider("🔍 Zoom", min_value=400, max_value=1600, value=800, step=100, 
+                           help="Adjust image display width")
+    
+    # Create tabs for each fence page
+    page_tabs = st.tabs([f"Page {p['page_number']}" for p in st.session_state.fence_pages])
+    
+    # Track selected lines per page
+    if 'selected_lines' not in st.session_state:
+        st.session_state.selected_lines = {}
+    
+    # Import PIL once outside loop
+    from PIL import Image, ImageDraw
+    
+    # OPTIMIZATION 5: Use st.fragment for partial reruns (only rerun the page content, not entire app)
+    @st.fragment
+    def render_page_fragment(page_data, zoom_level, min_line_pts, global_scale):
+        """Fragment function for each page - only this reruns on interaction"""
+        page_num = page_data['page_number']
+        page_key = f"page_{page_num}"
+        page_idx = page_data['page_index_in_original_doc']
+        pdf_width = page_data.get('pdf_width', 792)
+        pdf_height = page_data.get('pdf_height', 612)
+        
+        # Extract lines from PDF page (cached)
+        lines_cache_key = f"lines_{page_num}_{min_line_pts}"
+        if lines_cache_key not in st.session_state:
+            with fitz.open(stream=BytesIO(st.session_state.original_pdf_bytes), filetype="pdf") as doc:
+                pdf_page = doc[page_idx]
+                all_lines = extract_vector_lines(pdf_page)
+                filtered_lines = [l for l in all_lines if l.length_pts >= min_line_pts]
+                filtered_lines.sort(key=lambda l: l.length_pts, reverse=True)
+                st.session_state[lines_cache_key] = filtered_lines
+        
+        lines = st.session_state.get(lines_cache_key, [])
+        
+        if not lines:
+            st.warning(f"No lines found on this page (min length: {min_line_pts} pts)")
+            return
+        
+        # Initialize selection for this page
+        if page_key not in st.session_state.selected_lines:
+            st.session_state.selected_lines[page_key] = set()
+        
+        # Cache line stats (keyed by page + min_line_pts + scale)
+        line_stats_key = f"line_stats_{page_num}_{min_line_pts}_{global_scale}"
+        if line_stats_key not in st.session_state:
+            stats = []
+            for i, line in enumerate(lines):
+                length_inches = line.length_pts / 72.0
+                length_feet = (length_inches * global_scale) / 12.0
+                stats.append({
+                    'index': i,
+                    'length_pts': line.length_pts,
+                    'length_feet': length_feet,
+                    'layer': line.layer or 'default',
+                    'start': line.start,
+                    'end': line.end
+                })
+            st.session_state[line_stats_key] = stats
+        line_stats = st.session_state[line_stats_key]
+        
+        # Get base image (highlighted if available)
+        base_img_bytes = page_data.get('highlighted_image_bytes') or page_data.get('original_image_bytes')
+        
+        if base_img_bytes:
+            
+            # OPTIMIZATION 1: Cache resized base image (keyed by page + zoom)
+            base_img_cache_key = f"base_img_{page_num}_{zoom_level}"
+            if base_img_cache_key not in st.session_state:
+                base_img = Image.open(BytesIO(base_img_bytes)).convert('RGB')
+                orig_width, orig_height = base_img.size
+                ratio = zoom_level / orig_width
+                new_width = zoom_level
+                new_height = int(orig_height * ratio)
+                # OPTIMIZATION 4: Use BILINEAR for faster resize
+                base_img = base_img.resize((new_width, new_height), Image.BILINEAR)
+                st.session_state[base_img_cache_key] = base_img
+                st.session_state[f"base_img_size_{page_num}_{zoom_level}"] = (new_width, new_height)
+                st.session_state[f"orig_img_size_{page_num}"] = (orig_width, orig_height)
+            
+            base_img_cached = st.session_state[base_img_cache_key]
+            img_width, img_height = st.session_state[f"base_img_size_{page_num}_{zoom_level}"]
+            
+            # Scale factors from PDF to image coordinates
+            scale_x = img_width / pdf_width
+            scale_y = img_height / pdf_height
+            
+            selected_indices = st.session_state.selected_lines.get(page_key, set())
+            
+            # OPTIMIZATION 2: Cache drawn image with selections
+            # Create a hashable key from selection state
+            selection_tuple = tuple(sorted(selected_indices))
+            drawn_img_cache_key = f"drawn_img_{page_num}_{zoom_level}_{hash(selection_tuple)}"
+            
+            if drawn_img_cache_key not in st.session_state:
+                # Copy base image and draw selections
+                display_img = base_img_cached.copy()
+                draw = ImageDraw.Draw(display_img)
+                
+                # First pass: Draw ALL selectable lines with subtle color
+                for i, ls in enumerate(line_stats):
+                    x0 = ls['start'][0] * scale_x
+                    y0 = ls['start'][1] * scale_y
+                    x1 = ls['end'][0] * scale_x
+                    y1 = ls['end'][1] * scale_y
+                    # Subtle gray-blue for unselected, shows clickable lines without being distracting
+                    if i not in selected_indices:
+                        draw.line([(x0, y0), (x1, y1)], fill=(150, 180, 200), width=1)
+                
+                # Second pass: Draw SELECTED lines with prominent highlighting
+                for i, ls in enumerate(line_stats):
+                    if i in selected_indices:
+                        x0 = ls['start'][0] * scale_x
+                        y0 = ls['start'][1] * scale_y
+                        x1 = ls['end'][0] * scale_x
+                        y1 = ls['end'][1] * scale_y
+                        draw.line([(x0, y0), (x1, y1)], fill=(255, 255, 0), width=8)
+                        draw.line([(x0, y0), (x1, y1)], fill=(0, 255, 0), width=4)
+                        draw.ellipse([(x0-6, y0-6), (x0+6, y0+6)], fill=(255, 0, 0))
+                        draw.ellipse([(x1-6, y1-6), (x1+6, y1+6)], fill=(255, 0, 0))
+                
+                st.session_state[drawn_img_cache_key] = display_img
+            
+            display_img = st.session_state[drawn_img_cache_key]
+            
+            # Display clickable image and info side by side
+            col_img, col_info = st.columns([3, 1])
+            
+            with col_img:
+                # Track last click to detect new clicks
+                click_key = f"last_click_{page_num}"
+                if click_key not in st.session_state:
+                    st.session_state[click_key] = None
+                
+                # Use stable key (only page_num, not selection count)
+                click_result = streamlit_image_coordinates(
+                    display_img,
+                    key=f"click_img_{page_num}"
+                )
+                
+                # Handle click - find nearest line
+                if click_result is not None:
+                    current_click = (click_result.get('x', 0), click_result.get('y', 0))
+                    
+                    # Only process if this is a new click
+                    if current_click != st.session_state[click_key]:
+                        st.session_state[click_key] = current_click
+                        click_x, click_y = current_click
+                        pdf_click_x = click_x / scale_x
+                        pdf_click_y = click_y / scale_y
+                        
+                        def point_to_line_distance(px, py, x0, y0, x1, y1):
+                            dx = x1 - x0
+                            dy = y1 - y0
+                            if dx == 0 and dy == 0:
+                                return ((px - x0)**2 + (py - y0)**2)**0.5
+                            t = max(0, min(1, ((px - x0)*dx + (py - y0)*dy) / (dx*dx + dy*dy)))
+                            proj_x = x0 + t * dx
+                            proj_y = y0 + t * dy
+                            return ((px - proj_x)**2 + (py - proj_y)**2)**0.5
+                        
+                        min_dist = float('inf')
+                        nearest_idx = -1
+                        for i, ls in enumerate(line_stats):
+                            dist = point_to_line_distance(
+                                pdf_click_x, pdf_click_y,
+                                ls['start'][0], ls['start'][1],
+                                ls['end'][0], ls['end'][1]
+                            )
+                            if dist < min_dist:
+                                min_dist = dist
+                                nearest_idx = i
+                        
+                        # Toggle selection if click was close enough (within 30 PDF points)
+                        if nearest_idx >= 0 and min_dist < 30:
+                            if nearest_idx in st.session_state.selected_lines[page_key]:
+                                st.session_state.selected_lines[page_key].discard(nearest_idx)
+                            else:
+                                st.session_state.selected_lines[page_key].add(nearest_idx)
+                            # Fragment rerun - only reruns this fragment, not the whole app
+                            st.rerun(scope="fragment")
+            
+            with col_info:
+                st.markdown(f"**{len(lines)} lines**")
+                st.caption("Click lines to select")
+                
+                # Buttons trigger fragment rerun
+                if st.button("Select All", key=f"sel_all_{page_num}"):
+                    st.session_state.selected_lines[page_key] = set(range(len(lines)))
+                if st.button("Clear All", key=f"clear_sel_{page_num}"):
+                    st.session_state.selected_lines[page_key] = set()
+                
+                selected_indices = st.session_state.selected_lines.get(page_key, set())
+                if selected_indices:
+                    st.markdown(f"**Selected: {len(selected_indices)}**")
+                    total_feet = sum(line_stats[i]['length_feet'] for i in selected_indices if i < len(line_stats))
+                    st.metric("Total", f"{total_feet:.1f} ft")
+                    
+                    with st.expander("Selected lines"):
+                        for idx in sorted(selected_indices):
+                            if idx < len(line_stats):
+                                ls = line_stats[idx]
+                                st.caption(f"Line {idx+1}: {ls['length_feet']:.1f}ft")
+        else:
+            st.warning("Image not available")
+    
+    # Render each page tab using the fragment
+    for tab_idx, (tab, page_data) in enumerate(zip(page_tabs, st.session_state.fence_pages)):
+        with tab:
+            render_page_fragment(page_data, zoom_level, min_line_pts, global_scale)
+    
+    # Overall summary across all pages
+    st.markdown("---")
+    st.markdown("### 📊 Overall Summary")
+    
+    grand_total_feet = 0
+    grand_total_lines = 0
+    
+    for page_data in st.session_state.fence_pages:
+        page_num = page_data['page_number']
+        page_key = f"page_{page_num}"
+        lines_cache_key = f"lines_{page_num}_{min_line_pts}"
+        
+        lines = st.session_state.get(lines_cache_key, [])
+        if not lines:
+            continue
+        
+        selected_indices = st.session_state.selected_lines.get(page_key, set())
+        for i, line in enumerate(lines):
+            if i in selected_indices:
+                length_inches = line.length_pts / 72.0
+                length_feet = (length_inches * global_scale) / 12.0
+                grand_total_feet += length_feet
+                grand_total_lines += 1
+    
+    if grand_total_lines > 0:
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            st.metric("Lines Selected", grand_total_lines)
+        with col_s2:
+            st.metric("Grand Total", f"{grand_total_feet:.1f} ft")
+        with col_s3:
+            pages_with_sel = sum(1 for p in st.session_state.fence_pages 
+                               if st.session_state.selected_lines.get(f"page_{p['page_number']}", set()))
+            st.metric("Pages", pages_with_sel)
+        
+        if st.button("🗑️ Clear All Selections", key="clear_all_selections"):
+            st.session_state.selected_lines = {}
+    else:
+        st.info("Select individual lines from the page tabs above to calculate totals.")
 
 
 # ==============================================================================
