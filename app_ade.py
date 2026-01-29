@@ -1189,9 +1189,29 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
     # Create tabs for each fence page
     page_tabs = st.tabs([f"Page {p['page_number']}" for p in st.session_state.fence_pages])
     
-    # Track selected lines per page
-    if 'selected_lines' not in st.session_state:
-        st.session_state.selected_lines = {}
+    # Track line assignments per page: {page_key: {line_idx: category_name}}
+    if 'line_assignments' not in st.session_state:
+        st.session_state.line_assignments = {}
+    
+    # Track categories per page: {page_key: {cat_name: {indicator, keyword, color}}}
+    if 'page_categories' not in st.session_state:
+        st.session_state.page_categories = {}
+    
+    # Track active category per page
+    if 'active_category_per_page' not in st.session_state:
+        st.session_state.active_category_per_page = {}
+    
+    # Category colors for consistent assignment
+    CATEGORY_COLORS = [
+        (0, 255, 0),      # Green
+        (255, 165, 0),    # Orange
+        (0, 191, 255),    # Deep sky blue
+        (255, 0, 255),    # Magenta
+        (255, 255, 0),    # Yellow
+        (0, 255, 255),    # Cyan
+        (255, 105, 180),  # Hot pink
+        (173, 255, 47),   # Green yellow
+    ]
     
     # Import PIL once outside loop
     from PIL import Image, ImageDraw
@@ -1222,9 +1242,68 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             st.warning(f"No lines found on this page (min length: {min_line_pts} pts)")
             return
         
-        # Initialize selection for this page
-        if page_key not in st.session_state.selected_lines:
-            st.session_state.selected_lines[page_key] = set()
+        # Initialize line assignments for this page: {line_idx: category_name}
+        if page_key not in st.session_state.line_assignments:
+            st.session_state.line_assignments[page_key] = {}
+        
+        # Initialize categories for this page from its definitions
+        if page_key not in st.session_state.page_categories:
+            categories = {}
+            definitions = page_data.get('definitions', [])
+            for d in definitions:
+                indicator = d.get('indicator', '')
+                keyword = d.get('keyword', '')
+                if keyword:
+                    cat_name = f"{indicator}: {keyword}" if indicator else keyword
+                    if cat_name not in categories:
+                        color_idx = len(categories)
+                        categories[cat_name] = {
+                            'indicator': indicator,
+                            'keyword': keyword,
+                            'color': CATEGORY_COLORS[color_idx % len(CATEGORY_COLORS)]
+                        }
+            st.session_state.page_categories[page_key] = categories
+        
+        page_categories = st.session_state.page_categories[page_key]
+        
+        # Initialize active category for this page
+        if page_key not in st.session_state.active_category_per_page:
+            cats = list(page_categories.keys())
+            st.session_state.active_category_per_page[page_key] = cats[0] if cats else None
+        
+        # Category selector for this page
+        st.markdown("#### 🏷️ Fence Categories (This Page)")
+        cat_col1, cat_col2 = st.columns([3, 1])
+        with cat_col1:
+            category_options = list(page_categories.keys())
+            if category_options:
+                current_active = st.session_state.active_category_per_page.get(page_key)
+                active_cat = st.selectbox(
+                    "Assign lines to:",
+                    options=category_options,
+                    index=category_options.index(current_active) if current_active in category_options else 0,
+                    key=f"category_selector_{page_num}"
+                )
+                st.session_state.active_category_per_page[page_key] = active_cat
+                if active_cat:
+                    color = page_categories[active_cat]['color']
+                    st.markdown(f"<span style='color: rgb{color}; font-size: 20px;'>●</span> Click lines to assign", unsafe_allow_html=True)
+            else:
+                st.info("No fence categories detected on this page.")
+        
+        with cat_col2:
+            with st.popover("➕ Add"):
+                new_cat_name = st.text_input("Category name:", key=f"new_cat_{page_num}")
+                if st.button("Add", key=f"add_cat_btn_{page_num}") and new_cat_name:
+                    if new_cat_name not in st.session_state.page_categories[page_key]:
+                        color_idx = len(st.session_state.page_categories[page_key])
+                        st.session_state.page_categories[page_key][new_cat_name] = {
+                            'indicator': '',
+                            'keyword': new_cat_name,
+                            'color': CATEGORY_COLORS[color_idx % len(CATEGORY_COLORS)]
+                        }
+                        st.session_state.active_category_per_page[page_key] = new_cat_name
+                        st.rerun(scope="fragment")
         
         # Cache line stats (keyed by page + min_line_pts + scale)
         line_stats_key = f"line_stats_{page_num}_{min_line_pts}_{global_scale}"
@@ -1270,39 +1349,44 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             scale_x = img_width / pdf_width
             scale_y = img_height / pdf_height
             
-            selected_indices = st.session_state.selected_lines.get(page_key, set())
+            line_assignments = st.session_state.line_assignments.get(page_key, {})
             
-            # OPTIMIZATION 2: Cache drawn image with selections
-            # Create a hashable key from selection state
-            selection_tuple = tuple(sorted(selected_indices))
-            drawn_img_cache_key = f"drawn_img_{page_num}_{zoom_level}_{hash(selection_tuple)}"
+            # OPTIMIZATION 2: Cache drawn image with assignments
+            # Create a hashable key from assignment state
+            assignment_tuple = tuple(sorted(line_assignments.items()))
+            drawn_img_cache_key = f"drawn_img_{page_num}_{zoom_level}_{hash(assignment_tuple)}"
             
             if drawn_img_cache_key not in st.session_state:
-                # Copy base image and draw selections
+                # Copy base image and draw assignments
                 display_img = base_img_cached.copy()
                 draw = ImageDraw.Draw(display_img)
                 
-                # First pass: Draw ALL selectable lines with subtle color
+                # First pass: Draw ALL selectable lines with subtle color (unassigned)
                 for i, ls in enumerate(line_stats):
                     x0 = ls['start'][0] * scale_x
                     y0 = ls['start'][1] * scale_y
                     x1 = ls['end'][0] * scale_x
                     y1 = ls['end'][1] * scale_y
-                    # Subtle gray-blue for unselected, shows clickable lines without being distracting
-                    if i not in selected_indices:
+                    # Subtle gray-blue for unassigned lines
+                    if i not in line_assignments:
                         draw.line([(x0, y0), (x1, y1)], fill=(150, 180, 200), width=1)
                 
-                # Second pass: Draw SELECTED lines with prominent highlighting
+                # Second pass: Draw ASSIGNED lines with category colors
                 for i, ls in enumerate(line_stats):
-                    if i in selected_indices:
+                    if i in line_assignments:
+                        category = line_assignments[i]
+                        cat_info = page_categories.get(category, {})
+                        color = cat_info.get('color', (0, 255, 0))
+                        
                         x0 = ls['start'][0] * scale_x
                         y0 = ls['start'][1] * scale_y
                         x1 = ls['end'][0] * scale_x
                         y1 = ls['end'][1] * scale_y
-                        draw.line([(x0, y0), (x1, y1)], fill=(255, 255, 0), width=8)
-                        draw.line([(x0, y0), (x1, y1)], fill=(0, 255, 0), width=4)
-                        draw.ellipse([(x0-6, y0-6), (x0+6, y0+6)], fill=(255, 0, 0))
-                        draw.ellipse([(x1-6, y1-6), (x1+6, y1+6)], fill=(255, 0, 0))
+                        # Draw with category color
+                        draw.line([(x0, y0), (x1, y1)], fill=(255, 255, 255), width=6)  # White outline
+                        draw.line([(x0, y0), (x1, y1)], fill=color, width=4)
+                        draw.ellipse([(x0-5, y0-5), (x0+5, y0+5)], fill=color)
+                        draw.ellipse([(x1-5, y1-5), (x1+5, y1+5)], fill=color)
                 
                 st.session_state[drawn_img_cache_key] = display_img
             
@@ -1356,36 +1440,47 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                                 min_dist = dist
                                 nearest_idx = i
                         
-                        # Toggle selection if click was close enough (within 30 PDF points)
+                        # Assign/unassign line to active category for this page
                         if nearest_idx >= 0 and min_dist < 30:
-                            if nearest_idx in st.session_state.selected_lines[page_key]:
-                                st.session_state.selected_lines[page_key].discard(nearest_idx)
+                            active_cat = st.session_state.active_category_per_page.get(page_key)
+                            current_assignment = st.session_state.line_assignments[page_key].get(nearest_idx)
+                            
+                            if current_assignment == active_cat:
+                                # Click again on same category = unassign
+                                del st.session_state.line_assignments[page_key][nearest_idx]
                             else:
-                                st.session_state.selected_lines[page_key].add(nearest_idx)
+                                # Assign to active category
+                                if active_cat:
+                                    st.session_state.line_assignments[page_key][nearest_idx] = active_cat
                             # Fragment rerun - only reruns this fragment, not the whole app
                             st.rerun(scope="fragment")
             
             with col_info:
                 st.markdown(f"**{len(lines)} lines**")
-                st.caption("Click lines to select")
+                st.caption("Click to assign to category")
                 
-                # Buttons trigger fragment rerun
-                if st.button("Select All", key=f"sel_all_{page_num}"):
-                    st.session_state.selected_lines[page_key] = set(range(len(lines)))
+                # Clear assignments button
                 if st.button("Clear All", key=f"clear_sel_{page_num}"):
-                    st.session_state.selected_lines[page_key] = set()
+                    st.session_state.line_assignments[page_key] = {}
                 
-                selected_indices = st.session_state.selected_lines.get(page_key, set())
-                if selected_indices:
-                    st.markdown(f"**Selected: {len(selected_indices)}**")
-                    total_feet = sum(line_stats[i]['length_feet'] for i in selected_indices if i < len(line_stats))
-                    st.metric("Total", f"{total_feet:.1f} ft")
+                # Show assignments grouped by category
+                line_assignments = st.session_state.line_assignments.get(page_key, {})
+                if line_assignments:
+                    # Group by category
+                    by_category = {}
+                    for idx, cat in line_assignments.items():
+                        if cat not in by_category:
+                            by_category[cat] = []
+                        by_category[cat].append(idx)
                     
-                    with st.expander("Selected lines"):
-                        for idx in sorted(selected_indices):
-                            if idx < len(line_stats):
-                                ls = line_stats[idx]
-                                st.caption(f"Line {idx+1}: {ls['length_feet']:.1f}ft")
+                    st.markdown(f"**Assigned: {len(line_assignments)}**")
+                    
+                    # Show each category's total
+                    for cat, indices in by_category.items():
+                        cat_info = page_categories.get(cat, {})
+                        color = cat_info.get('color', (0, 255, 0))
+                        cat_total = sum(line_stats[i]['length_feet'] for i in indices if i < len(line_stats))
+                        st.markdown(f"<span style='color: rgb{color};'>●</span> **{cat}**: {len(indices)} lines, {cat_total:.1f} ft", unsafe_allow_html=True)
         else:
             st.warning("Image not available")
     
@@ -1394,10 +1489,12 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         with tab:
             render_page_fragment(page_data, zoom_level, min_line_pts, global_scale)
     
-    # Overall summary across all pages
+    # Overall summary across all pages - grouped by category
     st.markdown("---")
     st.markdown("### 📊 Overall Summary")
     
+    # Aggregate by category across all pages
+    category_totals = {}  # {category: {'lines': count, 'feet': total}}
     grand_total_feet = 0
     grand_total_lines = 0
     
@@ -1410,29 +1507,55 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         if not lines:
             continue
         
-        selected_indices = st.session_state.selected_lines.get(page_key, set())
-        for i, line in enumerate(lines):
-            if i in selected_indices:
+        line_assignments = st.session_state.line_assignments.get(page_key, {})
+        for i, category in line_assignments.items():
+            if i < len(lines):
+                line = lines[i]
                 length_inches = line.length_pts / 72.0
                 length_feet = (length_inches * global_scale) / 12.0
+                
+                if category not in category_totals:
+                    category_totals[category] = {'lines': 0, 'feet': 0}
+                category_totals[category]['lines'] += 1
+                category_totals[category]['feet'] += length_feet
+                
                 grand_total_feet += length_feet
                 grand_total_lines += 1
     
     if grand_total_lines > 0:
+        # Show per-category breakdown
+        st.markdown("#### By Category")
+        for cat, totals in category_totals.items():
+            # Find color from any page that has this category
+            color = (0, 255, 0)  # default
+            for pk, pc in st.session_state.page_categories.items():
+                if cat in pc:
+                    color = pc[cat].get('color', (0, 255, 0))
+                    break
+            col_cat, col_lines, col_feet = st.columns([3, 1, 1])
+            with col_cat:
+                st.markdown(f"<span style='color: rgb{color}; font-size: 18px;'>●</span> **{cat}**", unsafe_allow_html=True)
+            with col_lines:
+                st.metric("Lines", totals['lines'], label_visibility="collapsed")
+            with col_feet:
+                st.metric("Length", f"{totals['feet']:.1f} ft", label_visibility="collapsed")
+        
+        # Grand total
+        st.markdown("---")
         col_s1, col_s2, col_s3 = st.columns(3)
         with col_s1:
-            st.metric("Lines Selected", grand_total_lines)
+            st.metric("Total Lines", grand_total_lines)
         with col_s2:
-            st.metric("Grand Total", f"{grand_total_feet:.1f} ft")
+            st.metric("**Grand Total**", f"{grand_total_feet:.1f} ft")
         with col_s3:
-            pages_with_sel = sum(1 for p in st.session_state.fence_pages 
-                               if st.session_state.selected_lines.get(f"page_{p['page_number']}", set()))
-            st.metric("Pages", pages_with_sel)
+            pages_with_assign = sum(1 for p in st.session_state.fence_pages 
+                               if st.session_state.line_assignments.get(f"page_{p['page_number']}", {}))
+            st.metric("Pages", pages_with_assign)
         
-        if st.button("🗑️ Clear All Selections", key="clear_all_selections"):
-            st.session_state.selected_lines = {}
+        if st.button("🗑️ Clear All Assignments", key="clear_all_selections"):
+            st.session_state.line_assignments = {}
     else:
-        st.info("Select individual lines from the page tabs above to calculate totals.")
+        st.info("Click lines in the page tabs above and assign them to categories to calculate totals.")
 
 
 # ==============================================================================
