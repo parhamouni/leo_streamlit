@@ -8,8 +8,11 @@ Used for measuring fence-related elements identified by ADE detection.
 import fitz  # PyMuPDF
 import math
 import re
+import json
+import base64
+from io import BytesIO
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional, Set
+from typing import List, Dict, Tuple, Optional, Set, Any
 from collections import Counter
 
 
@@ -527,45 +530,306 @@ def infer_scale_from_page(page: fitz.Page) -> Optional[float]:
     return infer_scale_from_text(text)
 
 
-def verify_scale_with_bar(page: fitz.Page) -> Dict:
+def get_page_size_info(page: fitz.Page) -> Dict:
     """
-    Verify scale factor by measuring the scale bar line element.
+    Get PDF page dimensions and detect if it matches standard architectural sizes.
     
-    This handles cases where PDF was resized during export.
+    Standard architectural sizes (in points, 1 inch = 72 pts):
+    - ARCH A: 9x12" (648x864)
+    - ARCH B: 12x18" (864x1296)
+    - ARCH C: 18x24" (1296x1728)
+    - ARCH D: 24x36" (1728x2592)
+    - ARCH E: 36x48" (2592x3456)
+    """
+    rect = page.rect
+    width_pts = rect.width
+    height_pts = rect.height
+    width_inches = width_pts / 72.0
+    height_inches = height_pts / 72.0
     
-    Steps:
-    1. Find scale text (e.g., "1" = 30'") and its bounding box
-    2. Find horizontal lines near the scale text (the scale bar)
-    3. Measure scale bar length in PDF points
-    4. Calculate true scale based on actual line measurement
+    # Standard architectural sizes (width x height in inches)
+    arch_sizes = {
+        'ARCH A': (9, 12),
+        'ARCH B': (12, 18),
+        'ARCH C': (18, 24),
+        'ARCH D': (24, 36),
+        'ARCH E': (36, 48),
+        'ANSI A (Letter)': (8.5, 11),
+        'ANSI B (Tabloid)': (11, 17),
+        'ANSI C': (17, 22),
+        'ANSI D': (22, 34),
+    }
+    
+    # Check both orientations (landscape/portrait)
+    detected_size = None
+    scale_factor = 1.0
+    
+    for name, (w, h) in arch_sizes.items():
+        # Check landscape
+        if abs(width_inches - w) < 0.5 and abs(height_inches - h) < 0.5:
+            detected_size = name
+            scale_factor = 1.0
+            break
+        # Check portrait
+        if abs(width_inches - h) < 0.5 and abs(height_inches - w) < 0.5:
+            detected_size = f"{name} (portrait)"
+            scale_factor = 1.0
+            break
+        # Check if rescaled from this size
+        ratio_w = width_inches / w
+        ratio_h = height_inches / h
+        if abs(ratio_w - ratio_h) < 0.05 and 0.3 < ratio_w < 3.0:
+            # Proportionally scaled
+            detected_size = f"{name} (scaled {ratio_w:.1%})"
+            scale_factor = ratio_w
+            break
+    
+    return {
+        'width_pts': width_pts,
+        'height_pts': height_pts,
+        'width_inches': width_inches,
+        'height_inches': height_inches,
+        'detected_size': detected_size,
+        'scale_factor': scale_factor
+    }
+
+
+def detect_scale_with_vision(page: fitz.Page, llm: Any) -> Dict:
+    """
+    Use GPT-4V to visually detect scale notation from PDF page image.
     
     Args:
         page: PyMuPDF page object
+        llm: LangChain ChatOpenAI instance (must support vision)
+    
+    Returns:
+        Dict with scale info
+    """
+    from langchain_core.messages import HumanMessage
+    
+    # Get page size info
+    page_info = get_page_size_info(page)
+    
+    result = {
+        'success': False,
+        'verified_scale': None,
+        'scale_text': None,
+        'confidence': 'low',
+        'message': '',
+        'page_size': page_info,
+        'method': 'vision'
+    }
+    
+    try:
+        # Render page to image (lower DPI for efficiency, but readable)
+        pix = page.get_pixmap(dpi=100)
+        img_bytes = pix.tobytes("png")
+        img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+        
+        prompt_text = f"""Look at this architectural/engineering drawing and find the DRAWING SCALE notation.
+
+PAGE SIZE: {page_info['width_inches']:.1f}" x {page_info['height_inches']:.1f}"
+
+The scale is usually shown:
+- Near a title block (bottom right corner)
+- Near "SCALE:" label
+- As a graphic scale bar with measurements
+- Common formats: "1" = 30'-0"", "1:48", "SCALE: 1/4" = 1'-0""
+
+Look carefully at ALL areas of the drawing, especially:
+- Title block area
+- Near plan/view labels
+- Bottom of the page near graphic scale bars
+
+Respond in JSON format only:
+{{
+    "found": true/false,
+    "scale_text": "the exact scale notation you see (e.g., '1\" = 30'-0\"')",
+    "scale_inches": number (what 1 inch on paper equals in inches, e.g., 360 for 30 feet, 48 for 4 feet),
+    "location": "where you found it (e.g., 'bottom left near FINAL SITE PLAN')",
+    "confidence": "high"/"medium"/"low",
+    "reasoning": "brief explanation"
+}}
+
+If no scale found, set found=false and scale_inches=null."""
+
+        # Create message with image
+        message = HumanMessage(
+            content=[
+                {"type": "text", "text": prompt_text},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{img_base64}"}
+                }
+            ]
+        )
+        
+        response = llm.invoke([message])
+        content = response.content.strip()
+        result['raw_response'] = content
+        
+        # Parse JSON
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+        
+        data = json.loads(content)
+        
+        if data.get('found') and data.get('scale_inches'):
+            result['success'] = True
+            result['verified_scale'] = float(data['scale_inches'])
+            result['scale_text'] = data.get('scale_text', '')
+            result['confidence'] = data.get('confidence', 'medium')
+            result['message'] = f"{data.get('reasoning', '')} (Found at: {data.get('location', 'unknown')})"
+        else:
+            result['message'] = data.get('reasoning', 'No scale found visually')
+            
+    except json.JSONDecodeError as e:
+        result['message'] = f"Vision response parse error: {e}"
+    except Exception as e:
+        result['message'] = f"Vision error: {e}"
+    
+    return result
+
+
+def detect_scale_with_llm(page: fitz.Page, llm: Any, use_vision: bool = True) -> Dict:
+    """
+    Detect scale using vision (preferred) or text-based LLM.
+    
+    Args:
+        page: PyMuPDF page object
+        llm: LangChain ChatOpenAI instance
+        use_vision: If True, use GPT-4V to analyze the page image
+    
+    Returns:
+        Dict with scale info
+    """
+    # Try vision-based detection first (more reliable)
+    if use_vision:
+        result = detect_scale_with_vision(page, llm)
+        if result.get('success'):
+            return result
+        # Fall back to text if vision fails
+        result['message'] = f"Vision failed ({result.get('message')}), trying text..."
+    
+    # Get page size info
+    page_info = get_page_size_info(page)
+    
+    result = {
+        'success': False,
+        'verified_scale': None,
+        'scale_text': None,
+        'confidence': 'low',
+        'message': '',
+        'page_size': page_info,
+        'method': 'text'
+    }
+    
+    # Extract page text
+    page_text = page.get_text()
+    result['extracted_text_sample'] = page_text[:1500] if page_text else "No text extracted"
+    
+    if not page_text.strip():
+        result['message'] = "No text found on page"
+        return result
+    
+    if len(page_text) > 8000:
+        page_text = page_text[:8000]
+    
+    prompt = f"""Analyze this architectural/engineering drawing text and find the DRAWING SCALE notation.
+
+PAGE SIZE: {page_info['width_inches']:.1f}" x {page_info['height_inches']:.1f}" ({page_info.get('detected_size', 'unknown size')})
+
+The scale tells you how measurements on paper relate to real-world measurements.
+Common formats:
+- "1" = 30'-0"" means 1 inch on paper = 30 feet in reality
+- "1:48" means 1 unit on paper = 48 units in reality  
+- "SCALE: 1/4" = 1'-0"" means quarter inch = 1 foot (= 1" = 4')
+
+IMPORTANT: Only identify actual scale notations, NOT random text that happens to contain numbers.
+Look for text near words like "SCALE", "GRAPHIC SCALE", or standard scale bar labels.
+
+Page text:
+{page_text}
+
+Respond in JSON format only:
+{{
+    "found": true/false,
+    "scale_text": "the exact text containing the scale (e.g., '1\" = 30'-0\"')",
+    "scale_inches": number (what 1 inch on paper equals in inches, e.g., 360 for 30 feet),
+    "confidence": "high"/"medium"/"low",
+    "reasoning": "brief explanation"
+}}
+
+If no scale found, set found=false and scale_inches=null."""
+
+    try:
+        response = llm.invoke(prompt)
+        content = response.content.strip()
+        result['raw_response'] = content
+        
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+        
+        data = json.loads(content)
+        
+        if data.get('found') and data.get('scale_inches'):
+            result['success'] = True
+            result['verified_scale'] = float(data['scale_inches'])
+            result['scale_text'] = data.get('scale_text', '')
+            result['confidence'] = data.get('confidence', 'medium')
+            result['message'] = data.get('reasoning', 'Scale detected by LLM')
+        else:
+            result['message'] = data.get('reasoning', 'No scale found by LLM')
+            
+    except json.JSONDecodeError as e:
+        result['message'] = f"LLM response parse error: {e}"
+    except Exception as e:
+        result['message'] = f"LLM error: {e}"
+    
+    return result
+
+
+def verify_scale_with_bar(page: fitz.Page, llm: Any = None) -> Dict:
+    """
+    Detect scale factor using LLM (preferred) or regex fallback.
+    
+    Args:
+        page: PyMuPDF page object
+        llm: Optional LangChain ChatOpenAI instance for intelligent detection
     
     Returns:
         Dict with:
         - 'success': bool
-        - 'text_scale': scale from text parsing (or None)
-        - 'verified_scale': scale verified via bar measurement (or None)
-        - 'scale_bar_length_pts': measured bar length in points
+        - 'verified_scale': scale in inches (what 1" on paper equals)
         - 'confidence': 'high', 'medium', 'low'
         - 'message': explanation
+        - 'scale_text': the detected scale text
     """
+    # Use LLM if provided
+    if llm is not None:
+        return detect_scale_with_llm(page, llm)
+    
+    # Fallback to regex-based detection
     result = {
         'success': False,
         'text_scale': None,
         'verified_scale': None,
         'scale_bar_length_pts': None,
         'confidence': 'low',
-        'message': ''
+        'message': '',
+        'scale_text_bbox': None,
+        'scale_bar_line': None
     }
     
-    # Step 1: Find scale text with location
+    # Regex patterns for scale notation
     text_dict = page.get_text("dict")
     scale_text_bbox = None
     scale_text_value = None
     
-    # Patterns to find scale notation
     scale_patterns = [
         (r'1["\']?\s*=\s*(\d+)[\'′\-]', 'feet'),      # 1" = 30'
         (r'1\s*[:/]\s*(\d+)', 'ratio'),               # 1:30 or 1/30
@@ -573,7 +837,7 @@ def verify_scale_with_bar(page: fitz.Page) -> Dict:
     ]
     
     for block in text_dict.get("blocks", []):
-        if block.get("type") != 0:  # text block
+        if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
             line_text = ""
@@ -583,20 +847,18 @@ def verify_scale_with_bar(page: fitz.Page) -> Dict:
                 if line_bbox is None:
                     line_bbox = list(span.get("bbox", [0,0,0,0]))
                 else:
-                    # Expand bbox
                     sb = span.get("bbox", [0,0,0,0])
                     line_bbox[0] = min(line_bbox[0], sb[0])
                     line_bbox[1] = min(line_bbox[1], sb[1])
                     line_bbox[2] = max(line_bbox[2], sb[2])
                     line_bbox[3] = max(line_bbox[3], sb[3])
             
-            # Check for scale patterns
             for pattern, unit_type in scale_patterns:
                 match = re.search(pattern, line_text, re.IGNORECASE)
                 if match:
                     value = float(match.group(1))
                     if unit_type == 'feet':
-                        scale_text_value = value * 12  # convert to inches
+                        scale_text_value = value * 12
                     else:
                         scale_text_value = value
                     scale_text_bbox = line_bbox
@@ -607,47 +869,75 @@ def verify_scale_with_bar(page: fitz.Page) -> Dict:
             break
     
     result['text_scale'] = scale_text_value
+    result['scale_text_bbox'] = scale_text_bbox
     
     if not scale_text_bbox:
         result['message'] = "No scale text found on page"
         return result
     
-    # Step 2: Find horizontal lines near the scale text
-    # Expand search area below and around the scale text
+    # Step 2: Find lines near the scale text
+    # Detect if text bbox is rotated (tall and narrow = vertical text)
+    text_width = abs(scale_text_bbox[2] - scale_text_bbox[0])
+    text_height = abs(scale_text_bbox[3] - scale_text_bbox[1])
+    is_rotated = text_height > text_width * 2  # vertical text indicates rotated page
+    
+    # Expand search area around the scale text (larger area for rotated pages)
+    padding = 150 if is_rotated else 100
     search_bbox = (
-        scale_text_bbox[0] - 50,      # left
-        scale_text_bbox[1] - 20,      # top (slightly above)
-        scale_text_bbox[2] + 100,     # right (scale bar may extend)
-        scale_text_bbox[3] + 60       # bottom (scale bar usually below)
+        min(scale_text_bbox[0], scale_text_bbox[2]) - padding,
+        min(scale_text_bbox[1], scale_text_bbox[3]) - padding,
+        max(scale_text_bbox[0], scale_text_bbox[2]) + padding,
+        max(scale_text_bbox[1], scale_text_bbox[3]) + padding
     )
     
     # Extract all vector lines from page
     all_lines = extract_vector_lines(page)
     
-    # Find horizontal lines in search area
-    horizontal_lines = []
+    # Find scale bar lines in search area
+    # For rotated pages, look for vertical lines; otherwise horizontal
+    candidate_lines = []
     for line in all_lines:
         sx, sy = line.start
         ex, ey = line.end
         
-        # Check if line is roughly horizontal (within 5 degrees)
         dy = abs(ey - sy)
         dx = abs(ex - sx)
-        if dx > 10 and dy < dx * 0.1:  # horizontal threshold
+        
+        # Check if line is roughly aligned (horizontal or vertical depending on rotation)
+        if is_rotated:
+            # Look for vertical lines (scale bar appears vertical in rotated PDF)
+            if dy > 10 and dx < dy * 0.1:
+                is_aligned = True
+            else:
+                is_aligned = False
+        else:
+            # Look for horizontal lines
+            if dx > 10 and dy < dx * 0.1:
+                is_aligned = True
+            else:
+                is_aligned = False
+        
+        if is_aligned:
             # Check if line intersects search bbox
             min_x, max_x = min(sx, ex), max(sx, ex)
             min_y, max_y = min(sy, ey), max(sy, ey)
             
             if (min_x < search_bbox[2] and max_x > search_bbox[0] and
                 min_y < search_bbox[3] and max_y > search_bbox[1]):
-                horizontal_lines.append(line)
+                candidate_lines.append(line)
     
-    if not horizontal_lines:
-        result['message'] = f"Scale text found ('{scale_text_value}') but no scale bar line detected nearby"
-        result['confidence'] = 'low'
-        result['verified_scale'] = scale_text_value  # Use text scale as fallback
-        result['success'] = True
-        return result
+    # Rename for compatibility
+    horizontal_lines = candidate_lines
+    
+    # Simplified approach: just use the text-based scale, no bar line detection needed
+    # The scale bar is often a complex graphic (rectangles, not lines)
+    result['verified_scale'] = scale_text_value
+    result['success'] = True
+    result['confidence'] = 'medium'
+    result['message'] = f"Scale from text: 1\" = {scale_text_value/12:.0f}'"
+    
+    # We don't need to find the bar line - just return the text-based scale
+    return result
     
     # Step 3: Find the most likely scale bar (typically a clean horizontal line)
     # Sort by length and pick the longest reasonable one
@@ -672,6 +962,8 @@ def verify_scale_with_bar(page: fitz.Page) -> Dict:
     
     bar_length_pts = best_line.length_pts
     result['scale_bar_length_pts'] = bar_length_pts
+    result['scale_bar_line'] = (best_line.start[0], best_line.start[1], 
+                                 best_line.end[0], best_line.end[1])
     
     # Step 4: Calculate verified scale
     # If text says "1" = X'" and bar is supposed to be 1", 

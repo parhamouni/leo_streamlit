@@ -1122,40 +1122,33 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
     st.markdown("<h2>📏 Interactive Measurement Tool</h2>", unsafe_allow_html=True)
     st.caption("Click on lines in the image to select/deselect them. Selected lines shown in green.")
     
-    # Auto-detect and verify scale from first fence page
+    # Auto-detect and verify scale PER PAGE using LLM
     from utils_vector import verify_scale_with_bar
     
-    scale_info = None
-    if 'verified_scale_info' not in st.session_state:
-        try:
-            with fitz.open(stream=BytesIO(st.session_state.original_pdf_bytes), filetype="pdf") as doc:
-                first_fence_page = st.session_state.fence_pages[0]
-                page_idx = first_fence_page['page_index_in_original_doc']
-                pdf_page = doc[page_idx]
-                scale_info = verify_scale_with_bar(pdf_page)
-                st.session_state.verified_scale_info = scale_info
-        except Exception as e:
-            st.session_state.verified_scale_info = {'success': False, 'verified_scale': None, 'message': str(e)}
-    else:
-        scale_info = st.session_state.verified_scale_info
+    # Detect scale for each fence page (cached in session_state)
+    if 'per_page_scale_info' not in st.session_state:
+        st.session_state.per_page_scale_info = {}
     
-    auto_scale = scale_info.get('verified_scale') if scale_info else None
+    # Detect scales for all pages if not already done
+    with fitz.open(stream=BytesIO(st.session_state.original_pdf_bytes), filetype="pdf") as doc:
+        for fence_page in st.session_state.fence_pages:
+            page_num = fence_page['page_number']
+            cache_key = f"page_{page_num}"
+            if cache_key not in st.session_state.per_page_scale_info:
+                try:
+                    page_idx = fence_page['page_index_in_original_doc']
+                    pdf_page = doc[page_idx]
+                    # Use LLM for intelligent scale detection
+                    scale_info = verify_scale_with_bar(pdf_page, llm=llm_analysis_instance)
+                    st.session_state.per_page_scale_info[cache_key] = scale_info
+                except Exception as e:
+                    st.session_state.per_page_scale_info[cache_key] = {
+                        'success': False, 'verified_scale': None, 'message': str(e)
+                    }
     
-    # Global scale settings
+    # Global settings (min line length only - scale is now per-page)
     col_g1, col_g2, col_g3 = st.columns([1, 1, 1])
     with col_g1:
-        default_scale = auto_scale if auto_scale else 360.0
-        global_scale = st.number_input(
-            "Scale factor (inches)",
-            min_value=1.0,
-            max_value=1200.0,
-            value=float(default_scale),
-            step=12.0,
-            help="E.g., 360 means 1\" = 30' actual",
-            key="global_scale_input"
-        )
-        st.caption(f"= 1\" = {global_scale/12:.1f}' actual")
-    with col_g2:
         min_line_pts = st.number_input(
             "Min line length (pts)",
             min_value=5,
@@ -1165,22 +1158,12 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             help="Filter out short lines (hatching, text)",
             key="min_line_pts_input"
         )
+    with col_g2:
+        st.info("📐 Scale detected per page (see each tab)")
     with col_g3:
-        if scale_info and scale_info.get('success'):
-            confidence = scale_info.get('confidence', 'low')
-            bar_len = scale_info.get('scale_bar_length_pts')
-            if confidence == 'high':
-                st.success(f"✓ Verified: 1\"={auto_scale/12:.0f}'")
-            elif confidence == 'medium':
-                st.warning(f"⚠ Adjusted: 1\"={auto_scale/12:.0f}'")
-            else:
-                st.info(f"Scale: 1\"={auto_scale/12:.0f}'")
-            if bar_len:
-                st.caption(f"Bar: {bar_len:.1f}pts | {scale_info.get('message', '')}")
-        elif auto_scale:
-            st.info(f"Text scale: 1\"={auto_scale/12:.0f}'")
-        else:
-            st.warning("Scale not detected")
+        if st.button("🔄 Re-detect Scales", key="redetect_scales"):
+            st.session_state.per_page_scale_info = {}
+            st.rerun()
     
     # Zoom slider
     zoom_level = st.slider("🔍 Zoom", min_value=400, max_value=1600, value=800, step=100, 
@@ -1218,7 +1201,7 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
     
     # OPTIMIZATION 5: Use st.fragment for partial reruns (only rerun the page content, not entire app)
     @st.fragment
-    def render_page_fragment(page_data, zoom_level, min_line_pts, global_scale):
+    def render_page_fragment(page_data, zoom_level, min_line_pts):
         """Fragment function for each page - only this reruns on interaction"""
         page_num = page_data['page_number']
         page_key = f"page_{page_num}"
@@ -1271,6 +1254,67 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             cats = list(page_categories.keys())
             st.session_state.active_category_per_page[page_key] = cats[0] if cats else None
         
+        # Show per-page scale info
+        page_scale_info = st.session_state.per_page_scale_info.get(page_key, {})
+        page_scale = page_scale_info.get('verified_scale') or page_scale_info.get('text_scale') or 360.0
+        
+        scale_col1, scale_col2 = st.columns([2, 1])
+        with scale_col1:
+            page_scale_input = st.number_input(
+                f"Scale (Page {page_num})",
+                min_value=1.0,
+                max_value=1200.0,
+                value=float(page_scale),
+                step=12.0,
+                help=f"1\" = {page_scale/12:.1f}' actual",
+                key=f"scale_input_{page_num}"
+            )
+        with scale_col2:
+            if page_scale_info.get('success'):
+                confidence = page_scale_info.get('confidence', 'low')
+                scale_text = page_scale_info.get('scale_text', '')
+                display_text = f"✓ {scale_text}" if scale_text else f"1\"={page_scale/12:.0f}'"
+                if confidence == 'high':
+                    st.success(display_text)
+                elif confidence == 'medium':
+                    st.warning(f"⚠ {scale_text}" if scale_text else f"1\"={page_scale/12:.0f}'")
+                else:
+                    st.info(scale_text if scale_text else f"1\"={page_scale/12:.0f}'")
+            else:
+                st.warning("Not detected")
+        
+        # Show scale detection details
+        with st.expander("🔍 Scale Detection Details", expanded=False):
+            # Page size info
+            page_size = page_scale_info.get('page_size', {})
+            if page_size:
+                size_str = f"{page_size.get('width_inches', 0):.1f}\" x {page_size.get('height_inches', 0):.1f}\""
+                detected = page_size.get('detected_size', 'Unknown')
+                st.markdown(f"**Page size:** {size_str} ({detected})")
+            
+            # Scale detection
+            method = page_scale_info.get('method', 'unknown')
+            st.markdown(f"**Detection method:** {method}")
+            scale_text = page_scale_info.get('scale_text', '')
+            st.markdown(f"**Detected scale text:** {scale_text if scale_text else 'None'}")
+            st.markdown(f"**Confidence:** {page_scale_info.get('confidence', 'N/A')}")
+            st.markdown(f"**Message:** {page_scale_info.get('message', 'N/A')}")
+            if page_scale_info.get('verified_scale'):
+                scale_val = page_scale_info['verified_scale']
+                st.markdown(f"**Scale value:** 1\" = {scale_val/12:.0f}' ({scale_val} inches)")
+            
+            # Debug: show raw LLM response
+            raw = page_scale_info.get('raw_response', '')
+            if raw:
+                st.markdown("**LLM Response:**")
+                st.code(raw[:500], language=None)
+            
+            # Debug: show extracted text sample
+            extracted = page_scale_info.get('extracted_text_sample', '')
+            if extracted:
+                st.markdown("**Extracted PDF Text (first 1500 chars):**")
+                st.code(extracted, language=None)
+        
         # Category selector for this page
         st.markdown("#### 🏷️ Fence Categories (This Page)")
         cat_col1, cat_col2 = st.columns([3, 1])
@@ -1306,12 +1350,14 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                         st.rerun(scope="fragment")
         
         # Cache line stats (keyed by page + min_line_pts + scale)
-        line_stats_key = f"line_stats_{page_num}_{min_line_pts}_{global_scale}"
+        # Use the page-specific scale input
+        effective_scale = page_scale_input
+        line_stats_key = f"line_stats_{page_num}_{min_line_pts}_{effective_scale}"
         if line_stats_key not in st.session_state:
             stats = []
             for i, line in enumerate(lines):
                 length_inches = line.length_pts / 72.0
-                length_feet = (length_inches * global_scale) / 12.0
+                length_feet = (length_inches * effective_scale) / 12.0
                 stats.append({
                     'index': i,
                     'length_pts': line.length_pts,
@@ -1487,7 +1533,7 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
     # Render each page tab using the fragment
     for tab_idx, (tab, page_data) in enumerate(zip(page_tabs, st.session_state.fence_pages)):
         with tab:
-            render_page_fragment(page_data, zoom_level, min_line_pts, global_scale)
+            render_page_fragment(page_data, zoom_level, min_line_pts)
     
     # Overall summary across all pages - grouped by category
     st.markdown("---")
@@ -1503,6 +1549,10 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         page_key = f"page_{page_num}"
         lines_cache_key = f"lines_{page_num}_{min_line_pts}"
         
+        # Get per-page scale
+        page_scale_info = st.session_state.per_page_scale_info.get(page_key, {})
+        page_scale = page_scale_info.get('verified_scale') or page_scale_info.get('text_scale') or 360.0
+        
         lines = st.session_state.get(lines_cache_key, [])
         if not lines:
             continue
@@ -1512,7 +1562,7 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             if i < len(lines):
                 line = lines[i]
                 length_inches = line.length_pts / 72.0
-                length_feet = (length_inches * global_scale) / 12.0
+                length_feet = (length_inches * page_scale) / 12.0
                 
                 if category not in category_totals:
                     category_totals[category] = {'lines': 0, 'feet': 0}
