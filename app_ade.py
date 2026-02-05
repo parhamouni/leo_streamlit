@@ -1129,6 +1129,18 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
     if 'per_page_scale_info' not in st.session_state:
         st.session_state.per_page_scale_info = {}
     
+    # User-drawn lines storage: {page_key: [{'start': (x,y), 'end': (x,y), 'category': cat}, ...]}
+    if 'user_drawn_lines' not in st.session_state:
+        st.session_state.user_drawn_lines = {}
+    
+    # Drawing mode per page
+    if 'drawing_mode' not in st.session_state:
+        st.session_state.drawing_mode = {}
+    
+    # Pending point for line drawing (first click of a two-click line)
+    if 'pending_line_start' not in st.session_state:
+        st.session_state.pending_line_start = {}
+    
     # Detect scales for all pages if not already done
     with fitz.open(stream=BytesIO(st.session_state.original_pdf_bytes), filetype="pdf") as doc:
         for fence_page in st.session_state.fence_pages:
@@ -1147,7 +1159,7 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                     }
     
     # Global settings (min line length only - scale is now per-page)
-    col_g1, col_g2, col_g3 = st.columns([1, 1, 1])
+    col_g1, col_g2 = st.columns([1, 2])
     with col_g1:
         min_line_pts = st.number_input(
             "Min line length (pts)",
@@ -1160,13 +1172,9 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         )
     with col_g2:
         st.info("📐 Scale detected per page (see each tab)")
-    with col_g3:
-        if st.button("🔄 Re-detect Scales", key="redetect_scales"):
-            st.session_state.per_page_scale_info = {}
-            st.rerun()
     
-    # Zoom slider
-    zoom_level = st.slider("🔍 Zoom", min_value=400, max_value=1600, value=800, step=100, 
+    # Zoom slider (higher default for better quality)
+    zoom_level = st.slider("🔍 Zoom", min_value=600, max_value=2000, value=1200, step=100, 
                            help="Adjust image display width")
     
     # Create tabs for each fence page
@@ -1349,6 +1357,25 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                         st.session_state.active_category_per_page[page_key] = new_cat_name
                         st.rerun(scope="fragment")
         
+        # Mode toggle: Select existing lines vs Draw custom lines
+        mode_col1, mode_col2 = st.columns([1, 1])
+        with mode_col1:
+            if page_key not in st.session_state.drawing_mode:
+                st.session_state.drawing_mode[page_key] = "select"
+            
+            drawing_mode = st.radio(
+                "Mode:",
+                options=["select", "draw"],
+                format_func=lambda x: "📍 Select Lines" if x == "select" else "✏️ Draw Lines",
+                horizontal=True,
+                key=f"mode_{page_num}"
+            )
+            st.session_state.drawing_mode[page_key] = drawing_mode
+        
+        with mode_col2:
+            if drawing_mode == "draw":
+                st.caption("Draw lines on the image. They will be assigned to the active category.")
+        
         # Cache line stats (keyed by page + min_line_pts + scale)
         # Use the page-specific scale input
         effective_scale = page_scale_input
@@ -1382,8 +1409,8 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                 ratio = zoom_level / orig_width
                 new_width = zoom_level
                 new_height = int(orig_height * ratio)
-                # OPTIMIZATION 4: Use BILINEAR for faster resize
-                base_img = base_img.resize((new_width, new_height), Image.BILINEAR)
+                # Use LANCZOS for high quality resize
+                base_img = base_img.resize((new_width, new_height), Image.LANCZOS)
                 st.session_state[base_img_cache_key] = base_img
                 st.session_state[f"base_img_size_{page_num}_{zoom_level}"] = (new_width, new_height)
                 st.session_state[f"orig_img_size_{page_num}"] = (orig_width, orig_height)
@@ -1442,91 +1469,202 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             col_img, col_info = st.columns([3, 1])
             
             with col_img:
-                # Track last click to detect new clicks
-                click_key = f"last_click_{page_num}"
-                if click_key not in st.session_state:
-                    st.session_state[click_key] = None
+                # Initialize user-drawn lines for this page
+                if page_key not in st.session_state.user_drawn_lines:
+                    st.session_state.user_drawn_lines[page_key] = []
                 
-                # Use stable key (only page_num, not selection count)
-                click_result = streamlit_image_coordinates(
-                    display_img,
-                    key=f"click_img_{page_num}"
-                )
-                
-                # Handle click - find nearest line
-                if click_result is not None:
-                    current_click = (click_result.get('x', 0), click_result.get('y', 0))
+                if drawing_mode == "draw":
+                    # DRAW MODE: Click two points to create a line
+                    # Show pending start point if exists
+                    pending_start = st.session_state.pending_line_start.get(page_key)
                     
-                    # Only process if this is a new click
-                    if current_click != st.session_state[click_key]:
-                        st.session_state[click_key] = current_click
-                        click_x, click_y = current_click
-                        pdf_click_x = click_x / scale_x
-                        pdf_click_y = click_y / scale_y
+                    # Draw user lines and pending point on image
+                    draw_img = display_img.copy()
+                    draw_overlay = ImageDraw.Draw(draw_img)
+                    
+                    # Draw existing user-drawn lines
+                    user_lines = st.session_state.user_drawn_lines.get(page_key, [])
+                    for ul in user_lines:
+                        cat = ul.get('category')
+                        cat_info = page_categories.get(cat, {})
+                        color = cat_info.get('color', (0, 255, 0))
+                        x0 = ul['start'][0] * scale_x
+                        y0 = ul['start'][1] * scale_y
+                        x1 = ul['end'][0] * scale_x
+                        y1 = ul['end'][1] * scale_y
+                        draw_overlay.line([(x0, y0), (x1, y1)], fill=(255, 255, 255), width=5)
+                        draw_overlay.line([(x0, y0), (x1, y1)], fill=color, width=3)
+                        draw_overlay.ellipse([(x0-4, y0-4), (x0+4, y0+4)], fill=color)
+                        draw_overlay.ellipse([(x1-4, y1-4), (x1+4, y1+4)], fill=color)
+                    
+                    # Draw pending start point
+                    if pending_start:
+                        px, py = pending_start
+                        img_px = px * scale_x
+                        img_py = py * scale_y
+                        draw_overlay.ellipse([(img_px-8, img_py-8), (img_px+8, img_py+8)], fill=(255, 255, 0), outline=(0, 0, 0))
+                    
+                    click_key = f"draw_click_{page_num}"
+                    if click_key not in st.session_state:
+                        st.session_state[click_key] = None
+                    
+                    click_result = streamlit_image_coordinates(
+                        draw_img,
+                        key=f"draw_img_{page_num}"
+                    )
+                    
+                    if click_result is not None:
+                        current_click = (click_result.get('x', 0), click_result.get('y', 0))
                         
-                        def point_to_line_distance(px, py, x0, y0, x1, y1):
-                            dx = x1 - x0
-                            dy = y1 - y0
-                            if dx == 0 and dy == 0:
-                                return ((px - x0)**2 + (py - y0)**2)**0.5
-                            t = max(0, min(1, ((px - x0)*dx + (py - y0)*dy) / (dx*dx + dy*dy)))
-                            proj_x = x0 + t * dx
-                            proj_y = y0 + t * dy
-                            return ((px - proj_x)**2 + (py - proj_y)**2)**0.5
-                        
-                        min_dist = float('inf')
-                        nearest_idx = -1
-                        for i, ls in enumerate(line_stats):
-                            dist = point_to_line_distance(
-                                pdf_click_x, pdf_click_y,
-                                ls['start'][0], ls['start'][1],
-                                ls['end'][0], ls['end'][1]
-                            )
-                            if dist < min_dist:
-                                min_dist = dist
-                                nearest_idx = i
-                        
-                        # Assign/unassign line to active category for this page
-                        if nearest_idx >= 0 and min_dist < 30:
-                            active_cat = st.session_state.active_category_per_page.get(page_key)
-                            current_assignment = st.session_state.line_assignments[page_key].get(nearest_idx)
+                        if current_click != st.session_state[click_key]:
+                            st.session_state[click_key] = current_click
+                            click_x, click_y = current_click
+                            pdf_click_x = click_x / scale_x
+                            pdf_click_y = click_y / scale_y
                             
-                            if current_assignment == active_cat:
-                                # Click again on same category = unassign
-                                del st.session_state.line_assignments[page_key][nearest_idx]
+                            if pending_start is None:
+                                # First click - set start point
+                                st.session_state.pending_line_start[page_key] = (pdf_click_x, pdf_click_y)
+                                st.rerun(scope="fragment")
                             else:
-                                # Assign to active category
-                                if active_cat:
-                                    st.session_state.line_assignments[page_key][nearest_idx] = active_cat
-                            # Fragment rerun - only reruns this fragment, not the whole app
-                            st.rerun(scope="fragment")
+                                # Second click - create line
+                                active_cat = st.session_state.active_category_per_page.get(page_key)
+                                start_x, start_y = pending_start
+                                end_x, end_y = pdf_click_x, pdf_click_y
+                                
+                                length_pts = ((end_x - start_x)**2 + (end_y - start_y)**2)**0.5
+                                length_inches = length_pts / 72.0
+                                length_feet = (length_inches * effective_scale) / 12.0
+                                
+                                new_line = {
+                                    'start': (start_x, start_y),
+                                    'end': (end_x, end_y),
+                                    'category': active_cat,
+                                    'length_pts': length_pts,
+                                    'length_feet': length_feet
+                                }
+                                
+                                if page_key not in st.session_state.user_drawn_lines:
+                                    st.session_state.user_drawn_lines[page_key] = []
+                                st.session_state.user_drawn_lines[page_key].append(new_line)
+                                
+                                # Clear pending start
+                                st.session_state.pending_line_start[page_key] = None
+                                st.rerun(scope="fragment")
+                
+                else:
+                    # SELECT MODE: Use clickable image
+                    click_key = f"last_click_{page_num}"
+                    if click_key not in st.session_state:
+                        st.session_state[click_key] = None
+                    
+                    click_result = streamlit_image_coordinates(
+                        display_img,
+                        key=f"click_img_{page_num}"
+                    )
+                    
+                    # Handle click - find nearest line
+                    if click_result is not None:
+                        current_click = (click_result.get('x', 0), click_result.get('y', 0))
+                        
+                        if current_click != st.session_state[click_key]:
+                            st.session_state[click_key] = current_click
+                            click_x, click_y = current_click
+                            pdf_click_x = click_x / scale_x
+                            pdf_click_y = click_y / scale_y
+                            
+                            def point_to_line_distance(px, py, x0, y0, x1, y1):
+                                dx = x1 - x0
+                                dy = y1 - y0
+                                if dx == 0 and dy == 0:
+                                    return ((px - x0)**2 + (py - y0)**2)**0.5
+                                t = max(0, min(1, ((px - x0)*dx + (py - y0)*dy) / (dx*dx + dy*dy)))
+                                proj_x = x0 + t * dx
+                                proj_y = y0 + t * dy
+                                return ((px - proj_x)**2 + (py - proj_y)**2)**0.5
+                            
+                            min_dist = float('inf')
+                            nearest_idx = -1
+                            for i, ls in enumerate(line_stats):
+                                dist = point_to_line_distance(
+                                    pdf_click_x, pdf_click_y,
+                                    ls['start'][0], ls['start'][1],
+                                    ls['end'][0], ls['end'][1]
+                                )
+                                if dist < min_dist:
+                                    min_dist = dist
+                                    nearest_idx = i
+                            
+                            if nearest_idx >= 0 and min_dist < 30:
+                                active_cat = st.session_state.active_category_per_page.get(page_key)
+                                current_assignment = st.session_state.line_assignments[page_key].get(nearest_idx)
+                                
+                                if current_assignment == active_cat:
+                                    del st.session_state.line_assignments[page_key][nearest_idx]
+                                else:
+                                    if active_cat:
+                                        st.session_state.line_assignments[page_key][nearest_idx] = active_cat
+                                st.rerun(scope="fragment")
             
             with col_info:
-                st.markdown(f"**{len(lines)} lines**")
-                st.caption("Click to assign to category")
+                st.markdown(f"**{len(lines)} detected lines**")
+                if drawing_mode == "select":
+                    st.caption("Click to assign to category")
+                else:
+                    pending = st.session_state.pending_line_start.get(page_key)
+                    if pending:
+                        st.warning("Click end point")
+                        if st.button("Cancel", key=f"cancel_draw_{page_num}"):
+                            st.session_state.pending_line_start[page_key] = None
+                            st.rerun(scope="fragment")
+                    else:
+                        st.caption("Click start point")
                 
-                # Clear assignments button
-                if st.button("Clear All", key=f"clear_sel_{page_num}"):
-                    st.session_state.line_assignments[page_key] = {}
+                # Clear buttons
+                clear_col1, clear_col2 = st.columns(2)
+                with clear_col1:
+                    if st.button("Clear Sel", key=f"clear_sel_{page_num}"):
+                        st.session_state.line_assignments[page_key] = {}
+                        st.rerun(scope="fragment")
+                with clear_col2:
+                    if st.button("Clear Drawn", key=f"clear_drawn_{page_num}"):
+                        st.session_state.user_drawn_lines[page_key] = []
+                        st.rerun(scope="fragment")
                 
-                # Show assignments grouped by category
+                # Show selected lines (from existing)
                 line_assignments = st.session_state.line_assignments.get(page_key, {})
                 if line_assignments:
-                    # Group by category
                     by_category = {}
                     for idx, cat in line_assignments.items():
                         if cat not in by_category:
                             by_category[cat] = []
                         by_category[cat].append(idx)
                     
-                    st.markdown(f"**Assigned: {len(line_assignments)}**")
-                    
-                    # Show each category's total
+                    st.markdown(f"**Selected: {len(line_assignments)}**")
                     for cat, indices in by_category.items():
                         cat_info = page_categories.get(cat, {})
                         color = cat_info.get('color', (0, 255, 0))
                         cat_total = sum(line_stats[i]['length_feet'] for i in indices if i < len(line_stats))
                         st.markdown(f"<span style='color: rgb{color};'>●</span> **{cat}**: {len(indices)} lines, {cat_total:.1f} ft", unsafe_allow_html=True)
+                
+                # Show user-drawn lines
+                user_lines = st.session_state.user_drawn_lines.get(page_key, [])
+                if user_lines:
+                    st.markdown("---")
+                    st.markdown(f"**Drawn: {len(user_lines)}**")
+                    # Group by category
+                    drawn_by_cat = {}
+                    for ul in user_lines:
+                        cat = ul.get('category', 'Uncategorized')
+                        if cat not in drawn_by_cat:
+                            drawn_by_cat[cat] = []
+                        drawn_by_cat[cat].append(ul)
+                    
+                    for cat, cat_lines in drawn_by_cat.items():
+                        cat_info = page_categories.get(cat, {})
+                        color = cat_info.get('color', (0, 255, 0))
+                        cat_total = sum(ul['length_feet'] for ul in cat_lines)
+                        st.markdown(f"<span style='color: rgb{color};'>●</span> **{cat}**: {len(cat_lines)} drawn, {cat_total:.1f} ft", unsafe_allow_html=True)
         else:
             st.warning("Image not available")
     
@@ -1539,8 +1677,8 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
     st.markdown("---")
     st.markdown("### 📊 Overall Summary")
     
-    # Aggregate by category across all pages
-    category_totals = {}  # {category: {'lines': count, 'feet': total}}
+    # Aggregate by category across all pages (selected + drawn lines)
+    category_totals = {}  # {category: {'lines': count, 'feet': total, 'drawn': count}}
     grand_total_feet = 0
     grand_total_lines = 0
     
@@ -1553,10 +1691,8 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         page_scale_info = st.session_state.per_page_scale_info.get(page_key, {})
         page_scale = page_scale_info.get('verified_scale') or page_scale_info.get('text_scale') or 360.0
         
+        # Selected lines from PDF
         lines = st.session_state.get(lines_cache_key, [])
-        if not lines:
-            continue
-        
         line_assignments = st.session_state.line_assignments.get(page_key, {})
         for i, category in line_assignments.items():
             if i < len(lines):
@@ -1565,12 +1701,26 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                 length_feet = (length_inches * page_scale) / 12.0
                 
                 if category not in category_totals:
-                    category_totals[category] = {'lines': 0, 'feet': 0}
+                    category_totals[category] = {'lines': 0, 'feet': 0, 'drawn': 0}
                 category_totals[category]['lines'] += 1
                 category_totals[category]['feet'] += length_feet
                 
                 grand_total_feet += length_feet
                 grand_total_lines += 1
+        
+        # User-drawn lines
+        user_lines = st.session_state.user_drawn_lines.get(page_key, [])
+        for ul in user_lines:
+            category = ul.get('category', 'Uncategorized')
+            length_feet = ul.get('length_feet', 0)
+            
+            if category not in category_totals:
+                category_totals[category] = {'lines': 0, 'feet': 0, 'drawn': 0}
+            category_totals[category]['drawn'] += 1
+            category_totals[category]['feet'] += length_feet
+            
+            grand_total_feet += length_feet
+            grand_total_lines += 1
     
     if grand_total_lines > 0:
         # Show per-category breakdown
@@ -1586,7 +1736,12 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             with col_cat:
                 st.markdown(f"<span style='color: rgb{color}; font-size: 18px;'>●</span> **{cat}**", unsafe_allow_html=True)
             with col_lines:
-                st.metric("Lines", totals['lines'], label_visibility="collapsed")
+                selected = totals['lines']
+                drawn = totals.get('drawn', 0)
+                line_text = f"{selected} sel" if selected else ""
+                if drawn:
+                    line_text += f"{', ' if line_text else ''}{drawn} drawn"
+                st.markdown(line_text if line_text else "0")
             with col_feet:
                 st.metric("Length", f"{totals['feet']:.1f} ft", label_visibility="collapsed")
         
