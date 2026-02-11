@@ -1014,6 +1014,98 @@ If no layers seem fence-related, return: []
     return []
 
 
+def llm_match_layers_to_definitions(llm, fence_layers: List[str], fence_definitions: List[Dict]) -> Dict[str, str]:
+    """
+    Use LLM to match fence layer names to fence definition categories.
+    
+    Args:
+        llm: Language model instance
+        fence_layers: List of detected fence layer names (e.g. ["V-SITE-FENC-CL", "V-SITE-FENC-WOOD"])
+        fence_definitions: Detected fence definitions with indicator/keyword/description
+    
+    Returns:
+        Dict mapping layer_name -> category_name (e.g. {"V-SITE-FENC-CL": "3: 6' CHAIN LINK FENCE"})
+    """
+    if not llm or not fence_layers or not fence_definitions:
+        return {}
+    
+    # Build definition list for prompt
+    defs_text = ""
+    cat_names = []
+    for defn in fence_definitions:
+        ind = defn.get("indicator", "")
+        kw = defn.get("keyword", "")
+        desc = defn.get("description", "")
+        cat_name = f"{ind}: {kw}" if ind else kw
+        if cat_name:
+            cat_names.append(cat_name)
+            defs_text += f'  - Category: "{cat_name}" (description: {desc})\n'
+    
+    if not cat_names:
+        return {}
+    
+    layers_text = "\n".join(f'  - "{layer}"' for layer in fence_layers)
+    
+    prompt = f"""You are analyzing a construction/architectural PDF drawing.
+Match each PDF layer name to the most appropriate fence category based on naming conventions.
+
+FENCE LAYERS FOUND IN PDF:
+{layers_text}
+
+FENCE CATEGORIES FROM LEGEND:
+{defs_text}
+
+Common CAD layer naming patterns:
+- "FENC-CL" or "FENC-CHNLK" → chain link fence
+- "FENC-WOOD" or "FENC-WD" → wood fence  
+- "FENC-VINYL" or "FENC-VNL" → vinyl fence
+- "FENC-IRON" or "FENC-WI" → wrought iron fence
+- "FENC-METAL" → metal fence
+- "WALL" → wall/barrier
+- Generic "FENC" → match to the most common/default fence type
+
+Return a JSON object mapping each layer name to the best matching category name.
+Use EXACT category names from the list above.
+If a layer doesn't clearly match any category, map it to the most likely one.
+
+Example: {{"V-SITE-FENC-CL": "3: 6' CHAIN LINK FENCE", "V-SITE-FENC-WOOD": "5: 6' WOOD FENCE"}}
+"""
+
+    try:
+        raw_response = llm.invoke(prompt) if hasattr(llm, "invoke") else llm(prompt)
+        response_text = getattr(raw_response, "content", str(raw_response))
+        
+        # Parse JSON object from response
+        json_match = re.search(r'\{.*?\}', response_text, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group(0))
+            if isinstance(result, dict):
+                # Validate: only keep mappings where layer exists and category exists
+                valid_mapping = {}
+                for layer, cat in result.items():
+                    if layer in fence_layers and cat in cat_names:
+                        valid_mapping[layer] = cat
+                    elif layer in fence_layers:
+                        # LLM returned a category name that doesn't exactly match - find closest
+                        for real_cat in cat_names:
+                            if cat.lower() in real_cat.lower() or real_cat.lower() in cat.lower():
+                                valid_mapping[layer] = real_cat
+                                break
+                
+                # For any unmatched layers, assign to first category as fallback
+                for layer in fence_layers:
+                    if layer not in valid_mapping and cat_names:
+                        valid_mapping[layer] = cat_names[0]
+                
+                print(f"[DEBUG] LLM layer→category mapping: {valid_mapping}")
+                return valid_mapping
+    except Exception as e:
+        print(f"[DEBUG] LLM layer→category matching failed: {e}")
+    
+    # Fallback: map all layers to first category
+    return {layer: cat_names[0] for layer in fence_layers} if cat_names else {}
+
+
 def llm_suggest_filter_params(llm, line_stats: dict, page_context: str = "") -> dict:
     """
     Ask LLM to suggest filtering parameters based on line statistics.
@@ -1290,6 +1382,11 @@ def measure_fence_elements(
                 fence_layers.append(layer)
         print(f"[DEBUG] Keyword-matched fence layers: {fence_layers}")
     
+    # Match fence layers to definition categories using LLM
+    layer_to_category = {}
+    if fence_layers and llm and fence_definitions:
+        layer_to_category = llm_match_layers_to_definitions(llm, fence_layers, fence_definitions)
+    
     # Extract lines from fence-related layers
     if fence_layers:
         fence_lines = extract_lines_by_layers(page, fence_layers)
@@ -1544,6 +1641,7 @@ def measure_fence_elements(
         },
         'measurement_method': measurement_method,
         'fence_layers': fence_layers,
+        'layer_to_category': layer_to_category,
         'all_fence_lines': final_fence_lines,
         'layer_measurements': layer_measurements,
         'indicator_measurements': indicator_measurements,

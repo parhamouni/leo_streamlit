@@ -74,6 +74,11 @@ def initialize_session_state(session_id_val):
         'highlighted_pdf_bytes_for_download': None,
         'last_uploaded_file_id': None,
         'selected_model_for_analysis': "gpt-5.1",
+        # Unified measurement storage
+        'unified_measurements': {},  # {page_key: {'auto_lines': [...], 'manual_lines': [...], 'drawn_lines': [...]}}
+        'per_page_scale_info': {},
+        'page_categories': {},
+        'active_category_per_page': {},
     }
     for key, value in default_state.items():
         if key not in st.session_state:
@@ -220,6 +225,243 @@ def generate_combined_highlighted_pdf(original_pdf_bytes, fence_pages_results_li
     return (pdf_bytes, fname) if pdf_bytes else (None, fname)
 
 
+def generate_measurement_pdf(original_pdf_bytes, fence_pages_results_list, line_assignments, user_drawn_lines, 
+                             page_categories, session_state, min_line_pts, uploaded_pdf_name_base):
+    """Generate PDF with measurement lines highlighted by category."""
+    if not fence_pages_results_list or not original_pdf_bytes:
+        return None, "No data for PDF."
+    
+    output_doc = fitz.open()
+    input_doc = None
+    
+    try:
+        input_doc = fitz.open(stream=BytesIO(original_pdf_bytes), filetype="pdf")
+    except Exception as e:
+        if output_doc:
+            output_doc.close()
+        return None, f"Error opening original PDF: {e}"
+    
+    sorted_pages = sorted(fence_pages_results_list, key=lambda x: x.get('page_index_in_original_doc', float('inf')))
+    
+    for res_data in sorted_pages:
+        page_idx = res_data.get('page_index_in_original_doc')
+        page_num = res_data.get('page_number')
+        page_key = f"page_{page_num}"
+        
+        if page_idx is None:
+            continue
+        
+        try:
+            output_doc.insert_pdf(input_doc, from_page=page_idx, to_page=page_idx)
+            page_out = output_doc.load_page(len(output_doc) - 1)
+            
+            rotation = page_out.rotation
+            mediabox_w = page_out.mediabox.width
+            mediabox_h = page_out.mediabox.height
+            
+            def reverse_rotation_transform(x0, y0, x1, y1):
+                if rotation == 0:
+                    return x0, y0, x1, y1
+                elif rotation == 90:
+                    return y0, mediabox_h - x1, y1, mediabox_h - x0
+                elif rotation == 180:
+                    return mediabox_w - x1, mediabox_h - y1, mediabox_w - x0, mediabox_h - y0
+                elif rotation == 270:
+                    return mediabox_w - y1, x0, mediabox_w - y0, x1
+                return x0, y0, x1, y1
+            
+            # Draw definition boxes (green)
+            definitions = res_data.get('definitions', [])
+            for d in definitions:
+                mx0, my0, mx1, my1 = reverse_rotation_transform(d['x0'], d['y0'], d['x1'], d['y1'])
+                r = fitz.Rect(mx0, my0, mx1, my1)
+                r.normalize()
+                if not r.is_empty and r.is_valid:
+                    page_out.draw_rect(r, color=(0, 0.9, 0), width=2.0, overlay=True)
+            
+            # Draw instance boxes (purple)
+            instances = res_data.get('instances', [])
+            for inst in instances:
+                mx0, my0, mx1, my1 = reverse_rotation_transform(inst['x0'], inst['y0'], inst['x1'], inst['y1'])
+                r = fitz.Rect(mx0, my0, mx1, my1)
+                r.normalize()
+                if not r.is_empty and r.is_valid:
+                    page_out.draw_rect(r, color=(0.9, 0, 0.9), width=2.0, overlay=True)
+            
+            # Draw keyword match boxes (orange)
+            keyword_matches = res_data.get('keyword_matches', [])
+            for kw in keyword_matches:
+                if all(k in kw for k in ['x0', 'y0', 'x1', 'y1']):
+                    mx0, my0, mx1, my1 = reverse_rotation_transform(kw['x0'], kw['y0'], kw['x1'], kw['y1'])
+                    r = fitz.Rect(mx0, my0, mx1, my1)
+                    r.normalize()
+                    if not r.is_empty and r.is_valid:
+                        page_out.draw_rect(r, color=(1.0, 0.65, 0), width=2.0, overlay=True)
+            
+            # Get categories for this page
+            categories = page_categories.get(page_key, {})
+            
+            # Auto-detected lines are now included in line_assignments via coordinate matching,
+            # so they'll be drawn with category colors below (no separate cyan pass needed)
+            
+            # Get lines from session state - try multiple key formats
+            lines = []
+            for key in session_state.keys():
+                if key.startswith(f"lines_{page_num}_"):
+                    lines = session_state[key]
+                    break
+            
+            page_assignments = line_assignments.get(page_key, {})
+            
+            for line_idx, category in page_assignments.items():
+                idx = int(line_idx) if isinstance(line_idx, str) else line_idx
+                if idx < len(lines):
+                    line = lines[idx]
+                    cat_info = categories.get(category, {})
+                    color_rgb = cat_info.get('color', (0, 255, 0))
+                    # Convert 0-255 to 0-1
+                    color = (color_rgb[0]/255, color_rgb[1]/255, color_rgb[2]/255)
+                    
+                    sx, sy = line.start
+                    ex, ey = line.end
+                    mx0, my0, mx1, my1 = reverse_rotation_transform(sx, sy, ex, ey)
+                    
+                    page_out.draw_line((mx0, my0), (mx1, my1), color=color, width=3.0, overlay=True)
+            
+            # Draw user-drawn lines
+            user_lines = user_drawn_lines.get(page_key, [])
+            for ul in user_lines:
+                category = ul.get('category')
+                cat_info = categories.get(category, {})
+                color_rgb = cat_info.get('color', (0, 255, 0))
+                color = (color_rgb[0]/255, color_rgb[1]/255, color_rgb[2]/255)
+                
+                sx, sy = ul['start']
+                ex, ey = ul['end']
+                mx0, my0, mx1, my1 = reverse_rotation_transform(sx, sy, ex, ey)
+                
+                page_out.draw_line((mx0, my0), (mx1, my1), color=color, width=3.0, overlay=True)
+                # Draw endpoints
+                page_out.draw_circle((mx0, my0), 3, color=color, fill=color, overlay=True)
+                page_out.draw_circle((mx1, my1), 3, color=color, fill=color, overlay=True)
+                
+        except Exception as e:
+            print(f"Error processing page {page_idx} for measurement PDF: {e}")
+    
+    base, ext = os.path.splitext(uploaded_pdf_name_base)
+    fname = f"{base}_measurements{ext}"
+    
+    try:
+        pdf_bytes = output_doc.tobytes(garbage=2, deflate=True)
+    except Exception as e:
+        print(f"Error generating PDF bytes: {e}")
+        pdf_bytes = None
+    
+    if input_doc:
+        input_doc.close()
+    if output_doc:
+        output_doc.close()
+    
+    return (pdf_bytes, fname)
+
+
+def generate_measurement_spreadsheet(fence_pages, line_assignments, user_drawn_lines, page_categories, 
+                                     session_state, per_page_scale_info, min_line_pts):
+    """Generate CSV data with measurements by page and category."""
+    rows = []
+    
+    # Debug: print what we're working with
+    print(f"CSV Debug: line_assignments = {line_assignments}")
+    print(f"CSV Debug: user_drawn_lines = {user_drawn_lines}")
+    
+    for page_data in fence_pages:
+        page_num = page_data['page_number']
+        page_key = f"page_{page_num}"
+        
+        # Get scale
+        scale_info = per_page_scale_info.get(page_key, {})
+        page_scale = scale_info.get('verified_scale') or scale_info.get('text_scale') or 360.0
+        
+        # Get lines from session state - try multiple key formats
+        lines = []
+        lines_key_found = None
+        for key in list(session_state.keys()):
+            if key.startswith(f"lines_{page_num}_"):
+                lines = session_state[key]
+                lines_key_found = key
+                break
+        
+        print(f"CSV Debug: page {page_num}, lines_key={lines_key_found}, num_lines={len(lines)}")
+        
+        categories = page_categories.get(page_key, {})
+        
+        # Selected lines (includes auto-matched + manually selected)
+        auto_matched = session_state.get(f"auto_matched_indices_{page_key}", set())
+        page_assignments = line_assignments.get(page_key, {})
+        for line_idx, category in page_assignments.items():
+            idx = int(line_idx) if isinstance(line_idx, str) else line_idx
+            if idx < len(lines):
+                line = lines[idx]
+                length_inches = line.length_pts / 72.0
+                length_feet = (length_inches * page_scale) / 12.0
+                rows.append({
+                    'Page': page_num,
+                    'Category': category,
+                    'Type': 'Auto' if idx in auto_matched else 'Selected',
+                    'Length (ft)': round(length_feet, 2),
+                    'Length (pts)': round(line.length_pts, 2),
+                    'Scale': page_scale
+                })
+        
+        # User-drawn lines
+        user_lines = user_drawn_lines.get(page_key, [])
+        for ul in user_lines:
+            rows.append({
+                'Page': page_num,
+                'Category': ul.get('category', 'Uncategorized'),
+                'Type': 'Drawn',
+                'Length (ft)': round(ul.get('length_feet', 0), 2),
+                'Length (pts)': round(ul.get('length_pts', 0), 2),
+                'Scale': page_scale
+            })
+    
+    # Create DataFrame
+    if rows:
+        df = pd.DataFrame(rows)
+        
+        # Add summary rows
+        summary_rows = []
+        for cat in df['Category'].unique():
+            cat_df = df[df['Category'] == cat]
+            summary_rows.append({
+                'Page': 'TOTAL',
+                'Category': cat,
+                'Type': 'Summary',
+                'Length (ft)': round(cat_df['Length (ft)'].sum(), 2),
+                'Length (pts)': '',
+                'Scale': ''
+            })
+        
+        # Grand total
+        summary_rows.append({
+            'Page': 'GRAND',
+            'Category': 'TOTAL',
+            'Type': 'Summary',
+            'Length (ft)': round(df['Length (ft)'].sum(), 2),
+            'Length (pts)': '',
+            'Scale': ''
+        })
+        
+        summary_df = pd.DataFrame(summary_rows)
+        df = pd.concat([df, summary_df], ignore_index=True)
+        
+        return df.to_csv(index=False)
+    
+    # Return empty CSV with headers if no data
+    empty_df = pd.DataFrame(columns=['Page', 'Category', 'Type', 'Length (ft)', 'Length (pts)', 'Scale'])
+    return empty_df.to_csv(index=False)
+
+
 # ==============================================================================
 # Sidebar (matching app.py structure)
 # ==============================================================================
@@ -263,11 +505,11 @@ with st.sidebar:
     # ADE usage toggle
     use_ade = st.toggle("🧠 Use ADE (LandingAI)", value=True, key="use_ade_toggle")
     
-    # Fence Measurement toggle
-    enable_fence_measurement = st.toggle("📏 Measure fence elements", value=True, key="measurement_toggle")
-    
-    # Interactive Measurement toggle
-    enable_interactive_measurement = st.toggle("🖱️ Interactive line selection", value=False, key="interactive_measurement_toggle")
+    # Unified Measurement toggle (auto-detection + interactive editing)
+    enable_unified_measurement = st.toggle("📏 Unified Measurements", value=True, key="unified_measurement_toggle",
+                                           help="Auto-detect fence lines and interactively select/draw additional lines")
+    enable_nonlayer_suggestions = st.toggle("🔬 Non-layer suggestions", value=False, key="nonlayer_suggestions_toggle",
+                                            help="Show auto-detected suggestions even when no fence layers found (less reliable)")
     
     # Debug mode (disabled in UI)
     DEBUG_MODE = False
@@ -545,7 +787,7 @@ if st.session_state.run_analysis_triggered and \
                 # STEP 6: Smart Fence Measurement (if enabled)
                 # =====================================================================
                 measurement_result = {}
-                if enable_fence_measurement and (definitions or instances):
+                if enable_unified_measurement and (definitions or instances):
                     try:
                         status_txt_area.text(f"Page {page_num}/{total_pages}: Measuring fence elements...")
                         measurement_result = ade.measure_fence_elements(
@@ -555,7 +797,90 @@ if st.session_state.run_analysis_triggered and \
                         )
                     except Exception as e:
                         print(f"[APP] Measurement error: {e}")
-
+                
+                # Store auto-detected lines in unified measurement structure
+                # ONLY for layer-based detection (reliable) - skip LLM-guided fallback
+                page_key = f"page_{page_num}"
+                measurement_method = measurement_result.get('measurement_method', 'none') if measurement_result else 'none'
+                
+                if measurement_result and measurement_result.get('all_fence_lines') and measurement_method == 'layer':
+                    auto_lines = []
+                    all_fence_lines = measurement_result.get('all_fence_lines', [])
+                    scale_factor = measurement_result.get('page_info', {}).get('scale_factor', 1.0)
+                    layer_to_category = measurement_result.get('layer_to_category', {})
+                    
+                    # Map each line to its category using layer→category mapping
+                    for line in all_fence_lines:
+                        length_pts = line.length_pts
+                        length_inches = length_pts / 72.0
+                        length_feet = (length_inches * scale_factor) / 12.0
+                        
+                        line_layer = getattr(line, 'layer', None) or ''
+                        # Use LLM-matched layer→category mapping
+                        category = layer_to_category.get(line_layer)
+                        
+                        # Fallback: if layer not in mapping, try partial match
+                        if not category and line_layer:
+                            for mapped_layer, cat in layer_to_category.items():
+                                if mapped_layer in line_layer or line_layer in mapped_layer:
+                                    category = cat
+                                    break
+                        
+                        if category:
+                            auto_lines.append({
+                                'start': line.start,
+                                'end': line.end,
+                                'length_pts': length_pts,
+                                'length_feet': length_feet,
+                                'layer': line_layer,
+                                'category': category,
+                                'source': 'auto'
+                            })
+                    
+                    if auto_lines:
+                        if page_key not in st.session_state.unified_measurements:
+                            st.session_state.unified_measurements[page_key] = {
+                                'auto_lines': [], 'manual_lines': [], 'drawn_lines': [], 'accepted_auto': set()
+                            }
+                        st.session_state.unified_measurements[page_key]['auto_lines'] = auto_lines
+                        # Auto-accept all detected lines by default
+                        st.session_state.unified_measurements[page_key]['accepted_auto'] = set(range(len(auto_lines)))
+                        print(f"[AUTO] Page {page_num}: {len(auto_lines)} layer-based lines stored with categories from {len(layer_to_category)} layer mappings")
+                    else:
+                        print(f"[AUTO] Page {page_num}: layer-based but no lines matched to categories")
+                elif measurement_method != 'layer':
+                    print(f"[AUTO] Page {page_num}: skipping suggestions (method={measurement_method}, not layer-based)")
+                
+                # Store scale info (for all methods)
+                if measurement_result and measurement_result.get('page_info'):
+                    scale_factor = measurement_result['page_info'].get('scale_factor', 1.0)
+                    st.session_state.per_page_scale_info[page_key] = {
+                        'verified_scale': scale_factor,
+                        'text_scale': scale_factor,
+                        'success': measurement_result['page_info'].get('scale_detected', False),
+                        'method': measurement_result.get('measurement_method', 'unknown')
+                    }
+                
+                # Initialize categories from definitions (for all pages)
+                if page_key not in st.session_state.page_categories:
+                    categories = {}
+                    CATEGORY_COLORS = [
+                        (0, 255, 0), (255, 165, 0), (0, 191, 255), (255, 0, 255),
+                        (255, 255, 0), (0, 255, 255), (255, 105, 180), (173, 255, 47),
+                    ]
+                    for d in definitions:
+                        indicator = d.get('indicator', '')
+                        keyword = d.get('keyword', '')
+                        if keyword:
+                            cat_name = f"{indicator}: {keyword}" if indicator else keyword
+                            if cat_name not in categories:
+                                color_idx = len(categories)
+                                categories[cat_name] = {
+                                    'indicator': indicator,
+                                    'keyword': keyword,
+                                    'color': CATEGORY_COLORS[color_idx % len(CATEGORY_COLORS)]
+                                }
+                    st.session_state.page_categories[page_key] = categories
                 
                 # DEBUG: Show coordinate info if enabled
                 if DEBUG_MODE:
@@ -617,8 +942,8 @@ if st.session_state.run_analysis_triggered and \
                         page_img_bytes, keyword_matches, pdf_width, pdf_height
                     )
                 
-                # Highlight measured fence lines (cyan)
-                if measurement_result and measurement_result.get('all_fence_lines'):
+                # Highlight measured fence lines (cyan) - only for layer-based or if non-layer toggle enabled
+                if measurement_result and measurement_result.get('all_fence_lines') and (measurement_method == 'layer' or enable_nonlayer_suggestions):
                     highlighted_img_bytes = ade.highlight_fence_lines(
                         highlighted_img_bytes or page_img_bytes,
                         measurement_result['all_fence_lines'],
@@ -770,7 +1095,8 @@ if st.session_state.run_analysis_triggered and \
                             st.markdown(f"- Reason: {llm_res.get('reason', 'N/A')}")
                     
                     # Show Measurements (for ALL fence pages, not just keyword matches)
-                    if measurement_result and (measurement_result.get('indicator_measurements') or measurement_result.get('proximity_totals', {}).get('total_segments', 0) > 0):
+                    meas_method_stored = measurement_result.get('measurement_method', 'none') if measurement_result else 'none'
+                    if measurement_result and (meas_method_stored == 'layer' or enable_nonlayer_suggestions) and (measurement_result.get('indicator_measurements') or measurement_result.get('proximity_totals', {}).get('total_segments', 0) > 0):
                         st.markdown("---")
                         st.markdown("### 📏 Fence Measurements")
                         
@@ -1114,13 +1440,13 @@ elif st.session_state.processing_complete:
 
 
 # ==============================================================================
-# Interactive Measurement Tool
+# Unified Measurement Tool (Auto + Interactive)
 # ==============================================================================
 
-if st.session_state.processing_complete and st.session_state.fence_pages and enable_interactive_measurement:
+if st.session_state.processing_complete and st.session_state.fence_pages and enable_unified_measurement:
     st.markdown("---")
-    st.markdown("<h2>📏 Interactive Measurement Tool</h2>", unsafe_allow_html=True)
-    st.caption("Click on lines in the image to select/deselect them. Selected lines shown in green.")
+    st.markdown("<h2>📏 Unified Measurement Tool</h2>", unsafe_allow_html=True)
+    st.caption("🤖 Auto-detected lines shown in cyan | 👆 Click to select manual lines | ✏️ Draw custom lines")
     
     # Auto-detect and verify scale PER PAGE using LLM
     from utils_vector import verify_scale_with_bar
@@ -1237,6 +1563,55 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         if page_key not in st.session_state.line_assignments:
             st.session_state.line_assignments[page_key] = {}
         
+        # Pre-populate from auto-detected lines by matching coordinates to vector lines
+        # This runs once per analysis (keyed by auto_lines count to re-trigger on new analysis)
+        unified_page = st.session_state.unified_measurements.get(page_key, {})
+        auto_lines_data = unified_page.get('auto_lines', [])
+        accepted_auto = unified_page.get('accepted_auto', set())
+        auto_sync_key = f"auto_synced_{page_key}_{len(auto_lines_data)}"
+        
+        if auto_lines_data and accepted_auto and lines and auto_sync_key not in st.session_state:
+            import math
+            matched = 0
+            matched_indices = set()
+            for ai in accepted_auto:
+                if ai >= len(auto_lines_data):
+                    continue
+                auto_line = auto_lines_data[ai]
+                a_sx, a_sy = auto_line['start']
+                a_ex, a_ey = auto_line['end']
+                category = auto_line.get('category')
+                if not category:
+                    continue
+                
+                # Find closest vector line by endpoint distance
+                best_idx = None
+                best_dist = float('inf')
+                for vi, vline in enumerate(lines):
+                    v_sx, v_sy = vline.start
+                    v_ex, v_ey = vline.end
+                    # Try both orientations (line direction may differ)
+                    d1 = math.hypot(a_sx - v_sx, a_sy - v_sy) + math.hypot(a_ex - v_ex, a_ey - v_ey)
+                    d2 = math.hypot(a_sx - v_ex, a_sy - v_ey) + math.hypot(a_ex - v_sx, a_ey - v_sy)
+                    d = min(d1, d2)
+                    if d < best_dist:
+                        best_dist = d
+                        best_idx = vi
+                
+                # Coordinates come from same extract_vector_lines, should be near-exact
+                if best_idx is not None and best_dist < 2.0:
+                    st.session_state.line_assignments[page_key][best_idx] = category
+                    matched_indices.add(best_idx)
+                    matched += 1
+                else:
+                    print(f"[AUTO-PREPOP] No match for auto line {ai} (best_dist={best_dist:.2f})")
+            
+            # Track which vector line indices were auto-matched (for clear button)
+            auto_matched_key = f"auto_matched_indices_{page_key}"
+            st.session_state[auto_matched_key] = matched_indices
+            st.session_state[auto_sync_key] = matched
+            print(f"[AUTO-PREPOP] Page {page_num}: matched {matched}/{len(accepted_auto)} auto lines to {len(lines)} vector lines")
+        
         # Initialize categories for this page from its definitions
         if page_key not in st.session_state.page_categories:
             categories = {}
@@ -1322,6 +1697,72 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             if extracted:
                 st.markdown("**Extracted PDF Text (first 1500 chars):**")
                 st.code(extracted, language=None)
+        
+        # =====================================================================
+        # AUTO-DETECTED MEASUREMENTS SECTION
+        # =====================================================================
+        unified_page_data = st.session_state.unified_measurements.get(page_key, {})
+        auto_lines = unified_page_data.get('auto_lines', [])
+        
+        if auto_lines:
+            accepted_auto = unified_page_data.get('accepted_auto', set())
+            accepted_count = len(accepted_auto)
+            accepted_ft = sum(auto_lines[i].get('length_feet', 0) for i in accepted_auto if i < len(auto_lines))
+            
+            # Check how many auto lines are currently matched in line_assignments
+            auto_matched_key = f"auto_matched_indices_{page_key}"
+            auto_matched_indices = st.session_state.get(auto_matched_key, set())
+            currently_assigned = sum(1 for idx in auto_matched_indices if idx in st.session_state.line_assignments.get(page_key, {}))
+            
+            st.markdown("#### 🤖 Auto-Detected Fence Lines (Pre-Selected)")
+            
+            auto_col1, auto_col2, auto_col3 = st.columns([2, 1, 1])
+            with auto_col1:
+                if currently_assigned > 0:
+                    st.success(f"✓ {currently_assigned} lines matched & selected ({accepted_ft:.1f} ft)")
+                elif accepted_count > 0:
+                    st.warning(f"{accepted_count} auto lines detected but not yet synced to selections")
+                else:
+                    st.info("No auto-detected lines")
+            with auto_col2:
+                if st.button("🔄 Re-sync Auto", key=f"resync_auto_{page_num}", help="Re-match auto-detected lines to selectable vector lines"):
+                    # Clear old sync keys to force re-matching
+                    keys_to_remove = [k for k in st.session_state.keys() if k.startswith(f"auto_synced_{page_key}")]
+                    for k in keys_to_remove:
+                        del st.session_state[k]
+                    if auto_matched_key in st.session_state:
+                        del st.session_state[auto_matched_key]
+                    st.rerun(scope="fragment")
+            with auto_col3:
+                if st.button("❌ Clear Auto", key=f"clear_auto_{page_num}", help="Remove all auto-detected lines from selection"):
+                    # Remove auto-matched assignments from line_assignments
+                    page_assigns = st.session_state.line_assignments.get(page_key, {})
+                    for idx in auto_matched_indices:
+                        page_assigns.pop(idx, None)
+                    st.session_state.unified_measurements[page_key]['accepted_auto'] = set()
+                    st.session_state[auto_matched_key] = set()
+                    # Clear sync keys
+                    keys_to_remove = [k for k in st.session_state.keys() if k.startswith(f"auto_synced_{page_key}")]
+                    for k in keys_to_remove:
+                        del st.session_state[k]
+                    st.rerun(scope="fragment")
+            
+            # Show category breakdown for auto lines
+            auto_by_cat = {}
+            for i in accepted_auto:
+                if i < len(auto_lines):
+                    cat = auto_lines[i].get('category', 'Uncategorized')
+                    if cat not in auto_by_cat:
+                        auto_by_cat[cat] = {'count': 0, 'feet': 0}
+                    auto_by_cat[cat]['count'] += 1
+                    auto_by_cat[cat]['feet'] += auto_lines[i].get('length_feet', 0)
+            
+            if auto_by_cat:
+                for cat, data in auto_by_cat.items():
+                    cat_color = page_categories.get(cat, {}).get('color', (0, 255, 255))
+                    st.markdown(f"<span style='color: rgb{cat_color};'>●</span> **{cat}**: {data['count']} lines, {data['feet']:.1f} ft", unsafe_allow_html=True)
+        
+        st.markdown("---")
         
         # Category selector for this page
         st.markdown("#### 🏷️ Fence Categories (This Page)")
@@ -1429,6 +1870,8 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             assignment_tuple = tuple(sorted(line_assignments.items()))
             drawn_img_cache_key = f"drawn_img_{page_num}_{zoom_level}_{hash(assignment_tuple)}"
             
+            # Auto lines are now part of line_assignments, no separate cache key needed
+            
             if drawn_img_cache_key not in st.session_state:
                 # Copy base image and draw assignments
                 display_img = base_img_cached.copy()
@@ -1444,7 +1887,7 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                     if i not in line_assignments:
                         draw.line([(x0, y0), (x1, y1)], fill=(150, 180, 200), width=1)
                 
-                # Second pass: Draw ASSIGNED lines with category colors
+                # Second pass: Draw ASSIGNED lines with category colors (auto-matched + manually selected)
                 for i, ls in enumerate(line_stats):
                     if i in line_assignments:
                         category = line_assignments[i]
@@ -1600,7 +2043,9 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                                 current_assignment = st.session_state.line_assignments[page_key].get(nearest_idx)
                                 
                                 if current_assignment == active_cat:
-                                    del st.session_state.line_assignments[page_key][nearest_idx]
+                                    # Only delete if key exists
+                                    if nearest_idx in st.session_state.line_assignments[page_key]:
+                                        del st.session_state.line_assignments[page_key][nearest_idx]
                                 else:
                                     if active_cat:
                                         st.session_state.line_assignments[page_key][nearest_idx] = active_cat
@@ -1677,8 +2122,8 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
     st.markdown("---")
     st.markdown("### 📊 Overall Summary")
     
-    # Aggregate by category across all pages (selected + drawn lines)
-    category_totals = {}  # {category: {'lines': count, 'feet': total, 'drawn': count}}
+    # Aggregate by category across all pages (auto + selected + drawn lines)
+    category_totals = {}  # {category: {'auto': count, 'lines': count, 'feet': total, 'drawn': count}}
     grand_total_feet = 0
     grand_total_lines = 0
     
@@ -1691,7 +2136,9 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         page_scale_info = st.session_state.per_page_scale_info.get(page_key, {})
         page_scale = page_scale_info.get('verified_scale') or page_scale_info.get('text_scale') or 360.0
         
-        # Selected lines from PDF
+        # Selected lines from PDF (includes auto-matched + manually selected)
+        # Use auto_matched_indices to distinguish auto vs manual
+        auto_matched = st.session_state.get(f"auto_matched_indices_{page_key}", set())
         lines = st.session_state.get(lines_cache_key, [])
         line_assignments = st.session_state.line_assignments.get(page_key, {})
         for i, category in line_assignments.items():
@@ -1701,8 +2148,11 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                 length_feet = (length_inches * page_scale) / 12.0
                 
                 if category not in category_totals:
-                    category_totals[category] = {'lines': 0, 'feet': 0, 'drawn': 0}
-                category_totals[category]['lines'] += 1
+                    category_totals[category] = {'auto': 0, 'lines': 0, 'feet': 0, 'drawn': 0}
+                if i in auto_matched:
+                    category_totals[category]['auto'] += 1
+                else:
+                    category_totals[category]['lines'] += 1
                 category_totals[category]['feet'] += length_feet
                 
                 grand_total_feet += length_feet
@@ -1715,7 +2165,7 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             length_feet = ul.get('length_feet', 0)
             
             if category not in category_totals:
-                category_totals[category] = {'lines': 0, 'feet': 0, 'drawn': 0}
+                category_totals[category] = {'auto': 0, 'lines': 0, 'feet': 0, 'drawn': 0}
             category_totals[category]['drawn'] += 1
             category_totals[category]['feet'] += length_feet
             
@@ -1736,12 +2186,17 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             with col_cat:
                 st.markdown(f"<span style='color: rgb{color}; font-size: 18px;'>●</span> **{cat}**", unsafe_allow_html=True)
             with col_lines:
+                auto = totals.get('auto', 0)
                 selected = totals['lines']
                 drawn = totals.get('drawn', 0)
-                line_text = f"{selected} sel" if selected else ""
+                parts = []
+                if auto:
+                    parts.append(f"🤖{auto}")
+                if selected:
+                    parts.append(f"👆{selected}")
                 if drawn:
-                    line_text += f"{', ' if line_text else ''}{drawn} drawn"
-                st.markdown(line_text if line_text else "0")
+                    parts.append(f"✏️{drawn}")
+                st.markdown(", ".join(parts) if parts else "0")
             with col_feet:
                 st.metric("Length", f"{totals['feet']:.1f} ft", label_visibility="collapsed")
         
@@ -1761,6 +2216,55 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             st.session_state.line_assignments = {}
     else:
         st.info("Click lines in the page tabs above and assign them to categories to calculate totals.")
+    
+    # Download section - always show when there are fence pages
+    st.markdown("---")
+    st.markdown("#### 📥 Downloads")
+    
+    dl_col1, dl_col2 = st.columns(2)
+    
+    with dl_col1:
+        # Generate measurement PDF
+        pdf_bytes, pdf_name = generate_measurement_pdf(
+            st.session_state.original_pdf_bytes,
+            st.session_state.fence_pages,
+            st.session_state.line_assignments,
+            st.session_state.user_drawn_lines,
+            st.session_state.page_categories,
+            st.session_state,
+            min_line_pts,
+            st.session_state.uploaded_pdf_name
+        )
+        if pdf_bytes:
+            st.download_button(
+                "📄 Download PDF with Measurements",
+                pdf_bytes,
+                pdf_name,
+                "application/pdf",
+                key="dl_measurement_pdf"
+            )
+        else:
+            st.error("Error generating PDF")
+    
+    with dl_col2:
+        # Generate spreadsheet
+        csv_data = generate_measurement_spreadsheet(
+            st.session_state.fence_pages,
+            st.session_state.line_assignments,
+            st.session_state.user_drawn_lines,
+            st.session_state.page_categories,
+            st.session_state,
+            st.session_state.per_page_scale_info,
+            min_line_pts
+        )
+        base_name = os.path.splitext(st.session_state.uploaded_pdf_name)[0]
+        st.download_button(
+            "📊 Download Measurements CSV",
+            csv_data,
+            f"{base_name}_measurements.csv",
+            "text/csv",
+            key="dl_measurement_csv"
+        )
 
 
 # ==============================================================================
