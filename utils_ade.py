@@ -403,7 +403,8 @@ def extract_legend_entries(
     pdf_lines: List[Dict],
     ocr_lines: List[Dict],
     fence_keywords: List[str],
-    llm
+    llm,
+    figure_chunks: List[Dict] = None
 ) -> List[Dict]:
     print("[DEBUG] Extracting Legend Entries and Matching BBoxes...")
     results = []
@@ -415,14 +416,9 @@ def extract_legend_entries(
             return " ".join(words[:4])
         return text
 
-    for chunk in legend_chunks:
-        text = chunk.get("text", "")
-        if not text:
-            continue
-
-        items = llm_extract_fence_elements(llm, text, fence_keywords)
+    def _process_chunk(chunk, items, results, extraction_pass="legend"):
+        """Process LLM-extracted items from a chunk into results."""
         chunk_bbox = (chunk["x0"], chunk["y0"], chunk["x1"], chunk["y1"])
-
         for item in items:
             desc = item["text_element"]
             ind = item["indicator"]
@@ -450,7 +446,8 @@ def extract_legend_entries(
                     "description": item["description"],
                     "x0": bbox_desc["x0"], "y0": bbox_desc["y0"],
                     "x1": bbox_desc["x1"], "y1": bbox_desc["y1"],
-                    "source": bbox_desc.get("source", "unknown") + "_desc"
+                    "source": bbox_desc.get("source", "unknown") + "_desc",
+                    "extraction_pass": extraction_pass
                 })
 
             if bbox_ind:
@@ -465,13 +462,72 @@ def extract_legend_entries(
                         "description": "Indicator Code",
                         "x0": bbox_ind["x0"], "y0": bbox_ind["y0"],
                         "x1": bbox_ind["x1"], "y1": bbox_ind["y1"],
-                        "source": bbox_ind.get("source", "unknown") + "_ind"
+                        "source": bbox_ind.get("source", "unknown") + "_ind",
+                        "extraction_pass": extraction_pass
                     })
+
+    # Pass 1: Process legend chunks (primary source)
+    for chunk in legend_chunks:
+        text = chunk.get("text", "")
+        if not text:
+            continue
+        items = llm_extract_fence_elements(llm, text, fence_keywords)
+        _process_chunk(chunk, items, results, extraction_pass="legend")
+
+    # Check quality of legend results — filter out bad indicators
+    good_results = [r for r in results if r.get("indicator", "").strip() not in ("", ".", "(bullet point)", "bullet point", "-", "*")]
+    
+    # Pass 2: If legend chunks yielded few good results, also extract from figure chunks
+    if len(good_results) < 3 and figure_chunks:
+        print(f"[DEBUG] Legend extraction yielded only {len(good_results)} good results, trying figure chunks...")
+        for chunk in figure_chunks:
+            text = chunk.get("text", "")
+            if not text:
+                continue
+            # Only process figure chunks whose text contains fence keywords
+            text_lower = text.lower()
+            if not any(kw.lower() in text_lower for kw in fence_keywords):
+                continue
+            items = llm_extract_fence_elements(llm, text, fence_keywords)
+            _process_chunk(chunk, items, results, extraction_pass="figure")
+    
+    # Pass 3: If still few results, try extracting from OCR lines with fence keywords
+    good_results = [r for r in results if r.get("indicator", "").strip() not in ("", ".", "(bullet point)", "bullet point", "-", "*")]
+    if len(good_results) < 3 and ocr_lines:
+        print(f"[DEBUG] Still only {len(good_results)} good results, trying OCR fence lines...")
+        fence_ocr_text = []
+        for line in ocr_lines:
+            t = line.get('text', '')
+            if any(kw.lower() in t.lower() for kw in fence_keywords):
+                fence_ocr_text.append(t)
+        if fence_ocr_text:
+            combined_text = "\n".join(fence_ocr_text[:50])
+            items = llm_extract_fence_elements(llm, combined_text, fence_keywords)
+            if items:
+                # Use a page-wide bbox for OCR-sourced items
+                page_bbox = {"x0": 0, "y0": 0, "x1": 10000, "y1": 10000}
+                for item in items:
+                    desc = item["text_element"]
+                    ind = item["indicator"]
+                    bbox_desc = None
+                    if desc:
+                        bbox_desc = find_best_bbox(desc, pdf_lines, ocr_lines, (0, 0, 10000, 10000))
+                    if bbox_desc:
+                        results.append({
+                            "indicator": ind,
+                            "keyword": desc,
+                            "description": item["description"],
+                            "x0": bbox_desc["x0"], "y0": bbox_desc["y0"],
+                            "x1": bbox_desc["x1"], "y1": bbox_desc["y1"],
+                            "source": bbox_desc.get("source", "unknown") + "_ocr_fallback",
+                            "extraction_pass": "ocr"
+                        })
+
     print(f"[DEBUG] Finished Legend Extraction. Total mapped items: {len(results)}")
     return results
 
 
-def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Dict], all_tokens: List[Dict]) -> List[Dict]:
+def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Dict], all_tokens: List[Dict], ocr_lines: List[Dict] = None) -> List[Dict]:
     """
     Find instances of legend indicators ONLY within figure/architectural_drawing chunks.
     
@@ -479,9 +535,49 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
         legend_entries: List of definitions with 'indicator' field
         figure_chunks: List of figure region bounding boxes (type=figure or architectural_drawing)
         all_tokens: All text tokens from the page
+        ocr_lines: OCR text blocks as fallback when page has no embedded text
     """
     print("[DEBUG] Finding Instances in Figure Chunks...")
     print(f"[DEBUG] Figure chunks count: {len(figure_chunks)}")
+    
+    # Fallback: if no embedded text tokens, use OCR lines as token source
+    if not all_tokens and ocr_lines:
+        print(f"[DEBUG] No embedded text tokens, using {len(ocr_lines)} OCR lines as fallback")
+        # Split OCR lines into individual word-level tokens for better matching
+        for ocr_line in ocr_lines:
+            text = ocr_line.get('text', '').strip()
+            if not text:
+                continue
+            # For short text (likely a single token/number), use as-is
+            words = text.split()
+            if len(words) <= 1:
+                all_tokens.append({
+                    'text': text,
+                    'x0': ocr_line.get('x0', 0),
+                    'y0': ocr_line.get('y0', 0),
+                    'x1': ocr_line.get('x1', 0),
+                    'y1': ocr_line.get('y1', 0),
+                })
+            else:
+                # For multi-word OCR blocks, split into words with approximate positions
+                total_len = sum(len(w) for w in words)
+                x0 = ocr_line.get('x0', 0)
+                x1 = ocr_line.get('x1', 0)
+                y0 = ocr_line.get('y0', 0)
+                y1 = ocr_line.get('y1', 0)
+                span = x1 - x0
+                cursor = x0
+                for w in words:
+                    w_span = (len(w) / max(total_len, 1)) * span
+                    all_tokens.append({
+                        'text': w,
+                        'x0': cursor,
+                        'y0': y0,
+                        'x1': cursor + w_span,
+                        'y1': y1,
+                    })
+                    cursor += w_span
+        print(f"[DEBUG] Created {len(all_tokens)} tokens from OCR lines")
     for i, fc in enumerate(figure_chunks):
         print(f"[DEBUG]   Figure {i}: type={fc.get('type')} bbox=({fc['x0']:.1f}, {fc['y0']:.1f}) - ({fc['x1']:.1f}, {fc['y1']:.1f})")
     
@@ -508,8 +604,12 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
         return []
     
     # Get legend bounding boxes to exclude (don't match indicators in legend area)
+    # ONLY use legend-sourced definitions for exclusion — figure/OCR-sourced definitions
+    # are IN the drawing area and should NOT create exclusion zones
     legend_bboxes = []
     for entry in legend_entries:
+        if entry.get("extraction_pass", "legend") != "legend":
+            continue
         if all(k in entry for k in ['x0', 'y0', 'x1', 'y1']):
             legend_bboxes.append((entry['x0'], entry['y0'], entry['x1'], entry['y1']))
     
@@ -1323,7 +1423,8 @@ def measure_fence_elements(
     fence_instances: List[Dict],
     figure_chunks: List[Dict] = None,
     llm=None,
-    scale_factor: Optional[float] = None
+    scale_factor: Optional[float] = None,
+    ocr_text: str = None
 ) -> Dict:
     """
     Measure fence-related vector elements based on detected indicators.
@@ -1358,7 +1459,7 @@ def measure_fence_elements(
     
     # Auto-infer scale if not provided
     if scale_factor is None:
-        scale_factor = infer_scale_from_page(page)
+        scale_factor = infer_scale_from_page(page, ocr_text=ocr_text)
         if scale_factor:
             print(f"[DEBUG] Auto-detected scale factor: {scale_factor}")
         else:

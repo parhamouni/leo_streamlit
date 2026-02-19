@@ -66,6 +66,8 @@ def initialize_session_state(session_id_val):
             'panel', 'chain link', 'masonry', 'fence details', 'canopy shading',
             'adot specifications', 'mag specifications', 'rail', 'railing',
             'bollards', 'handrails', 'wall', 'cmu',
+            'operator', 'davis', 'bacon', 'davis-bacon', 'davis – bacon',
+            'buy america', 'american', 'dug out',
         ],
         'run_analysis_triggered': False,
         'uploaded_pdf_name': None,
@@ -743,7 +745,8 @@ if st.session_state.run_analysis_triggered and \
                         pdf_lines=pdf_lines,
                         ocr_lines=ocr_lines,
                         fence_keywords=FENCE_KEYWORDS_APP,
-                        llm=llm_analysis_instance
+                        llm=llm_analysis_instance,
+                        figure_chunks=figure_chunks
                     )
                 
                 # Get all page tokens for instance finding
@@ -781,7 +784,7 @@ if st.session_state.run_analysis_triggered and \
                 
                 # Find instances in figures
                 if definitions and figure_chunks:
-                    instances = ade.find_instances_in_figures(definitions, figure_chunks, all_page_tokens)
+                    instances = ade.find_instances_in_figures(definitions, figure_chunks, all_page_tokens, ocr_lines=ocr_lines)
                 
                 # =====================================================================
                 # STEP 6: Smart Fence Measurement (if enabled)
@@ -790,10 +793,13 @@ if st.session_state.run_analysis_triggered and \
                 if enable_unified_measurement and (definitions or instances):
                     try:
                         status_txt_area.text(f"Page {page_num}/{total_pages}: Measuring fence elements...")
+                        # Build OCR text for scale detection fallback
+                        ocr_full_text = "\n".join(line.get('text', '') for line in ocr_lines) if ocr_lines else None
                         measurement_result = ade.measure_fence_elements(
                             page, definitions, instances, 
                             figure_chunks=figure_chunks,  # Pass figure areas for boundary
-                            llm=llm_analysis_instance
+                            llm=llm_analysis_instance,
+                            ocr_text=ocr_full_text
                         )
                     except Exception as e:
                         print(f"[APP] Measurement error: {e}")

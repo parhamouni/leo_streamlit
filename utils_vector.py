@@ -515,19 +515,26 @@ def infer_scale_from_text(text: str) -> Optional[float]:
     return None
 
 
-def infer_scale_from_page(page: fitz.Page) -> Optional[float]:
+def infer_scale_from_page(page: fitz.Page, ocr_text: str = None) -> Optional[float]:
     """
     Attempt to infer scale factor from a PDF page's text content.
     
     Args:
         page: PyMuPDF page object
+        ocr_text: OCR text as fallback when page has no embedded text
     
     Returns:
         Scale factor or None if not found
     """
     # Extract all text from the page
     text = page.get_text()
-    return infer_scale_from_text(text)
+    result = infer_scale_from_text(text)
+    if result:
+        return result
+    # Fallback: try OCR text if embedded text didn't yield a scale
+    if ocr_text:
+        return infer_scale_from_text(ocr_text)
+    return None
 
 
 def get_page_size_info(page: fitz.Page) -> Dict:
