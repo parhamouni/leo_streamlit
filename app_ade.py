@@ -81,6 +81,8 @@ def initialize_session_state(session_id_val):
         'per_page_scale_info': {},
         'page_categories': {},
         'active_category_per_page': {},
+        'element_details': {},  # {element_name: {height, post_spacing, material, ...}}
+        'fence_page_texts': {},  # {page_number: full_text} for cross-page detail extraction
     }
     for key, value in default_state.items():
         if key not in st.session_state:
@@ -367,14 +369,60 @@ def generate_measurement_pdf(original_pdf_bytes, fence_pages_results_list, line_
     return (pdf_bytes, fname)
 
 
+def _lookup_element_details(category: str, element_details: dict) -> dict:
+    """Look up element details for a category name, trying exact and fuzzy matching."""
+    if not element_details:
+        return {}
+    # Exact match
+    if category in element_details:
+        return element_details[category]
+    # Case-insensitive match
+    cat_lower = category.lower()
+    for name, details in element_details.items():
+        if name.lower() == cat_lower:
+            return details
+    # Partial match (category contains element name or vice versa)
+    for name, details in element_details.items():
+        if name.lower() in cat_lower or cat_lower in name.lower():
+            return details
+    return {}
+
+
 def generate_measurement_spreadsheet(fence_pages, line_assignments, user_drawn_lines, page_categories, 
                                      session_state, per_page_scale_info, min_line_pts):
-    """Generate CSV data with measurements by page and category."""
+    """Generate CSV data with measurements by page and category, enriched with element details."""
     rows = []
+    element_details = session_state.get('element_details', {})
     
     # Debug: print what we're working with
     print(f"CSV Debug: line_assignments = {line_assignments}")
     print(f"CSV Debug: user_drawn_lines = {user_drawn_lines}")
+    print(f"CSV Debug: element_details keys = {list(element_details.keys())}")
+    
+    # Detail columns to include
+    DETAIL_COLS = ['Height', 'Post Type', 'Post Spacing', 'Material', 'Gauge', 'Mesh Size', 'Detail Page', 'Full Details']
+    
+    def _build_row(page_num, category, row_type, length_feet, length_pts, page_scale):
+        """Build a row dict with measurement + detail columns."""
+        row = {
+            'Page': page_num,
+            'Category': category,
+            'Type': row_type,
+            'Length (ft)': round(length_feet, 2),
+            'Length (pts)': round(length_pts, 2),
+            'Scale': page_scale,
+        }
+        # Look up details for this category
+        details = _lookup_element_details(category, element_details)
+        row['Height'] = details.get('height', '')
+        row['Post Type'] = details.get('post_type', '')
+        row['Post Spacing'] = details.get('post_spacing', '')
+        row['Material'] = details.get('material', '')
+        row['Gauge'] = details.get('gauge', '')
+        row['Mesh Size'] = details.get('mesh_size', '')
+        row['Detail Page'] = details.get('detail_page', '')
+        row['Full Details'] = details.get('full_details', '')
+        return row
     
     for page_data in fence_pages:
         page_num = page_data['page_number']
@@ -406,26 +454,23 @@ def generate_measurement_spreadsheet(fence_pages, line_assignments, user_drawn_l
                 line = lines[idx]
                 length_inches = line.length_pts / 72.0
                 length_feet = (length_inches * page_scale) / 12.0
-                rows.append({
-                    'Page': page_num,
-                    'Category': category,
-                    'Type': 'Auto' if idx in auto_matched else 'Selected',
-                    'Length (ft)': round(length_feet, 2),
-                    'Length (pts)': round(line.length_pts, 2),
-                    'Scale': page_scale
-                })
+                rows.append(_build_row(
+                    page_num, category,
+                    'Auto' if idx in auto_matched else 'Selected',
+                    length_feet, line.length_pts, page_scale
+                ))
         
         # User-drawn lines
         user_lines = user_drawn_lines.get(page_key, [])
         for ul in user_lines:
-            rows.append({
-                'Page': page_num,
-                'Category': ul.get('category', 'Uncategorized'),
-                'Type': 'Drawn',
-                'Length (ft)': round(ul.get('length_feet', 0), 2),
-                'Length (pts)': round(ul.get('length_pts', 0), 2),
-                'Scale': page_scale
-            })
+            rows.append(_build_row(
+                page_num, ul.get('category', 'Uncategorized'),
+                'Drawn',
+                ul.get('length_feet', 0), ul.get('length_pts', 0), page_scale
+            ))
+    
+    # Define all columns (measurement + detail)
+    all_columns = ['Page', 'Category', 'Type', 'Length (ft)', 'Length (pts)', 'Scale'] + DETAIL_COLS
     
     # Create DataFrame
     if rows:
@@ -435,32 +480,50 @@ def generate_measurement_spreadsheet(fence_pages, line_assignments, user_drawn_l
         summary_rows = []
         for cat in df['Category'].unique():
             cat_df = df[df['Category'] == cat]
-            summary_rows.append({
+            summary_row = {
                 'Page': 'TOTAL',
                 'Category': cat,
                 'Type': 'Summary',
                 'Length (ft)': round(cat_df['Length (ft)'].sum(), 2),
                 'Length (pts)': '',
                 'Scale': ''
-            })
+            }
+            # Include details in summary row too
+            details = _lookup_element_details(cat, element_details)
+            summary_row['Height'] = details.get('height', '')
+            summary_row['Post Type'] = details.get('post_type', '')
+            summary_row['Post Spacing'] = details.get('post_spacing', '')
+            summary_row['Material'] = details.get('material', '')
+            summary_row['Gauge'] = details.get('gauge', '')
+            summary_row['Mesh Size'] = details.get('mesh_size', '')
+            summary_row['Detail Page'] = details.get('detail_page', '')
+            summary_row['Full Details'] = details.get('full_details', '')
+            summary_rows.append(summary_row)
         
         # Grand total
-        summary_rows.append({
+        grand_row = {
             'Page': 'GRAND',
             'Category': 'TOTAL',
             'Type': 'Summary',
             'Length (ft)': round(df['Length (ft)'].sum(), 2),
             'Length (pts)': '',
             'Scale': ''
-        })
+        }
+        for col in DETAIL_COLS:
+            grand_row[col] = ''
+        summary_rows.append(grand_row)
         
         summary_df = pd.DataFrame(summary_rows)
         df = pd.concat([df, summary_df], ignore_index=True)
         
+        # Ensure column order
+        final_cols = [c for c in all_columns if c in df.columns]
+        df = df[final_cols]
+        
         return df.to_csv(index=False)
     
     # Return empty CSV with headers if no data
-    empty_df = pd.DataFrame(columns=['Page', 'Category', 'Type', 'Length (ft)', 'Length (pts)', 'Scale'])
+    empty_df = pd.DataFrame(columns=all_columns)
     return empty_df.to_csv(index=False)
 
 
@@ -924,6 +987,21 @@ if st.session_state.run_analysis_triggered and \
                         keyword_matches = prefilter_result.get("matched_lines", [])
                     detection_method = prefilter_result.get("method", "none")
             
+            # Collect full page text for cross-page detail extraction
+            if fence_found:
+                page_text_parts = []
+                for pl in pdf_lines:
+                    t = pl.get('text', '').strip()
+                    if t:
+                        page_text_parts.append(t)
+                for ol in ocr_lines:
+                    t = ol.get('text', '').strip()
+                    if t:
+                        page_text_parts.append(t)
+                full_page_text = "\n".join(page_text_parts)
+                if full_page_text.strip():
+                    st.session_state.fence_page_texts[page_num] = full_page_text
+            
             # Build text snippet from definitions or fallback keywords
             text_snippet = None
             if definitions:
@@ -1183,6 +1261,39 @@ if st.session_state.run_analysis_triggered and \
             
             time.sleep(0.05)
         
+        # =====================================================================
+        # CROSS-PAGE DETAIL EXTRACTION
+        # After all pages processed, extract detailed specs for each element
+        # =====================================================================
+        if st.session_state.fence_pages and st.session_state.fence_page_texts:
+            status_txt_area.text("Extracting element details across pages...")
+            # Collect unique element names from all definitions
+            all_element_names = []
+            seen_elements = set()
+            for fp in st.session_state.fence_pages:
+                for d in fp.get('definitions', []):
+                    kw = d.get('keyword', '').strip()
+                    desc_val = d.get('description', '').strip()
+                    if kw and kw not in seen_elements and desc_val != "Indicator Code":
+                        ind = d.get('indicator', '').strip()
+                        element_label = f"{ind}: {kw}" if ind else kw
+                        all_element_names.append(element_label)
+                        seen_elements.add(kw)
+            
+            if all_element_names:
+                print(f"[APP] Extracting details for {len(all_element_names)} elements: {all_element_names}")
+                try:
+                    element_details = ade.extract_element_details(
+                        llm=llm_analysis_instance,
+                        element_names=all_element_names,
+                        page_texts=st.session_state.fence_page_texts,
+                    )
+                    st.session_state.element_details = element_details
+                    print(f"[APP] Element details extracted: {len(element_details)} elements")
+                except Exception as e:
+                    print(f"[APP] Element detail extraction error: {e}")
+                    st.session_state.element_details = {}
+        
         # Processing complete
         st.session_state.processing_complete = True
         prog_bar.empty()
@@ -1351,6 +1462,41 @@ elif st.session_state.processing_complete:
                                 st.info("No definition details available.")
                         else:
                             st.dataframe(df_def, hide_index=True)
+                        
+                        # Show element details if available
+                        el_details = st.session_state.get('element_details', {})
+                        if el_details:
+                            st.markdown("### 📋 Element Specifications")
+                            detail_rows = []
+                            seen_kw = set()
+                            for d in definitions:
+                                kw = d.get('keyword', '').strip()
+                                if not kw or kw in seen_kw or d.get('description', '') == 'Indicator Code':
+                                    continue
+                                seen_kw.add(kw)
+                                ind = d.get('indicator', '').strip()
+                                cat_label = f"{ind}: {kw}" if ind else kw
+                                details = _lookup_element_details(cat_label, el_details)
+                                if details and any(v for v in details.values() if v):
+                                    detail_rows.append({
+                                        'Element': cat_label,
+                                        'Height': details.get('height', ''),
+                                        'Post Type': details.get('post_type', ''),
+                                        'Post Spacing': details.get('post_spacing', ''),
+                                        'Material': details.get('material', ''),
+                                        'Gauge': details.get('gauge', ''),
+                                        'Mesh Size': details.get('mesh_size', ''),
+                                        'Detail Page': details.get('detail_page', ''),
+                                    })
+                            if detail_rows:
+                                st.dataframe(pd.DataFrame(detail_rows), hide_index=True, use_container_width=True)
+                                # Full details in expandable section
+                                with st.expander("📝 Full Detail Text", expanded=False):
+                                    for dr in detail_rows:
+                                        elem = dr['Element']
+                                        full = _lookup_element_details(elem, el_details).get('full_details', '')
+                                        if full:
+                                            st.markdown(f"**{elem}:** {full}")
                     
                     if instances:
                         st.markdown("### 🟣 Instances (Drawings)")
@@ -2222,6 +2368,39 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             st.session_state.line_assignments = {}
     else:
         st.info("Click lines in the page tabs above and assign them to categories to calculate totals.")
+    
+    # Element Specifications Summary (cross-page details)
+    el_details = st.session_state.get('element_details', {})
+    if el_details:
+        st.markdown("---")
+        st.markdown("#### 📋 Element Specifications (Cross-Page Details)")
+        spec_rows = []
+        for elem_name, details in el_details.items():
+            if any(v for v in details.values() if v):
+                spec_rows.append({
+                    'Element': elem_name,
+                    'Height': details.get('height', ''),
+                    'Post Type': details.get('post_type', ''),
+                    'Post Spacing': details.get('post_spacing', ''),
+                    'Material': details.get('material', ''),
+                    'Gauge': details.get('gauge', ''),
+                    'Mesh Size': details.get('mesh_size', ''),
+                    'Foundation': details.get('foundation', ''),
+                    'Gate Info': details.get('gate_info', ''),
+                    'Detail Page': details.get('detail_page', ''),
+                })
+        if spec_rows:
+            st.dataframe(pd.DataFrame(spec_rows), hide_index=True, use_container_width=True)
+            with st.expander("📝 Full Detail Text per Element", expanded=False):
+                for elem_name, details in el_details.items():
+                    full = details.get('full_details', '')
+                    notes = details.get('notes', '')
+                    if full or notes:
+                        st.markdown(f"**{elem_name}:**")
+                        if full:
+                            st.markdown(f"  {full}")
+                        if notes:
+                            st.markdown(f"  *Notes: {notes}*")
     
     # Download section - always show when there are fence pages
     st.markdown("---")

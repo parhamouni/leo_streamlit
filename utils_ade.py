@@ -527,6 +527,138 @@ def extract_legend_entries(
     return results
 
 
+def extract_element_details(
+    llm,
+    element_names: List[str],
+    page_texts: Dict[int, str],
+) -> Dict[str, Dict]:
+    """
+    Cross-reference fence element names with detailed specifications found across pages.
+    
+    For each element (e.g. "9 GAUGE FABRIC"), searches all page texts for detail info
+    and uses LLM to extract structured specs (height, post spacing, material, etc.).
+    
+    Args:
+        llm: Language model instance
+        element_names: List of element keywords/categories to look up
+        page_texts: {page_number: full_text_of_page} for all fence-related pages
+        
+    Returns:
+        Dict mapping element name -> {height, post_spacing, material, gauge, 
+        top_rail, bottom_rail, detail_page, full_details, ...}
+    """
+    if not llm or not element_names or not page_texts:
+        return {}
+    
+    print(f"[DETAILS] Extracting details for {len(element_names)} elements across {len(page_texts)} pages")
+    
+    # Combine all page texts with page markers (truncate each to keep within token limits)
+    combined_parts = []
+    for page_num in sorted(page_texts.keys()):
+        text = page_texts[page_num].strip()
+        if text:
+            # Truncate very long pages but keep enough for detail extraction
+            truncated = text[:6000]
+            combined_parts.append(f"--- PAGE {page_num} ---\n{truncated}")
+    
+    combined_text = "\n\n".join(combined_parts)
+    # Cap total to avoid exceeding LLM context
+    combined_text = combined_text[:20000]
+    
+    elements_list = "\n".join(f"- {name}" for name in element_names)
+    
+    prompt = f"""You are reviewing engineering drawing documentation for fence construction.
+
+The following fence elements/categories were identified in the drawings:
+{elements_list}
+
+Below is the text extracted from multiple pages of the drawing set. Some pages contain 
+plan views (showing where fences go), while others contain DETAIL pages with specifications 
+like fence height, post type, post spacing, wire gauge, top/bottom rails, materials, 
+coating, foundation details, etc.
+
+Your task: For EACH element listed above, find any detailed specifications mentioned 
+anywhere in the text below. Cross-reference by indicator numbers, element names, or 
+any matching descriptions.
+
+Text from drawing pages:
+<PAGES>
+{combined_text}
+</PAGES>
+
+Respond with a JSON array where each element has:
+- "element_name": the element name (must match one from the list above)
+- "height": fence height if found (e.g. "6'-0\"", "8 FT")
+- "post_type": post type/size (e.g. "2-1/2\" SS40 ROUND", "W6x9")
+- "post_spacing": post spacing (e.g. "10'-0\" O.C.", "10 FT MAX")
+- "top_rail": top rail details
+- "bottom_rail": bottom rail or tension wire details
+- "material": material/coating (e.g. "Galvanized", "Vinyl Coated")
+- "gauge": wire/mesh gauge (e.g. "9 gauge", "11 gauge")
+- "mesh_size": mesh/opening size (e.g. "2 inch")
+- "foundation": footing/foundation details
+- "gate_info": gate details if applicable
+- "detail_page": page number(s) where detail was found
+- "full_details": a concise text summary of ALL specifications found for this element
+- "notes": any other relevant notes or specs
+
+If no details are found for an element, still include it with empty strings.
+Only return the JSON array, no other text."""
+
+    try:
+        raw_response = llm.invoke(prompt) if hasattr(llm, "invoke") else llm(prompt)
+        response_text = getattr(raw_response, "content", str(raw_response))
+    except Exception as exc:
+        print(f"[DETAILS] ⚠️ LLM call failed: {exc}")
+        return {}
+    
+    result = {}
+    try:
+        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+        if json_match:
+            parsed = json.loads(json_match.group(0))
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("element_name", "")).strip()
+                    if not name:
+                        continue
+                    # Match to closest element_name from our list (case-insensitive)
+                    matched_name = None
+                    for en in element_names:
+                        if en.lower() == name.lower() or en.lower() in name.lower() or name.lower() in en.lower():
+                            matched_name = en
+                            break
+                    if not matched_name:
+                        matched_name = name
+                    
+                    result[matched_name] = {
+                        "height": str(item.get("height", "")).strip(),
+                        "post_type": str(item.get("post_type", "")).strip(),
+                        "post_spacing": str(item.get("post_spacing", "")).strip(),
+                        "top_rail": str(item.get("top_rail", "")).strip(),
+                        "bottom_rail": str(item.get("bottom_rail", "")).strip(),
+                        "material": str(item.get("material", "")).strip(),
+                        "gauge": str(item.get("gauge", "")).strip(),
+                        "mesh_size": str(item.get("mesh_size", "")).strip(),
+                        "foundation": str(item.get("foundation", "")).strip(),
+                        "gate_info": str(item.get("gate_info", "")).strip(),
+                        "detail_page": str(item.get("detail_page", "")).strip(),
+                        "full_details": str(item.get("full_details", "")).strip(),
+                        "notes": str(item.get("notes", "")).strip(),
+                    }
+    except Exception as e:
+        print(f"[DETAILS] JSON parse error: {e}")
+    
+    print(f"[DETAILS] Extracted details for {len(result)} elements")
+    for name, details in result.items():
+        summary = details.get('full_details', '')[:80]
+        print(f"[DETAILS]   {name}: {summary}...")
+    
+    return result
+
+
 def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Dict], all_tokens: List[Dict], ocr_lines: List[Dict] = None) -> List[Dict]:
     """
     Find instances of legend indicators ONLY within figure/architectural_drawing chunks.
@@ -1023,6 +1155,7 @@ try:
         find_lines_near_bbox,
         find_fence_run_from_indicator,
         infer_scale_from_page,
+        detect_scale_with_vision,
         VectorLine
     )
     VECTOR_UTILS_AVAILABLE = True
@@ -1459,10 +1592,23 @@ def measure_fence_elements(
     
     # Auto-infer scale if not provided
     if scale_factor is None:
+        # 1) Try regex on embedded text / OCR text
         scale_factor = infer_scale_from_page(page, ocr_text=ocr_text)
         if scale_factor:
-            print(f"[DEBUG] Auto-detected scale factor: {scale_factor}")
-        else:
+            print(f"[DEBUG] Auto-detected scale factor (regex): {scale_factor}")
+        # 2) Fall back to vision model (GPT-4V analyzes page image)
+        if scale_factor is None and llm is not None:
+            print("[DEBUG] Regex scale detection failed, trying vision model...")
+            try:
+                vision_result = detect_scale_with_vision(page, llm)
+                if vision_result.get('success') and vision_result.get('verified_scale'):
+                    scale_factor = vision_result['verified_scale']
+                    print(f"[DEBUG] Auto-detected scale factor (vision): {scale_factor}")
+                else:
+                    print(f"[DEBUG] Vision scale detection failed: {vision_result.get('message', 'unknown')}")
+            except Exception as e:
+                print(f"[DEBUG] Vision scale detection error: {e}")
+        if scale_factor is None:
             scale_factor = 1.0
             print("[DEBUG] Could not detect scale, using 1.0")
     layer_names = extract_layer_names(page)
