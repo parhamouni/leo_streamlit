@@ -391,7 +391,8 @@ def _lookup_element_details(category: str, element_details: dict) -> dict:
 
 def generate_measurement_spreadsheet(fence_pages, line_assignments, user_drawn_lines, page_categories, 
                                      session_state, per_page_scale_info, min_line_pts):
-    """Generate CSV data with measurements by page and category, enriched with element details."""
+    """Generate Excel workbook (bytes) with multiple sheets: Measurements, Summary, Element Specifications."""
+    import io
     rows = []
     element_details = session_state.get('element_details', {})
     
@@ -515,17 +516,51 @@ def generate_measurement_spreadsheet(fence_pages, line_assignments, user_drawn_l
         summary_rows.append(grand_row)
         
         summary_df = pd.DataFrame(summary_rows)
-        df = pd.concat([df, summary_df], ignore_index=True)
         
-        # Ensure column order
-        final_cols = [c for c in all_columns if c in df.columns]
-        df = df[final_cols]
+        # Ensure column order for measurements sheet (no detail cols cluttering it)
+        meas_cols = ['Page', 'Category', 'Type', 'Length (ft)', 'Length (pts)', 'Scale']
+        meas_final = [c for c in meas_cols if c in df.columns]
+        df_meas = df[meas_final]
         
-        return df.to_csv(index=False)
+        # Summary sheet: totals per category + grand total
+        summ_final = [c for c in all_columns if c in summary_df.columns]
+        df_summ = summary_df[summ_final]
+        
+        # Element Specifications sheet
+        el_details = element_details or {}
+        spec_rows = []
+        for elem_name, details in el_details.items():
+            if any(v for v in details.values() if v):
+                spec_rows.append({
+                    'Element': elem_name,
+                    'Height': details.get('height', ''),
+                    'Post Type': details.get('post_type', ''),
+                    'Post Spacing': details.get('post_spacing', ''),
+                    'Material': details.get('material', ''),
+                    'Gauge': details.get('gauge', ''),
+                    'Mesh Size': details.get('mesh_size', ''),
+                    'Foundation': details.get('foundation', ''),
+                    'Gate Info': details.get('gate_info', ''),
+                    'Detail Page': details.get('detail_page', ''),
+                    'Full Details': details.get('full_details', ''),
+                    'Notes': details.get('notes', ''),
+                })
+        df_specs = pd.DataFrame(spec_rows) if spec_rows else pd.DataFrame()
+        
+        # Write to Excel with multiple sheets
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+            df_meas.to_excel(writer, sheet_name='Measurements', index=False)
+            df_summ.to_excel(writer, sheet_name='Summary', index=False)
+            if not df_specs.empty:
+                df_specs.to_excel(writer, sheet_name='Element Specifications', index=False)
+        return buf.getvalue()
     
-    # Return empty CSV with headers if no data
-    empty_df = pd.DataFrame(columns=all_columns)
-    return empty_df.to_csv(index=False)
+    # Return empty Excel with headers if no data
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        pd.DataFrame(columns=all_columns).to_excel(writer, sheet_name='Measurements', index=False)
+    return buf.getvalue()
 
 
 # ==============================================================================
@@ -2529,7 +2564,7 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
     
     with dl_col2:
         # Generate spreadsheet
-        csv_data = generate_measurement_spreadsheet(
+        xlsx_data = generate_measurement_spreadsheet(
             st.session_state.fence_pages,
             st.session_state.line_assignments,
             st.session_state.user_drawn_lines,
@@ -2540,11 +2575,11 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         )
         base_name = os.path.splitext(st.session_state.uploaded_pdf_name)[0]
         st.download_button(
-            "📊 Download Measurements CSV",
-            csv_data,
-            f"{base_name}_measurements.csv",
-            "text/csv",
-            key="dl_measurement_csv"
+            "📊 Download Measurements Excel",
+            xlsx_data,
+            f"{base_name}_measurements.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_measurement_xlsx"
         )
 
 
