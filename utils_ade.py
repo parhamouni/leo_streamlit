@@ -886,6 +886,70 @@ def create_single_page_pdf(pdf_bytes: bytes, page_index: int) -> bytes:
     return out
 
 
+def create_multi_page_pdf(full_pdf_bytes: bytes, page_indices: List[int]) -> bytes:
+    """Create a PDF containing only the specified pages (preserving order).
+    
+    In the resulting PDF, pages are numbered 0..len(page_indices)-1,
+    so callers must map local index back to the original page index.
+    """
+    doc = fitz.open(stream=full_pdf_bytes, filetype="pdf")
+    new_doc = fitz.open()
+    for idx in page_indices:
+        new_doc.insert_pdf(doc, from_page=idx, to_page=idx)
+    out = new_doc.tobytes()
+    doc.close()
+    new_doc.close()
+    return out
+
+
+def create_page_batches(
+    full_pdf_bytes: bytes,
+    page_indices: List[int],
+    max_batch_bytes: int = 15 * 1024 * 1024,
+    max_pages_per_batch: int = 10
+) -> List[List[int]]:
+    """Split page indices into batches respecting estimated size and page count limits.
+    
+    Uses average page size from the full PDF as a heuristic. A 1.3x safety factor
+    accounts for PDF structure overhead. This avoids the expense of creating
+    temporary single-page PDFs just to measure their size.
+    
+    Args:
+        full_pdf_bytes: Complete PDF file bytes
+        page_indices: 0-indexed page numbers to include
+        max_batch_bytes: Max estimated PDF size per batch (default 15MB)
+        max_pages_per_batch: Hard cap on pages per batch (default 10)
+    
+    Returns:
+        List of page-index lists, one per batch
+    """
+    if not page_indices:
+        return []
+    
+    total_pdf_size = len(full_pdf_bytes)
+    try:
+        doc = fitz.open(stream=full_pdf_bytes, filetype="pdf")
+        total_pages_in_doc = len(doc)
+        doc.close()
+    except Exception:
+        total_pages_in_doc = max(page_indices) + 1
+    
+    avg_page_size = (total_pdf_size / max(total_pages_in_doc, 1)) * 1.3
+    max_by_size = max(1, int(max_batch_bytes / max(avg_page_size, 1)))
+    effective_max = min(max_by_size, max_pages_per_batch)
+    
+    print(f"[BATCH] PDF: {total_pdf_size/1024/1024:.1f}MB, {total_pages_in_doc} pages, "
+          f"~{avg_page_size/1024:.0f}KB/page -> max {effective_max} pages/batch")
+    
+    batches = []
+    for i in range(0, len(page_indices), effective_max):
+        batches.append(page_indices[i:i + effective_max])
+    
+    print(f"[BATCH] {len(batches)} batch(es) for {len(page_indices)} fence pages: "
+          + ", ".join(f"[{','.join(str(p+1) for p in b)}]" for b in batches))
+    return batches
+
+
 # ==============================================================================
 # 7. Fallback Page Classification (Keyword + LLM)
 # ==============================================================================

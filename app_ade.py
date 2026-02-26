@@ -24,7 +24,8 @@ from utils_vector import (
     measure_lines_in_selection,
     measure_at_click_point,
     infer_scale_from_page,
-    extract_vector_lines
+    extract_vector_lines,
+    verify_scale_with_bar
 )
 
 # Optional: LLM client
@@ -707,33 +708,28 @@ if st.session_state.run_analysis_triggered and \
     try:
         total_pages = st.session_state.doc_total_pages
         
-        # Process each page with pre-filtering
+        # =================================================================
+        # PHASE 1: Pre-filter ALL pages to identify fence pages
+        # Text extraction + keyword/LLM scan (no ADE yet)
+        # =================================================================
+        _page_cache = {}
+        _fence_page_indices = []
+        
         for page_idx in range(total_pages):
             page_num = page_idx + 1
-            st.session_state.total_pages_processed_count = page_num
-            prog_bar.progress(page_num / total_pages)
-            status_txt_area.text(f"Page {page_num}/{total_pages}: Checking for fence content...")
-            print(f"SESSION {current_session_id} LOG: Processing page {page_num}.")
+            prog_bar.progress(page_num / total_pages * 0.3)
+            status_txt_area.text(f"Phase 1 — Scanning page {page_num}/{total_pages} for fence content...")
+            print(f"SESSION {current_session_id} LOG: Pre-filtering page {page_num}.")
             
-            # Get page dimensions and image
             page = doc_proc[page_idx]
             pdf_width, pdf_height = page.rect.width, page.rect.height
-            page_img_bytes = page.get_pixmap(dpi=DISPLAY_IMAGE_DPI).tobytes("png")
             
-            # =====================================================================
-            # STEP 1: Extract text sources (PDF native + OCR)
-            # =====================================================================
             pdf_lines = ade.get_native_pdf_lines(page)
-            
-            single_page_pdf = ade.create_single_page_pdf(file_bytes, page_idx)
             ocr_lines = []
             if google_cloud_config:
+                single_page_pdf = ade.create_single_page_pdf(file_bytes, page_idx)
                 ocr_lines = ade.run_google_ocr_blocks(single_page_pdf, google_cloud_config, pdf_width, pdf_height)
             
-            # =====================================================================
-            # STEP 2: PRE-FILTER - Check if page is fence-related
-            # =====================================================================
-            status_txt_area.text(f"Page {page_num}/{total_pages}: Pre-filtering...")
             prefilter_result = ade.fallback_fence_detection(
                 pdf_lines=pdf_lines,
                 ocr_lines=ocr_lines,
@@ -741,6 +737,99 @@ if st.session_state.run_analysis_triggered and \
                 llm=llm_analysis_instance,
                 use_llm_confirmation=True
             )
+            
+            _page_cache[page_idx] = {
+                'pdf_lines': pdf_lines,
+                'ocr_lines': ocr_lines,
+                'prefilter_result': prefilter_result,
+            }
+            
+            if prefilter_result["fence_found"]:
+                _fence_page_indices.append(page_idx)
+        
+        print(f"SESSION {current_session_id} LOG: Phase 1 complete — "
+              f"{len(_fence_page_indices)}/{total_pages} fence pages detected")
+        
+        # =================================================================
+        # PHASE 2: Batch ADE for fence pages (smart batching by size)
+        # =================================================================
+        _ade_chunks_by_page = {}
+        
+        if use_ade and ade_key and _fence_page_indices:
+            _batches = ade.create_page_batches(file_bytes, _fence_page_indices)
+            
+            for _batch_idx, _batch in enumerate(_batches):
+                _batch_pages_str = ", ".join(str(i + 1) for i in _batch)
+                status_txt_area.text(
+                    f"Phase 2 — ADE batch {_batch_idx + 1}/{len(_batches)}: "
+                    f"pages {_batch_pages_str}..."
+                )
+                prog_bar.progress(0.3 + (_batch_idx + 1) / len(_batches) * 0.3)
+                
+                _batch_pdf = ade.create_multi_page_pdf(file_bytes, _batch)
+                print(f"SESSION {current_session_id} LOG: ADE batch {_batch_idx + 1}/{len(_batches)}: "
+                      f"{len(_batch)} pages, {len(_batch_pdf) / 1024:.0f}KB")
+                
+                _ade_response = ade.ade_parse_document(_batch_pdf, ade_key)
+                
+                if _ade_response["success"]:
+                    for _local_idx, _orig_idx in enumerate(_batch):
+                        _p = doc_proc[_orig_idx]
+                        _chunks = ade.align_ade_chunks_to_page(
+                            _ade_response, _local_idx,
+                            _p.rect.width, _p.rect.height
+                        )
+                        _ade_chunks_by_page[_orig_idx] = _chunks
+                        print(f"[APP] Page {_orig_idx + 1}: {len(_chunks)} ADE chunks from batch")
+                else:
+                    # Batch failed — fall back to per-page ADE for this batch
+                    print(f"[APP] ADE batch {_batch_idx + 1} failed: {_ade_response.get('error')}")
+                    status_txt_area.text(
+                        f"Phase 2 — Batch {_batch_idx + 1} failed, retrying pages individually..."
+                    )
+                    for _orig_idx in _batch:
+                        try:
+                            _single_pdf = ade.create_single_page_pdf(file_bytes, _orig_idx)
+                            _single_resp = ade.ade_parse_document(_single_pdf, ade_key)
+                            if _single_resp["success"]:
+                                _p = doc_proc[_orig_idx]
+                                _chunks = ade.align_ade_chunks_to_page(
+                                    _single_resp, 0,
+                                    _p.rect.width, _p.rect.height
+                                )
+                                _ade_chunks_by_page[_orig_idx] = _chunks
+                                print(f"[APP] Page {_orig_idx + 1}: {len(_chunks)} ADE chunks (individual retry)")
+                            else:
+                                _ade_chunks_by_page[_orig_idx] = None
+                                print(f"[APP] Page {_orig_idx + 1}: individual ADE also failed")
+                        except Exception as _e:
+                            _ade_chunks_by_page[_orig_idx] = None
+                            print(f"[APP] Page {_orig_idx + 1}: individual ADE error: {_e}")
+            
+            _ok = sum(1 for v in _ade_chunks_by_page.values() if v is not None)
+            print(f"SESSION {current_session_id} LOG: Phase 2 complete — "
+                  f"ADE results for {_ok}/{len(_fence_page_indices)} fence pages")
+        
+        # =================================================================
+        # PHASE 3: Process each page using cached pre-filter + ADE results
+        # =================================================================
+        for page_idx in range(total_pages):
+            page_num = page_idx + 1
+            st.session_state.total_pages_processed_count = page_num
+            prog_bar.progress(0.6 + page_num / total_pages * 0.4)
+            status_txt_area.text(f"Phase 3 — Processing page {page_num}/{total_pages}...")
+            print(f"SESSION {current_session_id} LOG: Processing page {page_num}.")
+            
+            # Get page dimensions and render image
+            page = doc_proc[page_idx]
+            pdf_width, pdf_height = page.rect.width, page.rect.height
+            page_img_bytes = page.get_pixmap(dpi=DISPLAY_IMAGE_DPI).tobytes("png")
+            
+            # Load cached pre-filter results
+            _cached = _page_cache[page_idx]
+            pdf_lines = _cached['pdf_lines']
+            ocr_lines = _cached['ocr_lines']
+            prefilter_result = _cached['prefilter_result']
             
             # Initialize variables
             chunks = []
@@ -757,33 +846,24 @@ if st.session_state.run_analysis_triggered and \
             
             if not fence_found:
                 # =====================================================================
-                # NON-FENCE PAGE: Skip ADE, build minimal result
+                # NON-FENCE PAGE: Skip, build minimal result
                 # =====================================================================
-                print(f"[APP] Page {page_num}: Pre-filter says NOT fence-related, skipping ADE.")
+                print(f"[APP] Page {page_num}: Not fence-related, skipping.")
                 detection_method = "none"
             else:
                 # =====================================================================
-                # STEP 3: FENCE PAGE - optionally send single page to ADE
+                # FENCE PAGE: Use pre-computed ADE chunks from batch
                 # =====================================================================
                 if use_ade and ade_key:
-                    print(f"[APP] Page {page_num}: Pre-filter detected fence content via {prefilter_result['method']}, sending to ADE...")
-                    status_txt_area.text(f"Page {page_num}/{total_pages}: Sending to ADE for detailed extraction...")
-                    
-                    ade_response = ade.ade_parse_document(single_page_pdf, ade_key)
-                    
-                    if not ade_response["success"]:
-                        # ADE failed - use pre-filter results as fallback
-                        print(f"[APP] Page {page_num}: ADE failed ({ade_response['error']}), using pre-filter results.")
+                    _ade_chunks = _ade_chunks_by_page.get(page_idx)
+                    if _ade_chunks is None:
+                        print(f"[APP] Page {page_num}: ADE failed for this page, using pre-filter fallback.")
                         fallback_result = prefilter_result
                         keyword_matches = prefilter_result.get("matched_lines", [])
                         detection_method = prefilter_result["method"]
                     else:
-                        # =====================================================================
-                        # STEP 4: Process ADE results (page_idx=0 since single-page PDF)
-                        # =====================================================================
-                        status_txt_area.text(f"Page {page_num}/{total_pages}: Extracting definitions...")
-                        
-                        chunks = ade.align_ade_chunks_to_page(ade_response, 0, pdf_width, pdf_height)
+                        status_txt_area.text(f"Phase 3 — Page {page_num}/{total_pages}: Extracting definitions...")
+                        chunks = _ade_chunks
                         legend_chunks, figure_chunks = ade.segment_chunks(chunks)
                 else:
                     # ADE disabled or no key: rely solely on pre-filter result
@@ -850,18 +930,43 @@ if st.session_state.run_analysis_triggered and \
                     instances = ade.find_instances_in_figures(definitions, figure_chunks, all_page_tokens, ocr_lines=ocr_lines)
                 
                 # =====================================================================
-                # STEP 6: Smart Fence Measurement (if enabled)
+                # STEP 6: Scale Detection + Smart Fence Measurement
                 # =====================================================================
+                page_key = f"page_{page_num}"
+                
+                # Detect scale ONCE using the full chain (vision GPT -> text LLM -> regex)
+                detected_scale = None
+                if page_key not in st.session_state.per_page_scale_info:
+                    try:
+                        status_txt_area.text(f"Phase 3 — Page {page_num}/{total_pages}: Detecting scale...")
+                        scale_info = verify_scale_with_bar(page, llm=llm_analysis_instance)
+                        st.session_state.per_page_scale_info[page_key] = scale_info
+                        if scale_info.get('success') and scale_info.get('verified_scale'):
+                            detected_scale = scale_info['verified_scale']
+                            print(f"[APP] Page {page_num}: Scale detected = {detected_scale} "
+                                  f"({scale_info.get('confidence', '?')}: {scale_info.get('scale_text', '')})")
+                        else:
+                            print(f"[APP] Page {page_num}: Scale not detected — {scale_info.get('message', '')}")
+                    except Exception as e:
+                        print(f"[APP] Page {page_num}: Scale detection error: {e}")
+                        st.session_state.per_page_scale_info[page_key] = {
+                            'success': False, 'verified_scale': None, 'message': str(e)
+                        }
+                else:
+                    scale_info = st.session_state.per_page_scale_info[page_key]
+                    detected_scale = scale_info.get('verified_scale')
+                
+                # Measure fence elements (pass detected scale so it skips its own detection)
                 measurement_result = {}
                 if enable_unified_measurement and (definitions or instances):
                     try:
-                        status_txt_area.text(f"Page {page_num}/{total_pages}: Measuring fence elements...")
-                        # Build OCR text for scale detection fallback
+                        status_txt_area.text(f"Phase 3 — Page {page_num}/{total_pages}: Measuring fence elements...")
                         ocr_full_text = "\n".join(line.get('text', '') for line in ocr_lines) if ocr_lines else None
                         measurement_result = ade.measure_fence_elements(
                             page, definitions, instances, 
-                            figure_chunks=figure_chunks,  # Pass figure areas for boundary
+                            figure_chunks=figure_chunks,
                             llm=llm_analysis_instance,
+                            scale_factor=detected_scale,
                             ocr_text=ocr_full_text
                         )
                     except Exception as e:
@@ -869,7 +974,6 @@ if st.session_state.run_analysis_triggered and \
                 
                 # Store auto-detected lines in unified measurement structure
                 # ONLY for layer-based detection (reliable) - skip LLM-guided fallback
-                page_key = f"page_{page_num}"
                 measurement_method = measurement_result.get('measurement_method', 'none') if measurement_result else 'none'
                 
                 if measurement_result and measurement_result.get('all_fence_lines') and measurement_method == 'layer':
@@ -920,15 +1024,7 @@ if st.session_state.run_analysis_triggered and \
                 elif measurement_method != 'layer':
                     print(f"[AUTO] Page {page_num}: skipping suggestions (method={measurement_method}, not layer-based)")
                 
-                # Store scale info (for all methods)
-                if measurement_result and measurement_result.get('page_info'):
-                    scale_factor = measurement_result['page_info'].get('scale_factor', 1.0)
-                    st.session_state.per_page_scale_info[page_key] = {
-                        'verified_scale': scale_factor,
-                        'text_scale': scale_factor,
-                        'success': measurement_result['page_info'].get('scale_detected', False),
-                        'method': measurement_result.get('measurement_method', 'unknown')
-                    }
+                # Scale info already stored above (before measurement)
                 
                 # Initialize categories from definitions (for all pages)
                 if page_key not in st.session_state.page_categories:
