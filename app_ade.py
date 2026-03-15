@@ -5,10 +5,12 @@ import toml
 import json
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import base64
 from pathlib import Path
 from io import BytesIO
+import gc
 import pandas as pd
 import fitz  # PyMuPDF
 from PIL import Image
@@ -129,6 +131,35 @@ def generate_page_images(page_idx, pdf_bytes, definitions, instances, pdf_width,
             return original_bytes, highlighted_bytes
     except Exception as e:
         print(f"SESSION {current_session_id} ERROR: Image generation failed: {e}")
+        return None, None
+
+
+@st.cache_data(show_spinner=False, max_entries=5)
+def get_page_image_on_demand(_pdf_bytes_hash, pdf_bytes, page_idx, definitions, instances, keyword_matches,
+                              pdf_width, pdf_height, highlight, measurement_lines=None):
+    """Regenerate page images on demand instead of storing in session_state.
+    Uses st.cache_data with max_entries to bound memory usage."""
+    try:
+        with fitz.open(stream=BytesIO(pdf_bytes), filetype="pdf") as doc:
+            page = doc.load_page(page_idx)
+            pix = page.get_pixmap(dpi=DISPLAY_IMAGE_DPI)
+            original_bytes = pix.tobytes("png")
+            del pix
+            
+            highlighted_bytes = None
+            if highlight:
+                if definitions or instances:
+                    highlighted_bytes = ade.highlight_page_image(
+                        original_bytes, definitions, instances, pdf_width, pdf_height
+                    )
+                elif keyword_matches:
+                    highlighted_bytes = ade.highlight_keyword_matches(
+                        original_bytes, keyword_matches, pdf_width, pdf_height
+                    )
+            
+            return original_bytes, highlighted_bytes
+    except Exception as e:
+        print(f"ERROR: On-demand image generation failed for page {page_idx}: {e}")
         return None, None
 
 
@@ -670,6 +701,13 @@ if uploaded_pdf_file_obj:
     print(f"SESSION {current_session_id} LOG: PDF uploaded: {uploaded_pdf_file_obj.name}")
     current_file_id = f"{uploaded_pdf_file_obj.name}_{uploaded_pdf_file_obj.size}"
     
+    # Guard: reject excessively large files to prevent OOM
+    MAX_FILE_SIZE_MB = 500
+    file_size_mb = uploaded_pdf_file_obj.size / (1024 * 1024)
+    if file_size_mb > MAX_FILE_SIZE_MB:
+        st.error(f"File too large ({file_size_mb:.0f} MB). Maximum is {MAX_FILE_SIZE_MB} MB to prevent memory issues.")
+        st.stop()
+    
     if st.session_state.last_uploaded_file_id != current_file_id:
         print(f"SESSION {current_session_id} LOG: New file detected. Resetting state for {current_file_id}.")
         # Preserve some settings across resets
@@ -719,6 +757,14 @@ if st.session_state.run_analysis_triggered and \
         doc_proc = fitz.open(stream=BytesIO(file_bytes), filetype="pdf")
         st.session_state.doc_total_pages = len(doc_proc)
         print(f"SESSION {current_session_id} LOG: PDF opened, {st.session_state.doc_total_pages} pages.")
+        
+        MAX_PAGES = 300
+        if st.session_state.doc_total_pages > MAX_PAGES:
+            st.error(f"PDF has {st.session_state.doc_total_pages} pages (max {MAX_PAGES}). Please split the document.")
+            st.session_state.processing_complete = True
+            st.session_state.analysis_halted_due_to_error = True
+            doc_proc.close()
+            st.stop()
     except Exception as e:
         st.error(f"Failed to open PDF: {e}")
         st.session_state.processing_complete = True
@@ -746,24 +792,78 @@ if st.session_state.run_analysis_triggered and \
         # =================================================================
         # PHASE 1: Pre-filter ALL pages to identify fence pages
         # Text extraction + keyword/LLM scan (no ADE yet)
+        #
+        # OPTIMIZATION: Split into 3 sub-steps:
+        #   1a. Extract native PDF text (CPU, fast, sequential — needs fitz page)
+        #   1b. Run Google OCR in parallel (I/O-bound network calls)
+        #   1c. Run fence detection (may need LLM, sequential)
         # =================================================================
         _page_cache = {}
         _fence_page_indices = []
         
+        # --- Step 1a: Extract native PDF text + prepare OCR inputs (fast, sequential) ---
+        _pdf_lines_by_page = {}
+        _page_dims = {}
+        _single_page_pdfs = {}  # Cache for reuse in Phase 2 fallback
+        
+        status_txt_area.text(f"Phase 1a — Extracting text from {total_pages} pages...")
+        for page_idx in range(total_pages):
+            page = doc_proc[page_idx]
+            _page_dims[page_idx] = (page.rect.width, page.rect.height)
+            _pdf_lines_by_page[page_idx] = ade.get_native_pdf_lines(page)
+        
+        # Batch-create single-page PDFs for OCR (reused in Phase 2 fallback)
+        # Uses one fitz.open() instead of N separate open/close cycles
+        if google_cloud_config:
+            for page_idx in range(total_pages):
+                _tmp = fitz.open()
+                _tmp.insert_pdf(doc_proc, from_page=page_idx, to_page=page_idx)
+                _single_page_pdfs[page_idx] = _tmp.tobytes()
+                _tmp.close()
+        
+        # --- Step 1b: Run Google OCR in parallel across all pages ---
+        _ocr_lines_by_page = {i: [] for i in range(total_pages)}
+        
+        if google_cloud_config:
+            status_txt_area.text(f"Phase 1b — Running OCR on {total_pages} pages in parallel...")
+            
+            def _run_ocr_for_page(page_idx):
+                """Worker function for parallel OCR."""
+                pdf_w, pdf_h = _page_dims[page_idx]
+                return page_idx, ade.run_google_ocr_blocks(
+                    _single_page_pdfs[page_idx], google_cloud_config, pdf_w, pdf_h
+                )
+            
+            # Use up to 4 parallel OCR workers (API rate-limited, don't overwhelm)
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = {executor.submit(_run_ocr_for_page, pi): pi for pi in range(total_pages)}
+                completed = 0
+                for future in as_completed(futures):
+                    completed += 1
+                    prog_bar.progress(completed / total_pages * 0.15)
+                    try:
+                        pi, ocr_result = future.result()
+                        _ocr_lines_by_page[pi] = ocr_result
+                    except Exception as e:
+                        pi = futures[future]
+                        print(f"SESSION {current_session_id} WARNING: OCR failed for page {pi + 1}: {e}")
+            
+            print(f"SESSION {current_session_id} LOG: Phase 1b complete — OCR done for {total_pages} pages")
+            
+            # Free single-page PDFs after OCR — they can be recreated on-demand for ADE fallback
+            _single_page_pdfs.clear()
+            gc.collect()
+            print(f"SESSION {current_session_id} LOG: Freed single-page PDF cache after OCR")
+        
+        # --- Step 1c: Run fence detection (keyword scan + optional LLM, sequential) ---
         for page_idx in range(total_pages):
             page_num = page_idx + 1
-            prog_bar.progress(page_num / total_pages * 0.3)
-            status_txt_area.text(f"Phase 1 — Scanning page {page_num}/{total_pages} for fence content...")
+            prog_bar.progress(0.15 + page_num / total_pages * 0.15)
+            status_txt_area.text(f"Phase 1c — Classifying page {page_num}/{total_pages}...")
             print(f"SESSION {current_session_id} LOG: Pre-filtering page {page_num}.")
             
-            page = doc_proc[page_idx]
-            pdf_width, pdf_height = page.rect.width, page.rect.height
-            
-            pdf_lines = ade.get_native_pdf_lines(page)
-            ocr_lines = []
-            if google_cloud_config:
-                single_page_pdf = ade.create_single_page_pdf(file_bytes, page_idx)
-                ocr_lines = ade.run_google_ocr_blocks(single_page_pdf, google_cloud_config, pdf_width, pdf_height)
+            pdf_lines = _pdf_lines_by_page[page_idx]
+            ocr_lines = _ocr_lines_by_page[page_idx]
             
             prefilter_result = ade.fallback_fence_detection(
                 pdf_lines=pdf_lines,
@@ -855,10 +955,10 @@ if st.session_state.run_analysis_triggered and \
             status_txt_area.text(f"Phase 3 — Processing page {page_num}/{total_pages}...")
             print(f"SESSION {current_session_id} LOG: Processing page {page_num}.")
             
-            # Get page dimensions and render image
+            # Get page dimensions (cheap) — defer image rendering to fence pages only
             page = doc_proc[page_idx]
             pdf_width, pdf_height = page.rect.width, page.rect.height
-            page_img_bytes = page.get_pixmap(dpi=DISPLAY_IMAGE_DPI).tobytes("png")
+            page_img_bytes = None  # Rendered lazily below only for fence pages
             
             # Load cached pre-filter results
             _cached = _page_cache[page_idx]
@@ -881,10 +981,24 @@ if st.session_state.run_analysis_triggered and \
             
             if not fence_found:
                 # =====================================================================
-                # NON-FENCE PAGE: Skip, build minimal result
+                # NON-FENCE PAGE: Build minimal result and skip to next page
                 # =====================================================================
                 print(f"[APP] Page {page_num}: Not fence-related, skipping.")
-                detection_method = "none"
+                st.session_state.non_fence_pages.append({
+                    'page_number': page_num,
+                    'page_index_in_original_doc': page_idx,
+                    'fence_found': False,
+                })
+                with col_nf:
+                    with st.expander(f"Page {page_num}", expanded=False):
+                        st.info("No fence-related items found on this page.")
+                # Update summary
+                summary_placeholder.markdown(
+                    f"### Summary (Processed: {page_num}/{total_pages})\n"
+                    f"- ✅ Fence: {len(st.session_state.fence_pages)}\n"
+                    f"- ❌ Non-Fence: {len(st.session_state.non_fence_pages)}"
+                )
+                continue
             else:
                 # =====================================================================
                 # FENCE PAGE: Use pre-computed ADE chunks from batch
@@ -992,6 +1106,8 @@ if st.session_state.run_analysis_triggered and \
                     detected_scale = scale_info.get('verified_scale')
                 
                 # Measure fence elements (pass detected scale so it skips its own detection)
+                # OPTIMIZATION: Always pass a value (default 1.0) to prevent
+                # measure_fence_elements from re-running scale detection (redundant vision LLM call)
                 measurement_result = {}
                 if enable_unified_measurement and (definitions or instances):
                     try:
@@ -1001,7 +1117,7 @@ if st.session_state.run_analysis_triggered and \
                             page, definitions, instances, 
                             figure_chunks=figure_chunks,
                             llm=llm_analysis_instance,
-                            scale_factor=detected_scale,
+                            scale_factor=detected_scale or 1.0,
                             ocr_text=ocr_full_text
                         )
                     except Exception as e:
@@ -1141,11 +1257,13 @@ if st.session_state.run_analysis_triggered and \
             elif fallback_result and fallback_result.get("matched_keywords"):
                 text_snippet = "Keywords: " + ", ".join(fallback_result["matched_keywords"][:5])
             
-            # Generate images
+            # Generate images — render only for fence pages (lazy)
+            if fence_found and page_img_bytes is None:
+                page_img_bytes = page.get_pixmap(dpi=DISPLAY_IMAGE_DPI).tobytes("png")
             original_img_bytes = page_img_bytes
             highlighted_img_bytes = None
             
-            if highlight_fence_text_app:
+            if highlight_fence_text_app and page_img_bytes:
                 if definitions or instances:
                     # Primary highlighting: definitions (green) + instances (purple)
                     highlighted_img_bytes = ade.highlight_page_image(
@@ -1169,6 +1287,15 @@ if st.session_state.run_analysis_triggered and \
             # detection_method already set above based on flow
             llm_result = fallback_result.get("llm_result") if fallback_result else None
             
+            # Strip heavy VectorLine objects from measurement_result before storing
+            # Keep only summary data (totals, indicator_measurements, layer info)
+            measurement_result_light = {}
+            if measurement_result:
+                measurement_result_light = {
+                    k: v for k, v in measurement_result.items()
+                    if k != 'all_fence_lines'
+                }
+            
             analysis_result = {
                 'page_number': page_num,
                 'page_index_in_original_doc': page_idx,
@@ -1183,15 +1310,13 @@ if st.session_state.run_analysis_triggered and \
                 'text_snippet': text_snippet,
                 'definitions': definitions,
                 'instances': instances,
-                'instances': instances,
-                'keyword_matches': keyword_matches,  # NEW: Store keyword matches
-                'fallback_result': fallback_result,  # NEW: Store fallback result
-                'measurements': measurement_result,  # NEW: Store measurements
-                'detection_method': detection_method,  # NEW: Track how fence was detected
-                'fence_text_boxes_details': definitions + instances + keyword_matches,  # Combined for compatibility
+                'keyword_matches': keyword_matches,
+                'fallback_result': fallback_result,
+                'measurements': measurement_result_light,
+                'detection_method': detection_method,
                 'highlight_fence_text_app_setting': highlight_fence_text_app,
-                'original_image_bytes': original_img_bytes,
-                'highlighted_image_bytes': highlighted_img_bytes,
+                'original_image_bytes': None,
+                'highlighted_image_bytes': None,
                 'pdf_width': pdf_width,
                 'pdf_height': pdf_height,
                 'chunk_count': len(chunks),
@@ -1199,18 +1324,13 @@ if st.session_state.run_analysis_triggered and \
                 'figure_count': len(figure_chunks),
             }
             
-            # Add to appropriate list
-            if fence_found:
-                st.session_state.fence_pages.append(analysis_result)
-            else:
-                st.session_state.non_fence_pages.append(analysis_result)
+            # Add to fence pages list (non-fence pages handled via early continue above)
+            st.session_state.fence_pages.append(analysis_result)
             
-            # Display in appropriate column (matching app.py)
-            target_col = col_f if fence_found else col_nf
-            
-            with target_col:
+            # Display in fence column (non-fence pages handled via early continue above)
+            with col_f:
                 exp_title = f"Page {page_num}"
-                if fence_found:
+                if True:
                     reasons = []
                     if definitions:
                         reasons.append("Definitions")
@@ -1392,6 +1512,12 @@ if st.session_state.run_analysis_triggered and \
             
             time.sleep(0.05)
         
+        # Free Phase 1/2 caches to reduce memory (especially for large PDFs)
+        del _page_cache, _pdf_lines_by_page, _ocr_lines_by_page, _ade_chunks_by_page
+        _single_page_pdfs.clear()
+        gc.collect()
+        print(f"SESSION {current_session_id} LOG: Freed processing caches, gc.collect() done")
+        
         # =====================================================================
         # CROSS-PAGE DETAIL EXTRACTION
         # After all pages processed, extract detailed specs for each element
@@ -1533,20 +1659,35 @@ elif st.session_state.processing_complete:
                     img_col_r, det_col_r = st.columns([2, 1])
                     
                     with img_col_r:
-                        disp_img_r = res_data_item.get('highlighted_image_bytes') or res_data_item.get('original_image_bytes')
+                        # Regenerate images on demand (not stored in session_state)
+                        _orig_r, _hl_r = None, None
+                        if res_data_item.get('fence_found') and st.session_state.original_pdf_bytes:
+                            _defs_hashable = tuple(tuple(sorted(d.items())) for d in definitions) if definitions else ()
+                            _inst_hashable = tuple(tuple(sorted(i.items())) for i in instances) if instances else ()
+                            _kw_hashable = tuple(tuple(sorted(k.items())) for k in keyword_matches if all(key in k for key in ['x0','y0','x1','y1'])) if keyword_matches else ()
+                            _orig_r, _hl_r = get_page_image_on_demand(
+                                st.session_state.current_pdf_hash,
+                                st.session_state.original_pdf_bytes,
+                                res_data_item['page_index_in_original_doc'],
+                                _defs_hashable, _inst_hashable, _kw_hashable,
+                                res_data_item.get('pdf_width', 792),
+                                res_data_item.get('pdf_height', 612),
+                                res_data_item.get('highlight_fence_text_app_setting', True),
+                            )
+                        disp_img_r = _hl_r or _orig_r
                         if disp_img_r:
                             st.image(disp_img_r, caption=f"Page {res_data_item['page_number']}")
                         
                         dl_links_rerun = []
-                        if res_data_item.get('highlighted_image_bytes'):
+                        if _hl_r:
                             dl_links_rerun.append(get_image_download_link_html(
-                                res_data_item['highlighted_image_bytes'],
+                                _hl_r,
                                 f"page_{res_data_item['page_number']}_hl.png",
                                 "DL HL Img"
                             ))
-                        if res_data_item.get('original_image_bytes'):
+                        if _orig_r:
                             dl_links_rerun.append(get_image_download_link_html(
-                                res_data_item['original_image_bytes'],
+                                _orig_r,
                                 f"page_{res_data_item['page_number']}_orig.png",
                                 "DL Orig Img"
                             ))
@@ -2105,6 +2246,10 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         effective_scale = page_scale_input
         line_stats_key = f"line_stats_{page_num}_{min_line_pts}_{effective_scale}"
         if line_stats_key not in st.session_state:
+            # Evict old line_stats for this page (accumulate on every scale change)
+            for k in [k for k in list(st.session_state.keys())
+                      if k.startswith(f"line_stats_{page_num}_") and k != line_stats_key]:
+                del st.session_state[k]
             stats = []
             for i, line in enumerate(lines):
                 length_inches = line.length_pts / 72.0
@@ -2120,14 +2265,39 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             st.session_state[line_stats_key] = stats
         line_stats = st.session_state[line_stats_key]
         
-        # Get base image (highlighted if available)
+        # Get base image on demand (regenerate instead of reading from session_state)
         base_img_bytes = page_data.get('highlighted_image_bytes') or page_data.get('original_image_bytes')
+        if not base_img_bytes and st.session_state.original_pdf_bytes:
+            # Regenerate on demand
+            _defs = page_data.get('definitions', [])
+            _insts = page_data.get('instances', [])
+            _kws = page_data.get('keyword_matches', [])
+            _defs_h = tuple(tuple(sorted(d.items())) for d in _defs) if _defs else ()
+            _insts_h = tuple(tuple(sorted(i.items())) for i in _insts) if _insts else ()
+            _kws_h = tuple(tuple(sorted(k.items())) for k in _kws if all(key in k for key in ['x0','y0','x1','y1'])) if _kws else ()
+            _orig_img, _hl_img = get_page_image_on_demand(
+                st.session_state.current_pdf_hash,
+                st.session_state.original_pdf_bytes,
+                page_idx, _defs_h, _insts_h, _kws_h,
+                pdf_width, pdf_height,
+                page_data.get('highlight_fence_text_app_setting', True),
+            )
+            base_img_bytes = _hl_img or _orig_img
         
         if base_img_bytes:
             
             # OPTIMIZATION 1: Cache resized base image (keyed by page + zoom)
+            # Evict old zoom levels for this page to bound memory
             base_img_cache_key = f"base_img_{page_num}_{zoom_level}"
             if base_img_cache_key not in st.session_state:
+                # Evict previous zoom level caches for this page
+                for k in [k for k in list(st.session_state.keys())
+                          if (k.startswith(f"base_img_{page_num}_") or
+                              k.startswith(f"base_img_size_{page_num}_") or
+                              k.startswith(f"drawn_img_{page_num}_"))
+                          and k != base_img_cache_key]:
+                    del st.session_state[k]
+                
                 base_img = Image.open(BytesIO(base_img_bytes)).convert('RGB')
                 orig_width, orig_height = base_img.size
                 ratio = zoom_level / orig_width
@@ -2135,11 +2305,16 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                 new_height = int(orig_height * ratio)
                 # Use LANCZOS for high quality resize
                 base_img = base_img.resize((new_width, new_height), Image.LANCZOS)
-                st.session_state[base_img_cache_key] = base_img
+                # Store as compressed PNG bytes (~10x less memory than raw PIL)
+                _buf = BytesIO()
+                base_img.save(_buf, format='PNG', optimize=True)
+                st.session_state[base_img_cache_key] = _buf.getvalue()
                 st.session_state[f"base_img_size_{page_num}_{zoom_level}"] = (new_width, new_height)
                 st.session_state[f"orig_img_size_{page_num}"] = (orig_width, orig_height)
+                del base_img, _buf
             
-            base_img_cached = st.session_state[base_img_cache_key]
+            # Decompress on demand (~5ms, negligible vs rendering)
+            base_img_cached = Image.open(BytesIO(st.session_state[base_img_cache_key]))
             img_width, img_height = st.session_state[f"base_img_size_{page_num}_{zoom_level}"]
             
             # Scale factors from PDF to image coordinates
@@ -2156,6 +2331,10 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             # Auto lines are now part of line_assignments, no separate cache key needed
             
             if drawn_img_cache_key not in st.session_state:
+                # Evict old drawn images for this page (they leak on every assignment change)
+                for k in [k for k in list(st.session_state.keys())
+                          if k.startswith(f"drawn_img_{page_num}_") and k != drawn_img_cache_key]:
+                    del st.session_state[k]
                 # Copy base image and draw assignments
                 display_img = base_img_cached.copy()
                 draw = ImageDraw.Draw(display_img)
