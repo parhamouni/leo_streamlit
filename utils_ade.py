@@ -715,8 +715,26 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
     
     instances = []
     
+    def normalize_indicator(s):
+        """Normalize dotted indicator numbers by stripping leading zeros from each segment.
+        E.g. '2.09' -> '2.9', '02.03' -> '2.3', '2.9' -> '2.9'.
+        Non-numeric parts are left unchanged."""
+        parts = s.split('.')
+        normalized_parts = []
+        for p in parts:
+            # Strip leading zeros from numeric segments, but keep at least one digit
+            if p.lstrip('0').isdigit():
+                normalized_parts.append(p.lstrip('0') or '0')
+            elif p.isdigit() or (p and p[0].isdigit()):
+                normalized_parts.append(p.lstrip('0') or '0')
+            else:
+                normalized_parts.append(p)
+        return '.'.join(normalized_parts)
+    
     # Collect all indicators to search for
     indicators_to_find = set()
+    # Map from normalized form -> original indicator string
+    norm_to_original = {}
     for item in legend_entries:
         ind = item.get("indicator", "").strip()
         if ind:
@@ -725,8 +743,15 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
             clean_ind = re.sub(r'[^\w]', '', ind)
             if clean_ind:
                 indicators_to_find.add(clean_ind)
+            # Build normalized lookup: normalized form -> original indicator
+            norm_key = normalize_indicator(ind)
+            norm_to_original.setdefault(norm_key, ind)
+            if clean_ind:
+                norm_clean = normalize_indicator(clean_ind)
+                norm_to_original.setdefault(norm_clean, ind)
     
     print(f"[DEBUG] Looking for indicators: {indicators_to_find}")
+    print(f"[DEBUG] Normalized indicator map: {norm_to_original}")
     
     if not indicators_to_find:
         return []
@@ -794,6 +819,15 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
             if ind.startswith("(") and token_text == ind:
                 matched_indicator = ind
                 break
+        
+        # Fallback: normalized numeric matching (handles "2.09" == "2.9")
+        if not matched_indicator:
+            # Strip parentheses/brackets from token for normalization
+            stripped = token_text.strip('()[] ')
+            norm_token = normalize_indicator(stripped)
+            if norm_token in norm_to_original:
+                matched_indicator = norm_to_original[norm_token]
+                print(f"[DEBUG] Normalized match: token '{token_text}' -> '{norm_token}' matched indicator '{matched_indicator}'")
         
         if matched_indicator:
             # Skip if in legend area (we already have it as definition)
