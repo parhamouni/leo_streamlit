@@ -250,7 +250,49 @@ def run_google_ocr_blocks(page_bytes: bytes, google_cloud_config: Dict, pdf_widt
             "source": "ocr_paragraph"
         })
 
-    print(f"[DEBUG] OCR extraction complete. Found {len(ocr_lines)} paragraphs.")
+    # Also extract at token/word level — captures small individual indicator callouts
+    # (like circled "2.09") that paragraph-level extraction misses or groups
+    token_count = 0
+    existing_positions = set((round(l['x0']), round(l['y0']), l['text']) for l in ocr_lines)
+    
+    # Try page-level tokens first, fall back to words within lines
+    token_source = list(getattr(ocr_page, 'tokens', None) or [])
+    if not token_source:
+        for line in getattr(ocr_page, 'lines', []):
+            for word in getattr(line, 'words', []):
+                token_source.append(word)
+    
+    for token in token_source:
+        layout = token.layout
+        text_content = ""
+        for segment in layout.text_anchor.text_segments:
+            text_content += doc_result.text[segment.start_index:segment.end_index]
+        text_content = text_content.strip()
+        if not text_content:
+            continue
+        
+        vertices = layout.bounding_poly.normalized_vertices
+        if not vertices:
+            continue
+        xs = [v.x * img_width * scale_x for v in vertices if v.x is not None]
+        ys = [v.y * img_height * scale_y for v in vertices if v.y is not None]
+        if not xs or not ys:
+            continue
+        
+        x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+        pos_key = (round(x0), round(y0), text_content)
+        if pos_key in existing_positions:
+            continue
+        existing_positions.add(pos_key)
+        
+        ocr_lines.append({
+            "text": text_content,
+            "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+            "source": "ocr_token"
+        })
+        token_count += 1
+
+    print(f"[DEBUG] OCR extraction complete. Found {len(ocr_lines)} items ({len(ocr_lines) - token_count} paragraphs + {token_count} tokens).")
     doc.close()
     return ocr_lines
 
@@ -672,24 +714,32 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
     print("[DEBUG] Finding Instances in Figure Chunks...")
     print(f"[DEBUG] Figure chunks count: {len(figure_chunks)}")
     
-    # Fallback: if no embedded text tokens, use OCR lines as token source
-    if not all_tokens and ocr_lines:
-        print(f"[DEBUG] No embedded text tokens, using {len(ocr_lines)} OCR lines as fallback")
-        # Split OCR lines into individual word-level tokens for better matching
+    # Always merge OCR tokens into the search pool alongside native PDF tokens.
+    # Native PDF text often misses indicator callouts in drawings (they're graphical),
+    # but OCR can read them. We deduplicate by position to avoid double-counting.
+    if ocr_lines:
+        existing_positions = set()
+        for t in all_tokens:
+            existing_positions.add((round(t['x0']), round(t['y0']), t.get('text', '')))
+        
+        ocr_added = 0
         for ocr_line in ocr_lines:
             text = ocr_line.get('text', '').strip()
             if not text:
                 continue
-            # For short text (likely a single token/number), use as-is
             words = text.split()
             if len(words) <= 1:
-                all_tokens.append({
-                    'text': text,
-                    'x0': ocr_line.get('x0', 0),
-                    'y0': ocr_line.get('y0', 0),
-                    'x1': ocr_line.get('x1', 0),
-                    'y1': ocr_line.get('y1', 0),
-                })
+                pos_key = (round(ocr_line.get('x0', 0)), round(ocr_line.get('y0', 0)), text)
+                if pos_key not in existing_positions:
+                    all_tokens.append({
+                        'text': text,
+                        'x0': ocr_line.get('x0', 0),
+                        'y0': ocr_line.get('y0', 0),
+                        'x1': ocr_line.get('x1', 0),
+                        'y1': ocr_line.get('y1', 0),
+                    })
+                    existing_positions.add(pos_key)
+                    ocr_added += 1
             else:
                 # For multi-word OCR blocks, split into words with approximate positions
                 total_len = sum(len(w) for w in words)
@@ -701,15 +751,19 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
                 cursor = x0
                 for w in words:
                     w_span = (len(w) / max(total_len, 1)) * span
-                    all_tokens.append({
-                        'text': w,
-                        'x0': cursor,
-                        'y0': y0,
-                        'x1': cursor + w_span,
-                        'y1': y1,
-                    })
+                    pos_key = (round(cursor), round(y0), w)
+                    if pos_key not in existing_positions:
+                        all_tokens.append({
+                            'text': w,
+                            'x0': cursor,
+                            'y0': y0,
+                            'x1': cursor + w_span,
+                            'y1': y1,
+                        })
+                        existing_positions.add(pos_key)
+                        ocr_added += 1
                     cursor += w_span
-        print(f"[DEBUG] Created {len(all_tokens)} tokens from OCR lines")
+        print(f"[DEBUG] Merged {ocr_added} OCR tokens into {len(all_tokens)} total tokens (deduped)")
     for i, fc in enumerate(figure_chunks):
         print(f"[DEBUG]   Figure {i}: type={fc.get('type')} bbox=({fc['x0']:.1f}, {fc['y0']:.1f}) - ({fc['x1']:.1f}, {fc['y1']:.1f})")
     
@@ -739,14 +793,16 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
         ind = item.get("indicator", "").strip()
         if ind:
             indicators_to_find.add(ind)
-            # Also add cleaned version (remove special chars)
+            # Also add cleaned version (remove special chars like parentheses)
+            # but NOT for dotted numeric indicators (e.g. "2.8" -> "28" would
+            # match random numbers like dimensions/grid refs)
             clean_ind = re.sub(r'[^\w]', '', ind)
-            if clean_ind:
+            if clean_ind and clean_ind != ind and not clean_ind.isdigit():
                 indicators_to_find.add(clean_ind)
             # Build normalized lookup: normalized form -> original indicator
             norm_key = normalize_indicator(ind)
             norm_to_original.setdefault(norm_key, ind)
-            if clean_ind:
+            if clean_ind and clean_ind != ind and not clean_ind.isdigit():
                 norm_clean = normalize_indicator(clean_ind)
                 norm_to_original.setdefault(norm_clean, ind)
     
@@ -835,11 +891,18 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
                 print(f"[DEBUG] Skipping '{matched_indicator}' at ({token['x0']:.1f}, {token['y0']:.1f}) - in legend area")
                 continue
             
-            # Create position key to avoid duplicates
-            pos_key = (round(token['x0']), round(token['y0']))
-            if pos_key in found_positions:
+            # Proximity-based dedup: skip if we already found the same indicator
+            # within 30 PDF units (native + OCR often see the same callout at
+            # slightly different coordinates)
+            tx, ty = (token['x0'] + token['x1']) / 2, (token['y0'] + token['y1']) / 2
+            is_dup = False
+            for prev_ind, prev_x, prev_y in found_positions:
+                if prev_ind == matched_indicator and abs(tx - prev_x) < 30 and abs(ty - prev_y) < 30:
+                    is_dup = True
+                    break
+            if is_dup:
                 continue
-            found_positions.add(pos_key)
+            found_positions.add((matched_indicator, tx, ty))
             
             instances.append({
                 "indicator": matched_indicator,
