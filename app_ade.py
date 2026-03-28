@@ -38,6 +38,9 @@ HIGHLIGHT_COLOR_UI = (0, 0.9, 0)  # Green for definitions
 HIGHLIGHT_COLOR_INSTANCE = (0.9, 0, 0.9)  # Purple for instances
 HIGHLIGHT_WIDTH_UI = 2.0
 DISPLAY_IMAGE_DPI = 150
+ANALYSIS_LOCK_PATH = "/tmp/fence_analysis.lock"
+ANALYSIS_LOCK_TTL_SECONDS = 4 * 60 * 60
+MAX_ANALYSIS_SECONDS = 30 * 60
 
 st.set_page_config(page_title="ADE Fence Detector", layout="wide")
 st.markdown("""<style> /* Your CSS */ </style>""", unsafe_allow_html=True)
@@ -94,6 +97,53 @@ def initialize_session_state(session_id_val):
                                     value
         elif key == 'session_id' and st.session_state.session_id != session_id_val:
             st.session_state.session_id = session_id_val
+
+
+def acquire_analysis_lock(session_id: str):
+    """Ensure only one heavyweight analysis runs at a time."""
+    now = int(time.time())
+    owner = {}
+
+    if os.path.exists(ANALYSIS_LOCK_PATH):
+        try:
+            with open(ANALYSIS_LOCK_PATH, "r", encoding="utf-8") as f:
+                owner = json.load(f)
+        except Exception:
+            owner = {}
+
+        started_at = int(owner.get("started_at", 0) or 0)
+        if started_at and (now - started_at) <= ANALYSIS_LOCK_TTL_SECONDS:
+            return False, owner
+        # Stale or malformed lock
+        try:
+            os.remove(ANALYSIS_LOCK_PATH)
+        except Exception:
+            pass
+
+    lock_data = {
+        "session_id": session_id,
+        "pid": os.getpid(),
+        "started_at": now,
+    }
+    with open(ANALYSIS_LOCK_PATH, "w", encoding="utf-8") as f:
+        json.dump(lock_data, f)
+    return True, lock_data
+
+
+def release_analysis_lock(session_id: str):
+    if not os.path.exists(ANALYSIS_LOCK_PATH):
+        return
+    try:
+        with open(ANALYSIS_LOCK_PATH, "r", encoding="utf-8") as f:
+            owner = json.load(f)
+    except Exception:
+        owner = {}
+
+    if owner.get("session_id") == session_id:
+        try:
+            os.remove(ANALYSIS_LOCK_PATH)
+        except Exception:
+            pass
 
 
 current_session_id = get_session_id()
@@ -733,8 +783,12 @@ if uploaded_pdf_file_obj:
        not st.session_state.run_analysis_triggered and \
        not st.session_state.processing_complete and \
        not st.session_state.analysis_halted_due_to_error:
-        print(f"SESSION {current_session_id} LOG: Triggering analysis.")
-        st.session_state.run_analysis_triggered = True
+        if st.button("▶ Start Analysis", type="primary", key="start_analysis_btn"):
+            print(f"SESSION {current_session_id} LOG: Triggering analysis.")
+            st.session_state.run_analysis_triggered = True
+            st.rerun()
+        else:
+            st.info("Ready to run. Click Start Analysis to begin processing.")
 
 
 # ==============================================================================
@@ -747,9 +801,24 @@ if st.session_state.run_analysis_triggered and \
    (ade_key or not use_ade) and \
    not st.session_state.analysis_halted_due_to_error and \
    not st.session_state.processing_complete:
-    
+
+    lock_acquired, lock_info = acquire_analysis_lock(current_session_id)
+    if not lock_acquired:
+        holder = lock_info.get("session_id", "another session")
+        st.warning(f"Another analysis is already running ({holder}). Please wait for it to finish.")
+        st.stop()
+
     print(f"SESSION {current_session_id} LOG: Starting ADE-based PDF processing.")
     file_bytes = st.session_state.original_pdf_bytes
+    analysis_started_at = time.time()
+
+    def _assert_time_budget(stage: str):
+        elapsed = time.time() - analysis_started_at
+        if elapsed > MAX_ANALYSIS_SECONDS:
+            raise TimeoutError(
+                f"Analysis exceeded {MAX_ANALYSIS_SECONDS // 60} minutes during {stage}. "
+                "Please split the PDF and retry."
+            )
     
     # Open PDF to get page count
     doc_proc = None
@@ -808,6 +877,7 @@ if st.session_state.run_analysis_triggered and \
         
         status_txt_area.text(f"Phase 1a — Extracting text from {total_pages} pages...")
         for page_idx in range(total_pages):
+            _assert_time_budget("Phase 1a")
             page = doc_proc[page_idx]
             _page_dims[page_idx] = (page.rect.width, page.rect.height)
             _pdf_lines_by_page[page_idx] = ade.get_native_pdf_lines(page)
@@ -839,6 +909,7 @@ if st.session_state.run_analysis_triggered and \
                 futures = {executor.submit(_run_ocr_for_page, pi): pi for pi in range(total_pages)}
                 completed = 0
                 for future in as_completed(futures):
+                    _assert_time_budget("Phase 1b")
                     completed += 1
                     prog_bar.progress(completed / total_pages * 0.15)
                     try:
@@ -857,6 +928,7 @@ if st.session_state.run_analysis_triggered and \
         
         # --- Step 1c: Run fence detection (keyword scan + optional LLM, sequential) ---
         for page_idx in range(total_pages):
+            _assert_time_budget("Phase 1c")
             page_num = page_idx + 1
             prog_bar.progress(0.15 + page_num / total_pages * 0.15)
             status_txt_area.text(f"Phase 1c — Classifying page {page_num}/{total_pages}...")
@@ -894,6 +966,7 @@ if st.session_state.run_analysis_triggered and \
             _batches = ade.create_page_batches(file_bytes, _fence_page_indices)
             
             for _batch_idx, _batch in enumerate(_batches):
+                _assert_time_budget("Phase 2")
                 _batch_pages_str = ", ".join(str(i + 1) for i in _batch)
                 status_txt_area.text(
                     f"Phase 2 — ADE batch {_batch_idx + 1}/{len(_batches)}: "
@@ -949,6 +1022,7 @@ if st.session_state.run_analysis_triggered and \
         # PHASE 3: Process each page using cached pre-filter + ADE results
         # =================================================================
         for page_idx in range(total_pages):
+            _assert_time_budget("Phase 3")
             page_num = page_idx + 1
             st.session_state.total_pages_processed_count = page_num
             prog_bar.progress(0.6 + page_num / total_pages * 0.4)
@@ -1578,6 +1652,7 @@ if st.session_state.run_analysis_triggered and \
         if doc_proc:
             doc_proc.close()
             print(f"SESSION {current_session_id} LOG: Closed main processing PDF document.")
+        release_analysis_lock(current_session_id)
     
     # Final summary
     final_summary_text = (
@@ -2064,18 +2139,26 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         # Show per-page scale info
         page_scale_info = st.session_state.per_page_scale_info.get(page_key, {})
         page_scale = page_scale_info.get('verified_scale') or page_scale_info.get('text_scale') or 360.0
+        scale_min = 1.0
+        scale_max = 1200.0
+        page_scale_clamped = max(scale_min, min(float(page_scale), scale_max))
         
         scale_col1, scale_col2 = st.columns([2, 1])
         with scale_col1:
             page_scale_input = st.number_input(
                 f"Scale (Page {page_num})",
-                min_value=1.0,
-                max_value=1200.0,
-                value=float(page_scale),
+                min_value=scale_min,
+                max_value=scale_max,
+                value=page_scale_clamped,
                 step=12.0,
-                help=f"1\" = {page_scale/12:.1f}' actual",
+                help=f"1\" = {page_scale_clamped/12:.1f}' actual",
                 key=f"scale_input_{page_num}"
             )
+            if float(page_scale) != page_scale_clamped:
+                st.caption(
+                    f"Detected scale {float(page_scale):.1f} was outside allowed range "
+                    f"({scale_min:.0f}-{scale_max:.0f}) and was clamped."
+                )
         with scale_col2:
             if page_scale_info.get('success'):
                 confidence = page_scale_info.get('confidence', 'low')

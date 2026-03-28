@@ -38,7 +38,11 @@ def ade_parse_document(pdf_bytes: bytes, api_key: str, zdr: bool = False) -> Dic
     files = {"document": ("document.pdf", pdf_bytes, "application/pdf")}
     data = {"options": json.dumps({"zdr": zdr})} if zdr else {}
 
-    for attempt in range(3):
+    max_attempts = 2
+    connect_timeout_s = 10
+    read_timeout_s = 120
+
+    for attempt in range(max_attempts):
         try:
             print(f"[DEBUG] ADE API Request - Attempt {attempt+1}")
             response = requests.post(
@@ -46,7 +50,7 @@ def ade_parse_document(pdf_bytes: bytes, api_key: str, zdr: bool = False) -> Dic
                 files=files,
                 data=data,
                 headers=headers,
-                timeout=600  # 10 minutes for large architectural PDFs
+                timeout=(connect_timeout_s, read_timeout_s)
             )
             response.raise_for_status()
             result = response.json()
@@ -66,7 +70,7 @@ def ade_parse_document(pdf_bytes: bytes, api_key: str, zdr: bool = False) -> Dic
             }
         except Exception as e:
             print(f"[DEBUG] ADE Attempt {attempt+1} Failed: {e}")
-            if attempt == 2:
+            if attempt == (max_attempts - 1):
                 return {"success": False, "error": str(e)}
             time.sleep(2 * (attempt + 1))
 
@@ -198,14 +202,16 @@ def run_google_ocr_blocks(page_bytes: bytes, google_cloud_config: Dict, pdf_widt
     request = documentai.ProcessRequest(name=name, raw_document=raw_document)
 
     try:
-        result = client.process_document(request=request)
+        result = client.process_document(request=request, timeout=60)
         doc_result = result.document
         print(f"[DEBUG] Google API returned successfully. Text length: {len(doc_result.text)}")
     except Exception as e:
         print(f"[DEBUG] ❌ DocAI Processing Failed: {e}")
+        doc.close()
         return []
 
     if not doc_result.pages:
+        doc.close()
         return []
     ocr_page = doc_result.pages[0]
 
