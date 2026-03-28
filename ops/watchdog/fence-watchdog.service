@@ -1,0 +1,11 @@
+[Unit]
+Description=Fence app watchdog probe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=TIMEOUT_SECONDS=8
+Environment=RESTART_ON_FAIL=1
+Environment=SERVICE_NAME=fence.service
+ExecStart=/bin/bash /home/ubuntu/leo_streamlit/ops/watchdog/check_fence_health.sh http://127.0.0.1/_stcore/health

@@ -2060,12 +2060,22 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         # Extract lines from PDF page (cached)
         lines_cache_key = f"lines_{page_num}_{min_line_pts}"
         if lines_cache_key not in st.session_state:
+            # Evict previous line caches for this page when min length changes.
+            for k in [k for k in list(st.session_state.keys())
+                      if k.startswith(f"lines_{page_num}_") and k != lines_cache_key]:
+                del st.session_state[k]
             with fitz.open(stream=BytesIO(st.session_state.original_pdf_bytes), filetype="pdf") as doc:
                 pdf_page = doc[page_idx]
                 all_lines = extract_vector_lines(pdf_page)
                 filtered_lines = [l for l in all_lines if l.length_pts >= min_line_pts]
                 filtered_lines.sort(key=lambda l: l.length_pts, reverse=True)
-                st.session_state[lines_cache_key] = filtered_lines
+                # Store only compact, serializable fields instead of full VectorLine objects.
+                st.session_state[lines_cache_key] = [{
+                    'start': (float(l.start[0]), float(l.start[1])),
+                    'end': (float(l.end[0]), float(l.end[1])),
+                    'length_pts': float(l.length_pts),
+                    'layer': l.layer or 'default',
+                } for l in filtered_lines]
         
         lines = st.session_state.get(lines_cache_key, [])
         
@@ -2102,8 +2112,8 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                 best_idx = None
                 best_dist = float('inf')
                 for vi, vline in enumerate(lines):
-                    v_sx, v_sy = vline.start
-                    v_ex, v_ey = vline.end
+                    v_sx, v_sy = vline['start']
+                    v_ex, v_ey = vline['end']
                     # Try both orientations (line direction may differ)
                     d1 = math.hypot(a_sx - v_sx, a_sy - v_sy) + math.hypot(a_ex - v_ex, a_ey - v_ey)
                     d2 = math.hypot(a_sx - v_ex, a_sy - v_ey) + math.hypot(a_ex - v_sx, a_ey - v_sy)
@@ -2350,15 +2360,15 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                 del st.session_state[k]
             stats = []
             for i, line in enumerate(lines):
-                length_inches = line.length_pts / 72.0
+                length_inches = line['length_pts'] / 72.0
                 length_feet = (length_inches * effective_scale) / 12.0
                 stats.append({
                     'index': i,
-                    'length_pts': line.length_pts,
+                    'length_pts': line['length_pts'],
                     'length_feet': length_feet,
-                    'layer': line.layer or 'default',
-                    'start': line.start,
-                    'end': line.end
+                    'layer': line.get('layer') or 'default',
+                    'start': line['start'],
+                    'end': line['end']
                 })
             st.session_state[line_stats_key] = stats
         line_stats = st.session_state[line_stats_key]
@@ -2403,9 +2413,9 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                 new_height = int(orig_height * ratio)
                 # Use LANCZOS for high quality resize
                 base_img = base_img.resize((new_width, new_height), Image.LANCZOS)
-                # Store as compressed PNG bytes (~10x less memory than raw PIL)
+                # Store as compressed WEBP bytes to reduce session memory footprint.
                 _buf = BytesIO()
-                base_img.save(_buf, format='PNG', optimize=True)
+                base_img.save(_buf, format='WEBP', quality=88, method=6)
                 st.session_state[base_img_cache_key] = _buf.getvalue()
                 st.session_state[f"base_img_size_{page_num}_{zoom_level}"] = (new_width, new_height)
                 st.session_state[f"orig_img_size_{page_num}"] = (orig_width, orig_height)
@@ -2464,9 +2474,12 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                         draw.ellipse([(x0-5, y0-5), (x0+5, y0+5)], fill=color)
                         draw.ellipse([(x1-5, y1-5), (x1+5, y1+5)], fill=color)
                 
-                st.session_state[drawn_img_cache_key] = display_img
+                _drawn_buf = BytesIO()
+                display_img.save(_drawn_buf, format='WEBP', quality=90, method=6)
+                st.session_state[drawn_img_cache_key] = _drawn_buf.getvalue()
+                del _drawn_buf
             
-            display_img = st.session_state[drawn_img_cache_key]
+            display_img = Image.open(BytesIO(st.session_state[drawn_img_cache_key])).convert("RGB")
             
             # Display clickable image and info side by side
             col_img, col_info = st.columns([3, 1])
@@ -2704,7 +2717,7 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         for i, category in line_assignments.items():
             if i < len(lines):
                 line = lines[i]
-                length_inches = line.length_pts / 72.0
+                length_inches = line['length_pts'] / 72.0
                 length_feet = (length_inches * page_scale) / 12.0
                 
                 if category not in category_totals:
