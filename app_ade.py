@@ -407,9 +407,13 @@ def generate_measurement_pdf(original_pdf_bytes, fence_pages_results_list, line_
                     color_rgb = cat_info.get('color', (0, 255, 0))
                     # Convert 0-255 to 0-1
                     color = (color_rgb[0]/255, color_rgb[1]/255, color_rgb[2]/255)
-                    
-                    sx, sy = line.start
-                    ex, ey = line.end
+
+                    if isinstance(line, dict):
+                        sx, sy = line['start']
+                        ex, ey = line['end']
+                    else:
+                        sx, sy = line.start
+                        ex, ey = line.end
                     mx0, my0, mx1, my1 = reverse_rotation_transform(sx, sy, ex, ey)
                     
                     page_out.draw_line((mx0, my0), (mx1, my1), color=color, width=3.0, overlay=True)
@@ -535,12 +539,13 @@ def generate_measurement_spreadsheet(fence_pages, line_assignments, user_drawn_l
             idx = int(line_idx) if isinstance(line_idx, str) else line_idx
             if idx < len(lines):
                 line = lines[idx]
-                length_inches = line.length_pts / 72.0
+                length_pts = line['length_pts'] if isinstance(line, dict) else line.length_pts
+                length_inches = length_pts / 72.0
                 length_feet = (length_inches * page_scale) / 12.0
                 rows.append(_build_row(
                     page_num, category,
                     'Auto' if idx in auto_matched else 'Selected',
-                    length_feet, line.length_pts, page_scale
+                    length_feet, length_pts, page_scale
                 ))
         
         # User-drawn lines
