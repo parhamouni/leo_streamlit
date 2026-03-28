@@ -730,10 +730,25 @@ def get_llm_instance(api_key: str, model: str):
         max_retries=2
     )
 
+
+@st.cache_resource
+def get_scale_llm_instance(api_key: str, model: str):
+    """Dedicated LLM client for scale vision/text detection with more lenient timeout."""
+    print(f"LOG: Creating cached SCALE LLM instance for model {model}")
+    return ChatOpenAI(
+        model=model,
+        temperature=0,
+        openai_api_key=api_key,
+        timeout=300,
+        max_retries=3
+    )
+
 llm_analysis_instance = None
+scale_llm_instance = None
 if openai_key:
     try:
         llm_analysis_instance = get_llm_instance(openai_key, st.session_state.selected_model_for_analysis)
+        scale_llm_instance = get_scale_llm_instance(openai_key, st.session_state.selected_model_for_analysis)
     except Exception as e:
         st.error(f"LLM Init Error: {e}")
         openai_key = None
@@ -1162,7 +1177,7 @@ if st.session_state.run_analysis_triggered and \
                 if page_key not in st.session_state.per_page_scale_info:
                     try:
                         status_txt_area.text(f"Phase 3 — Page {page_num}/{total_pages}: Detecting scale...")
-                        scale_info = verify_scale_with_bar(page, llm=llm_analysis_instance)
+                        scale_info = verify_scale_with_bar(page, llm=scale_llm_instance or llm_analysis_instance)
                         st.session_state.per_page_scale_info[page_key] = scale_info
                         if scale_info.get('success') and scale_info.get('verified_scale'):
                             detected_scale = scale_info['verified_scale']
@@ -1976,7 +1991,7 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                     page_idx = fence_page['page_index_in_original_doc']
                     pdf_page = doc[page_idx]
                     # Use LLM for intelligent scale detection
-                    scale_info = verify_scale_with_bar(pdf_page, llm=llm_analysis_instance)
+                    scale_info = verify_scale_with_bar(pdf_page, llm=scale_llm_instance or llm_analysis_instance)
                     st.session_state.per_page_scale_info[cache_key] = scale_info
                 except Exception as e:
                     st.session_state.per_page_scale_info[cache_key] = {
