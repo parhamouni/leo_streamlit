@@ -171,7 +171,8 @@ initialize_session_state(current_session_id)
 # Saves up to 500 MB per concurrent session.
 _PDF_TMP_DIR = "/tmp/fence_pdfs"
 os.makedirs(_PDF_TMP_DIR, exist_ok=True)
-MAX_CONCURRENT_SESSIONS = 4  # prevent OOM from too many users
+MAX_CONCURRENT_UPLOADS = 6  # total sessions with PDFs loaded (viewing is cheap)
+
 
 def _save_pdf_to_disk(pdf_bytes: bytes, session_id: str, pdf_hash: str) -> str:
     """Write PDF bytes to a temp file, return the path."""
@@ -182,13 +183,13 @@ def _save_pdf_to_disk(pdf_bytes: bytes, session_id: str, pdf_hash: str) -> str:
     return path
 
 def _get_pdf_bytes() -> bytes | None:
-    """Read PDF bytes from disk. Returns None if file missing.
+    """Read PDF bytes from disk (.pdf or .done). Returns None if missing.
     Touches the file to signal the session is still active."""
     path = st.session_state.get('pdf_disk_path')
     if not path or not os.path.exists(path):
         return None
     try:
-        os.utime(path)  # bump mtime → keeps session alive
+        os.utime(path)  # bump mtime → prevents stale cleanup
     except Exception:
         pass
     with open(path, "rb") as f:
@@ -203,29 +204,48 @@ def _cleanup_pdf_on_disk(session_id: str):
     except Exception:
         pass
 
-_SESSION_STALE_SECONDS = 600  # 10 min — if no activity, consider session dead
+_STALE_ACTIVE_SECONDS = 600     # 10 min — active upload with no activity → stale
+_STALE_DONE_SECONDS = 3600      # 1 hour — finished session temp file cleanup
+
+def _mark_session_done():
+    """Rename .pdf → .done so it no longer counts as 'active' but stays
+    available for on-demand reads (exports, zoom, measurements)."""
+    path = st.session_state.get('pdf_disk_path')
+    if path and path.endswith('.pdf') and os.path.exists(path):
+        done_path = path.replace('.pdf', '.done')
+        try:
+            os.rename(path, done_path)
+            st.session_state.pdf_disk_path = done_path
+            print(f"SESSION LOG: Marked session done: {done_path}")
+        except Exception:
+            pass
 
 def _count_active_sessions() -> int:
-    """Count active sessions by temp PDF files, auto-cleaning stale ones.
-    A file older than _SESSION_STALE_SECONDS with no matching Streamlit
-    websocket is considered stale and removed."""
+    """Count sessions with uploaded PDFs, auto-cleaning stale ones.
+    Only .pdf files count as 'active' (pre-analysis or mid-analysis).
+    .done files are finished sessions (cheap, just viewing results)."""
     now = time.time()
     active = 0
     try:
         for f in os.listdir(_PDF_TMP_DIR):
-            if not f.endswith('.pdf'):
-                continue
             fpath = os.path.join(_PDF_TMP_DIR, f)
             age = now - os.path.getmtime(fpath)
-            if age > _SESSION_STALE_SECONDS:
-                # Stale session — clean up
-                try:
-                    os.remove(fpath)
-                    print(f"LOG: Removed stale session PDF {f} (age {age/60:.0f} min)")
-                except Exception:
-                    pass
-            else:
-                active += 1
+            if f.endswith('.pdf'):
+                if age > _STALE_ACTIVE_SECONDS:
+                    try:
+                        os.remove(fpath)
+                        print(f"LOG: Removed stale active PDF {f} (age {age/60:.0f} min)")
+                    except Exception:
+                        pass
+                else:
+                    active += 1
+            elif f.endswith('.done'):
+                if age > _STALE_DONE_SECONDS:
+                    try:
+                        os.remove(fpath)
+                        print(f"LOG: Removed stale done PDF {f} (age {age/60:.0f} min)")
+                    except Exception:
+                        pass
     except Exception:
         pass
     return active
@@ -883,9 +903,9 @@ if uploaded_pdf_file_obj:
         st.error(f"File too large ({file_size_mb:.0f} MB). Maximum is {MAX_FILE_SIZE_MB} MB to prevent memory issues.")
         st.stop()
     
-    # Guard: cap concurrent sessions to prevent multi-user OOM
+    # Guard: cap total loaded PDFs to prevent disk/memory exhaustion
     _active = _count_active_sessions()
-    if _active >= MAX_CONCURRENT_SESSIONS and not st.session_state.get('pdf_disk_path'):
+    if _active >= MAX_CONCURRENT_UPLOADS and not st.session_state.get('pdf_disk_path'):
         st.warning(f"Server is busy ({_active} active sessions). Please try again in a few minutes.")
         st.stop()
 
@@ -1003,12 +1023,14 @@ if st.session_state.run_analysis_triggered and \
             st.error(f"PDF has {st.session_state.doc_total_pages} pages (max {MAX_PAGES}). Please split the document.")
             st.session_state.processing_complete = True
             st.session_state.analysis_halted_due_to_error = True
+            _mark_session_done()
             doc_proc.close()
             st.stop()
     except Exception as e:
         st.error(f"Failed to open PDF: {e}")
         st.session_state.processing_complete = True
         st.session_state.analysis_halted_due_to_error = True
+        _mark_session_done()
         if doc_proc:
             doc_proc.close()
         print(f"SESSION {current_session_id} ERROR: Failed to open PDF for processing: {e}")
@@ -1800,8 +1822,9 @@ if st.session_state.run_analysis_triggered and \
         st.session_state.fence_page_texts = {}
         gc.collect()
 
-        # Processing complete
+        # Processing complete — mark session as done so it doesn't block new users
         st.session_state.processing_complete = True
+        _mark_session_done()
         prog_bar.empty()
         status_txt_area.success("All pages processed!")
         
@@ -1823,6 +1846,7 @@ if st.session_state.run_analysis_triggered and \
     except Exception as e:
         st.error(f"Processing error: {e}")
         st.session_state.analysis_halted_due_to_error = True
+        _mark_session_done()
         print(f"SESSION {current_session_id} ERROR: {e}")
     finally:
         if doc_proc:
