@@ -150,6 +150,45 @@ def release_analysis_lock(session_id: str):
 current_session_id = get_session_id()
 initialize_session_state(current_session_id)
 
+# --- Disk-backed PDF storage ------------------------------------------------
+# Store uploaded PDFs on disk (/tmp) instead of in session_state RAM.
+# Saves up to 500 MB per concurrent session.
+_PDF_TMP_DIR = "/tmp/fence_pdfs"
+os.makedirs(_PDF_TMP_DIR, exist_ok=True)
+MAX_CONCURRENT_SESSIONS = 4  # prevent OOM from too many users
+
+def _save_pdf_to_disk(pdf_bytes: bytes, session_id: str, pdf_hash: str) -> str:
+    """Write PDF bytes to a temp file, return the path."""
+    path = os.path.join(_PDF_TMP_DIR, f"{session_id}_{pdf_hash}.pdf")
+    with open(path, "wb") as f:
+        f.write(pdf_bytes)
+    print(f"SESSION {session_id} LOG: PDF saved to disk ({len(pdf_bytes)/(1024*1024):.1f} MB) -> {path}")
+    return path
+
+def _get_pdf_bytes() -> bytes | None:
+    """Read PDF bytes from disk. Returns None if file missing."""
+    path = st.session_state.get('pdf_disk_path')
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        return f.read()
+
+def _cleanup_pdf_on_disk(session_id: str):
+    """Remove any temp PDFs for this session."""
+    try:
+        for f in os.listdir(_PDF_TMP_DIR):
+            if f.startswith(f"{session_id}_"):
+                os.remove(os.path.join(_PDF_TMP_DIR, f))
+    except Exception:
+        pass
+
+def _count_active_sessions() -> int:
+    """Count temp PDF files as a proxy for active sessions."""
+    try:
+        return len([f for f in os.listdir(_PDF_TMP_DIR) if f.endswith('.pdf')])
+    except Exception:
+        return 0
+
 # --- Memory pressure relief ------------------------------------------------
 _DYNAMIC_CACHE_PREFIXES = (
     'base_img_', 'drawn_img_', 'line_stats_', 'lines_',
@@ -803,6 +842,12 @@ if uploaded_pdf_file_obj:
         st.error(f"File too large ({file_size_mb:.0f} MB). Maximum is {MAX_FILE_SIZE_MB} MB to prevent memory issues.")
         st.stop()
     
+    # Guard: cap concurrent sessions to prevent multi-user OOM
+    _active = _count_active_sessions()
+    if _active >= MAX_CONCURRENT_SESSIONS and not st.session_state.get('pdf_disk_path'):
+        st.warning(f"Server is busy ({_active} active sessions). Please try again in a few minutes.")
+        st.stop()
+
     if st.session_state.last_uploaded_file_id != current_file_id:
         print(f"SESSION {current_session_id} LOG: New file detected. Resetting state for {current_file_id}.")
         # Preserve some settings across resets
@@ -837,8 +882,15 @@ if uploaded_pdf_file_obj:
         st.session_state.fence_keywords_app = current_keywords
         
         st.session_state.uploaded_pdf_name = uploaded_pdf_file_obj.name
-        st.session_state.original_pdf_bytes = uploaded_pdf_file_obj.getvalue()
-        st.session_state.current_pdf_hash = hashlib.sha256(st.session_state.original_pdf_bytes).hexdigest()
+        _raw_bytes = uploaded_pdf_file_obj.getvalue()
+        st.session_state.current_pdf_hash = hashlib.sha256(_raw_bytes).hexdigest()
+        # Store PDF on disk instead of RAM (saves up to 500 MB per session)
+        _cleanup_pdf_on_disk(current_session_id)  # remove old file first
+        st.session_state.pdf_disk_path = _save_pdf_to_disk(
+            _raw_bytes, current_session_id, st.session_state.current_pdf_hash
+        )
+        st.session_state.original_pdf_bytes = None  # no longer kept in RAM
+        del _raw_bytes
         st.session_state.last_uploaded_file_id = current_file_id
         
         st.cache_data.clear()
@@ -863,7 +915,7 @@ if uploaded_pdf_file_obj:
 # ==============================================================================
 
 if st.session_state.run_analysis_triggered and \
-   st.session_state.original_pdf_bytes and \
+   st.session_state.get('pdf_disk_path') and \
    llm_analysis_instance and \
    (ade_key or not use_ade) and \
    not st.session_state.analysis_halted_due_to_error and \
@@ -876,7 +928,7 @@ if st.session_state.run_analysis_triggered and \
         st.stop()
 
     print(f"SESSION {current_session_id} LOG: Starting ADE-based PDF processing.")
-    file_bytes = st.session_state.original_pdf_bytes
+    file_bytes = _get_pdf_bytes()
     analysis_started_at = time.time()
 
     def _assert_time_budget(stage: str):
@@ -1702,9 +1754,10 @@ if st.session_state.run_analysis_triggered and \
         status_txt_area.success("All pages processed!")
         
         # Generate combined PDF
-        if st.session_state.fence_pages and st.session_state.original_pdf_bytes:
+        _pdf_for_highlight = _get_pdf_bytes()
+        if st.session_state.fence_pages and _pdf_for_highlight:
             pdf_b, pdf_n = generate_combined_highlighted_pdf(
-                st.session_state.original_pdf_bytes,
+                _pdf_for_highlight,
                 st.session_state.fence_pages,
                 st.session_state.uploaded_pdf_name,
                 current_session_id
@@ -1807,13 +1860,14 @@ elif st.session_state.processing_complete:
                     with img_col_r:
                         # Regenerate images on demand (not stored in session_state)
                         _orig_r, _hl_r = None, None
-                        if res_data_item.get('fence_found') and st.session_state.original_pdf_bytes:
+                        _pdf_bytes_r = _get_pdf_bytes()
+                        if res_data_item.get('fence_found') and _pdf_bytes_r:
                             _defs_hashable = tuple(tuple(sorted(d.items())) for d in definitions) if definitions else ()
                             _inst_hashable = tuple(tuple(sorted(i.items())) for i in instances) if instances else ()
                             _kw_hashable = tuple(tuple(sorted(k.items())) for k in keyword_matches if all(key in k for key in ['x0','y0','x1','y1'])) if keyword_matches else ()
                             _orig_r, _hl_r = get_page_image_on_demand(
                                 st.session_state.current_pdf_hash,
-                                st.session_state.original_pdf_bytes,
+                                _pdf_bytes_r,
                                 res_data_item['page_index_in_original_doc'],
                                 _defs_hashable, _inst_hashable, _kw_hashable,
                                 res_data_item.get('pdf_width', 792),
@@ -2038,7 +2092,8 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         st.session_state.pending_line_start = {}
     
     # Detect scales for all pages if not already done
-    with fitz.open(stream=BytesIO(st.session_state.original_pdf_bytes), filetype="pdf") as doc:
+    _pdf_bytes_for_scale = _get_pdf_bytes()
+    with fitz.open(stream=BytesIO(_pdf_bytes_for_scale), filetype="pdf") as doc:
         for fence_page in st.session_state.fence_pages:
             page_num = fence_page['page_number']
             cache_key = f"page_{page_num}"
@@ -2120,7 +2175,7 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             for k in [k for k in list(st.session_state.keys())
                       if k.startswith(f"lines_{page_num}_") and k != lines_cache_key]:
                 del st.session_state[k]
-            with fitz.open(stream=BytesIO(st.session_state.original_pdf_bytes), filetype="pdf") as doc:
+            with fitz.open(stream=BytesIO(_get_pdf_bytes()), filetype="pdf") as doc:
                 pdf_page = doc[page_idx]
                 all_lines = extract_vector_lines(pdf_page)
                 filtered_lines = [l for l in all_lines if l.length_pts >= min_line_pts]
@@ -2431,7 +2486,8 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         
         # Get base image on demand (regenerate instead of reading from session_state)
         base_img_bytes = page_data.get('highlighted_image_bytes') or page_data.get('original_image_bytes')
-        if not base_img_bytes and st.session_state.original_pdf_bytes:
+        _pdf_bytes_img = _get_pdf_bytes() if not base_img_bytes else None
+        if not base_img_bytes and _pdf_bytes_img:
             # Regenerate on demand
             _defs = page_data.get('definitions', [])
             _insts = page_data.get('instances', [])
@@ -2441,7 +2497,7 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             _kws_h = tuple(tuple(sorted(k.items())) for k in _kws if all(key in k for key in ['x0','y0','x1','y1'])) if _kws else ()
             _orig_img, _hl_img = get_page_image_on_demand(
                 st.session_state.current_pdf_hash,
-                st.session_state.original_pdf_bytes,
+                _pdf_bytes_img,
                 page_idx, _defs_h, _insts_h, _kws_h,
                 pdf_width, pdf_height,
                 page_data.get('highlight_fence_text_app_setting', True),
@@ -2888,7 +2944,7 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
     with dl_col1:
         # Generate measurement PDF
         pdf_bytes, pdf_name = generate_measurement_pdf(
-            st.session_state.original_pdf_bytes,
+            _get_pdf_bytes(),
             st.session_state.fence_pages,
             st.session_state.line_assignments,
             st.session_state.user_drawn_lines,
@@ -2933,7 +2989,7 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
 # Fallback Messages
 # ==============================================================================
 
-elif not st.session_state.original_pdf_bytes:
+elif not st.session_state.get('pdf_disk_path'):
     st.info("Upload a PDF to begin analysis.")
 elif not (openai_key and llm_analysis_instance):
     st.error("OpenAI models not initialized. Check API key.")
