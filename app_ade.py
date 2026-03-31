@@ -40,7 +40,7 @@ HIGHLIGHT_COLOR_INSTANCE = (0.9, 0, 0.9)  # Purple for instances
 HIGHLIGHT_WIDTH_UI = 2.0
 DISPLAY_IMAGE_DPI = 150
 ANALYSIS_LOCK_PATH = "/tmp/fence_analysis.lock"
-ANALYSIS_LOCK_TTL_SECONDS = 4 * 60 * 60
+ANALYSIS_LOCK_TTL_SECONDS = 60 * 60  # 1 hour hard ceiling
 MAX_ANALYSIS_SECONDS = 30 * 60
 
 st.set_page_config(page_title="ADE Fence Detector", layout="wide")
@@ -100,6 +100,18 @@ def initialize_session_state(session_id_val):
             st.session_state.session_id = session_id_val
 
 
+def _is_lock_holder_alive(lock_info: dict) -> bool:
+    """Check if the process that created the lock is still running."""
+    pid = lock_info.get("pid")
+    if not pid:
+        return False
+    try:
+        proc = psutil.Process(pid)
+        # Verify it's actually a streamlit process (not a recycled PID)
+        return "streamlit" in " ".join(proc.cmdline()).lower()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
 def acquire_analysis_lock(session_id: str):
     """Ensure only one heavyweight analysis runs at a time."""
     now = int(time.time())
@@ -113,9 +125,13 @@ def acquire_analysis_lock(session_id: str):
             owner = {}
 
         started_at = int(owner.get("started_at", 0) or 0)
+        # Lock is valid only if: within TTL AND holder process is still alive
         if started_at and (now - started_at) <= ANALYSIS_LOCK_TTL_SECONDS:
-            return False, owner
-        # Stale or malformed lock
+            if _is_lock_holder_alive(owner):
+                return False, owner
+            else:
+                print(f"LOG: Lock holder PID {owner.get('pid')} is dead, clearing stale lock.")
+        # Stale, expired, or orphaned lock
         try:
             os.remove(ANALYSIS_LOCK_PATH)
         except Exception:
@@ -924,7 +940,18 @@ if st.session_state.run_analysis_triggered and \
     lock_acquired, lock_info = acquire_analysis_lock(current_session_id)
     if not lock_acquired:
         holder = lock_info.get("session_id", "another session")
-        st.warning(f"Another analysis is already running ({holder}). Please wait for it to finish.")
+        lock_age_min = (int(time.time()) - int(lock_info.get("started_at", 0))) // 60
+        st.warning(f"Another analysis is already running ({holder}, {lock_age_min} min ago). "
+                   "Please wait for it to finish.")
+        if lock_age_min >= 5:
+            if st.button("🔓 Force clear stale lock", key="force_clear_lock"):
+                release_analysis_lock(holder)  # release by holder's session_id
+                try:
+                    os.remove(ANALYSIS_LOCK_PATH)  # force remove regardless
+                except Exception:
+                    pass
+                st.success("Lock cleared. Click **Start Analysis** again.")
+                st.rerun()
         st.stop()
 
     print(f"SESSION {current_session_id} LOG: Starting ADE-based PDF processing.")
