@@ -916,6 +916,12 @@ if uploaded_pdf_file_obj:
         st.warning(f"Server is busy ({_active} active sessions). Please try again in a few minutes.")
         st.stop()
 
+    # Detect if temp PDF was lost (e.g. server restart) — force re-save
+    _existing_path = st.session_state.get('pdf_disk_path')
+    if _existing_path and not os.path.exists(_existing_path):
+        print(f"SESSION {current_session_id} LOG: Temp PDF missing ({_existing_path}), will re-save.")
+        st.session_state.last_uploaded_file_id = None  # force re-upload flow
+
     if st.session_state.last_uploaded_file_id != current_file_id:
         print(f"SESSION {current_session_id} LOG: New file detected. Resetting state for {current_file_id}.")
         # Preserve some settings across resets
@@ -1008,6 +1014,12 @@ if st.session_state.run_analysis_triggered and \
 
     print(f"SESSION {current_session_id} LOG: Starting ADE-based PDF processing.")
     file_bytes = _get_pdf_bytes()
+    if not file_bytes:
+        st.error("PDF file is no longer available (server was restarted). Please re-upload the file.")
+        st.session_state.run_analysis_triggered = False
+        st.session_state.last_uploaded_file_id = None  # force re-upload
+        release_analysis_lock(current_session_id)
+        st.stop()
     analysis_started_at = time.time()
 
     def _assert_time_budget(stage: str):
