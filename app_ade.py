@@ -11,6 +11,7 @@ import base64
 from pathlib import Path
 from io import BytesIO
 import gc
+import psutil
 import pandas as pd
 import fitz  # PyMuPDF
 from PIL import Image
@@ -149,6 +150,30 @@ def release_analysis_lock(session_id: str):
 current_session_id = get_session_id()
 initialize_session_state(current_session_id)
 
+# --- Memory pressure relief ------------------------------------------------
+_DYNAMIC_CACHE_PREFIXES = (
+    'base_img_', 'drawn_img_', 'line_stats_', 'lines_',
+    'auto_synced_', 'auto_matched_indices_',
+    'orig_img_size_', 'base_img_size_', 'click_key_',
+)
+_RSS_CEILING_GB = 8.0  # purge caches before hitting 12 GB systemd kill
+
+def _check_memory_pressure():
+    """Purge dynamic image/line caches if process RSS exceeds threshold."""
+    rss_gb = psutil.Process().memory_info().rss / (1024 ** 3)
+    if rss_gb > _RSS_CEILING_GB:
+        purged = 0
+        for k in list(st.session_state.keys()):
+            if any(k.startswith(p) for p in _DYNAMIC_CACHE_PREFIXES):
+                del st.session_state[k]
+                purged += 1
+        st.cache_data.clear()
+        gc.collect()
+        rss_after = psutil.Process().memory_info().rss / (1024 ** 3)
+        print(f"SESSION {current_session_id} LOG: Memory pressure relief "
+              f"({rss_gb:.1f} -> {rss_after:.1f} GB), purged {purged} keys")
+
+_check_memory_pressure()
 
 # ==============================================================================
 # Helper Functions
@@ -783,7 +808,29 @@ if uploaded_pdf_file_obj:
         # Preserve some settings across resets
         current_selected_model = st.session_state.selected_model_for_analysis
         current_keywords = st.session_state.fence_keywords_app
-        
+
+        # Purge all dynamic cache keys accumulated during previous session
+        _DYNAMIC_PREFIXES = (
+            'base_img_', 'drawn_img_', 'line_stats_', 'lines_',
+            'auto_synced_', 'auto_matched_indices_',
+            'orig_img_size_', 'base_img_size_', 'click_key_',
+        )
+        _purged = 0
+        for k in list(st.session_state.keys()):
+            if any(k.startswith(p) for p in _DYNAMIC_PREFIXES):
+                del st.session_state[k]
+                _purged += 1
+        # Reset lazily-initialized measurement dicts
+        for _dict_key in ('user_drawn_lines', 'line_assignments', 'drawing_mode',
+                          'pending_line_start', 'unified_measurements',
+                          'per_page_scale_info', 'page_categories',
+                          'active_category_per_page', 'element_details',
+                          'fence_page_texts'):
+            st.session_state[_dict_key] = {}
+        if _purged:
+            gc.collect()
+            print(f"SESSION {current_session_id} LOG: Purged {_purged} dynamic cache keys on file switch.")
+
         initialize_session_state(current_session_id)
         
         st.session_state.selected_model_for_analysis = current_selected_model
@@ -1644,7 +1691,11 @@ if st.session_state.run_analysis_triggered and \
                 except Exception as e:
                     print(f"[APP] Element detail extraction error: {e}")
                     st.session_state.element_details = {}
-        
+
+        # Free fence_page_texts (only needed for cross-page extraction above)
+        st.session_state.fence_page_texts = {}
+        gc.collect()
+
         # Processing complete
         st.session_state.processing_complete = True
         prog_bar.empty()
