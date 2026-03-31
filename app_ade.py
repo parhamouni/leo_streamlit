@@ -173,6 +173,13 @@ _PDF_TMP_DIR = "/tmp/fence_pdfs"
 os.makedirs(_PDF_TMP_DIR, exist_ok=True)
 MAX_CONCURRENT_UPLOADS = 6  # total sessions with PDFs loaded (viewing is cheap)
 
+# Clean all temp PDFs on process start (service restart = fresh slate)
+for _f in os.listdir(_PDF_TMP_DIR):
+    try:
+        os.remove(os.path.join(_PDF_TMP_DIR, _f))
+    except Exception:
+        pass
+
 
 def _save_pdf_to_disk(pdf_bytes: bytes, session_id: str, pdf_hash: str) -> str:
     """Write PDF bytes to a temp file, return the path."""
@@ -204,7 +211,7 @@ def _cleanup_pdf_on_disk(session_id: str):
     except Exception:
         pass
 
-_STALE_ACTIVE_SECONDS = 600     # 10 min — active upload with no activity → stale
+_STALE_ACTIVE_SECONDS = 120     # 2 min — active upload with no activity → stale
 _STALE_DONE_SECONDS = 3600      # 1 hour — finished session temp file cleanup
 
 def _mark_session_done():
@@ -1010,6 +1017,13 @@ if st.session_state.run_analysis_triggered and \
                 f"Analysis exceeded {MAX_ANALYSIS_SECONDS // 60} minutes during {stage}. "
                 "Please split the PDF and retry."
             )
+        # Keep temp file alive during long analysis runs
+        _path = st.session_state.get('pdf_disk_path')
+        if _path and os.path.exists(_path):
+            try:
+                os.utime(_path)
+            except Exception:
+                pass
     
     # Open PDF to get page count
     doc_proc = None
