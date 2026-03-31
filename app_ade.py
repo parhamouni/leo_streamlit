@@ -173,10 +173,14 @@ _PDF_TMP_DIR = "/tmp/fence_pdfs"
 os.makedirs(_PDF_TMP_DIR, exist_ok=True)
 MAX_CONCURRENT_UPLOADS = 6  # total sessions with PDFs loaded (viewing is cheap)
 
-# Clean all temp PDFs on process start (service restart = fresh slate)
+# On process start, clean only truly old temp files (>1 hour).
+# Don't wipe everything — sessions may reconnect after a quick restart.
+_boot_now = time.time()
 for _f in os.listdir(_PDF_TMP_DIR):
+    _fp = os.path.join(_PDF_TMP_DIR, _f)
     try:
-        os.remove(os.path.join(_PDF_TMP_DIR, _f))
+        if _boot_now - os.path.getmtime(_fp) > 3600:
+            os.remove(_fp)
     except Exception:
         pass
 
@@ -916,11 +920,15 @@ if uploaded_pdf_file_obj:
         st.warning(f"Server is busy ({_active} active sessions). Please try again in a few minutes.")
         st.stop()
 
-    # Detect if temp PDF was lost (e.g. server restart) — force re-save
+    # Detect if temp PDF was lost (e.g. server restart) — re-save silently
     _existing_path = st.session_state.get('pdf_disk_path')
     if _existing_path and not os.path.exists(_existing_path):
-        print(f"SESSION {current_session_id} LOG: Temp PDF missing ({_existing_path}), will re-save.")
-        st.session_state.last_uploaded_file_id = None  # force re-upload flow
+        print(f"SESSION {current_session_id} LOG: Temp PDF missing ({_existing_path}), re-saving.")
+        _raw_bytes = uploaded_pdf_file_obj.getvalue()
+        _hash = hashlib.sha256(_raw_bytes).hexdigest()
+        st.session_state.pdf_disk_path = _save_pdf_to_disk(_raw_bytes, current_session_id, _hash)
+        del _raw_bytes
+        # Don't reset state or clear caches — session results are still valid
 
     if st.session_state.last_uploaded_file_id != current_file_id:
         print(f"SESSION {current_session_id} LOG: New file detected. Resetting state for {current_file_id}.")
@@ -951,10 +959,10 @@ if uploaded_pdf_file_obj:
             print(f"SESSION {current_session_id} LOG: Purged {_purged} dynamic cache keys on file switch.")
 
         initialize_session_state(current_session_id)
-        
+
         st.session_state.selected_model_for_analysis = current_selected_model
         st.session_state.fence_keywords_app = current_keywords
-        
+
         st.session_state.uploaded_pdf_name = uploaded_pdf_file_obj.name
         _raw_bytes = uploaded_pdf_file_obj.getvalue()
         st.session_state.current_pdf_hash = hashlib.sha256(_raw_bytes).hexdigest()
@@ -966,7 +974,7 @@ if uploaded_pdf_file_obj:
         st.session_state.original_pdf_bytes = None  # no longer kept in RAM
         del _raw_bytes
         st.session_state.last_uploaded_file_id = current_file_id
-        
+
         st.cache_data.clear()
         print(f"SESSION {current_session_id} LOG: Cleared all @st.cache_data caches due to new file.")
         st.rerun()
