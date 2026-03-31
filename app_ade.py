@@ -182,10 +182,15 @@ def _save_pdf_to_disk(pdf_bytes: bytes, session_id: str, pdf_hash: str) -> str:
     return path
 
 def _get_pdf_bytes() -> bytes | None:
-    """Read PDF bytes from disk. Returns None if file missing."""
+    """Read PDF bytes from disk. Returns None if file missing.
+    Touches the file to signal the session is still active."""
     path = st.session_state.get('pdf_disk_path')
     if not path or not os.path.exists(path):
         return None
+    try:
+        os.utime(path)  # bump mtime → keeps session alive
+    except Exception:
+        pass
     with open(path, "rb") as f:
         return f.read()
 
@@ -198,12 +203,32 @@ def _cleanup_pdf_on_disk(session_id: str):
     except Exception:
         pass
 
+_SESSION_STALE_SECONDS = 600  # 10 min — if no activity, consider session dead
+
 def _count_active_sessions() -> int:
-    """Count temp PDF files as a proxy for active sessions."""
+    """Count active sessions by temp PDF files, auto-cleaning stale ones.
+    A file older than _SESSION_STALE_SECONDS with no matching Streamlit
+    websocket is considered stale and removed."""
+    now = time.time()
+    active = 0
     try:
-        return len([f for f in os.listdir(_PDF_TMP_DIR) if f.endswith('.pdf')])
+        for f in os.listdir(_PDF_TMP_DIR):
+            if not f.endswith('.pdf'):
+                continue
+            fpath = os.path.join(_PDF_TMP_DIR, f)
+            age = now - os.path.getmtime(fpath)
+            if age > _SESSION_STALE_SECONDS:
+                # Stale session — clean up
+                try:
+                    os.remove(fpath)
+                    print(f"LOG: Removed stale session PDF {f} (age {age/60:.0f} min)")
+                except Exception:
+                    pass
+            else:
+                active += 1
     except Exception:
-        return 0
+        pass
+    return active
 
 # --- Memory pressure relief ------------------------------------------------
 _DYNAMIC_CACHE_PREFIXES = (
