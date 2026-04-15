@@ -1807,7 +1807,27 @@ def measure_fence_elements(
     else:
         fence_lines = []
     print(f"[DEBUG] Extracted {len(fence_lines)} lines from fence layers")
-    
+
+    # Skip measurement for pages with extremely dense vector content
+    # (e.g. complex site plans with thousands of line segments per layer)
+    MAX_FENCE_LINES = 5000
+    if len(fence_lines) > MAX_FENCE_LINES:
+        print(f"[DEBUG] Skipping measurement: {len(fence_lines)} lines exceeds limit of {MAX_FENCE_LINES}")
+        return {
+            "measurements": {},
+            "all_fence_lines": fence_lines,
+            "layer_measurements": {},
+            "layer_to_category": layer_to_category,
+            "measurement_method": "skipped",
+            "page_info": {
+                "width_pts": page_width,
+                "height_pts": page_height,
+                "rotation": rotation,
+                "scale_factor": scale_factor,
+            },
+            "skip_reason": f"Page has {len(fence_lines)} fence-layer lines (limit: {MAX_FENCE_LINES})",
+        }
+
     # Group lines by layer for per-layer measurements
     lines_by_layer = group_lines_by_layer(fence_lines)
     

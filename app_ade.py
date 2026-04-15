@@ -40,8 +40,7 @@ HIGHLIGHT_COLOR_INSTANCE = (0.9, 0, 0.9)  # Purple for instances
 HIGHLIGHT_WIDTH_UI = 2.0
 DISPLAY_IMAGE_DPI = 150
 ANALYSIS_LOCK_PATH = "/tmp/fence_analysis.lock"
-ANALYSIS_LOCK_TTL_SECONDS = 60 * 60  # 1 hour hard ceiling
-MAX_ANALYSIS_SECONDS = 30 * 60
+ANALYSIS_LOCK_TTL_SECONDS = 4 * 60 * 60  # 4 hour safety ceiling
 
 st.set_page_config(page_title="ADE Fence Detector", layout="wide")
 st.markdown("""<style> /* Your CSS */ </style>""", unsafe_allow_html=True)
@@ -125,12 +124,12 @@ def acquire_analysis_lock(session_id: str):
             owner = {}
 
         started_at = int(owner.get("started_at", 0) or 0)
-        # Lock is valid only if: within TTL AND holder process is still alive
+        # Process alive → lock is always valid (supports long-running analysis)
+        if started_at and _is_lock_holder_alive(owner):
+            return False, owner
+        # Process dead or can't check — use TTL as fallback safety ceiling
         if started_at and (now - started_at) <= ANALYSIS_LOCK_TTL_SECONDS:
-            if _is_lock_holder_alive(owner):
-                return False, owner
-            else:
-                print(f"LOG: Lock holder PID {owner.get('pid')} is dead, clearing stale lock.")
+            print(f"LOG: Lock holder PID {owner.get('pid')} is dead, clearing stale lock.")
         # Stale, expired, or orphaned lock
         try:
             os.remove(ANALYSIS_LOCK_PATH)
@@ -1028,16 +1027,8 @@ if st.session_state.run_analysis_triggered and \
         st.session_state.last_uploaded_file_id = None  # force re-upload
         release_analysis_lock(current_session_id)
         st.stop()
-    analysis_started_at = time.time()
-
-    def _assert_time_budget(stage: str):
-        elapsed = time.time() - analysis_started_at
-        if elapsed > MAX_ANALYSIS_SECONDS:
-            raise TimeoutError(
-                f"Analysis exceeded {MAX_ANALYSIS_SECONDS // 60} minutes during {stage}. "
-                "Please split the PDF and retry."
-            )
-        # Keep temp file alive during long analysis runs
+    def _keep_session_alive():
+        """Touch temp PDF to prevent stale-file cleanup during long analysis runs."""
         _path = st.session_state.get('pdf_disk_path')
         if _path and os.path.exists(_path):
             try:
@@ -1104,7 +1095,7 @@ if st.session_state.run_analysis_triggered and \
         
         status_txt_area.text(f"Phase 1a — Extracting text from {total_pages} pages...")
         for page_idx in range(total_pages):
-            _assert_time_budget("Phase 1a")
+            _keep_session_alive()
             page = doc_proc[page_idx]
             _page_dims[page_idx] = (page.rect.width, page.rect.height)
             _pdf_lines_by_page[page_idx] = ade.get_native_pdf_lines(page)
@@ -1136,7 +1127,7 @@ if st.session_state.run_analysis_triggered and \
                 futures = {executor.submit(_run_ocr_for_page, pi): pi for pi in range(total_pages)}
                 completed = 0
                 for future in as_completed(futures):
-                    _assert_time_budget("Phase 1b")
+                    _keep_session_alive()
                     completed += 1
                     prog_bar.progress(completed / total_pages * 0.15)
                     try:
@@ -1155,7 +1146,7 @@ if st.session_state.run_analysis_triggered and \
         
         # --- Step 1c: Run fence detection (keyword scan + optional LLM, sequential) ---
         for page_idx in range(total_pages):
-            _assert_time_budget("Phase 1c")
+            _keep_session_alive()
             page_num = page_idx + 1
             prog_bar.progress(0.15 + page_num / total_pages * 0.15)
             status_txt_area.text(f"Phase 1c — Classifying page {page_num}/{total_pages}...")
@@ -1193,7 +1184,7 @@ if st.session_state.run_analysis_triggered and \
             _batches = ade.create_page_batches(file_bytes, _fence_page_indices)
             
             for _batch_idx, _batch in enumerate(_batches):
-                _assert_time_budget("Phase 2")
+                _keep_session_alive()
                 _batch_pages_str = ", ".join(str(i + 1) for i in _batch)
                 status_txt_area.text(
                     f"Phase 2 — ADE batch {_batch_idx + 1}/{len(_batches)}: "
@@ -1249,7 +1240,7 @@ if st.session_state.run_analysis_triggered and \
         # PHASE 3: Process each page using cached pre-filter + ADE results
         # =================================================================
         for page_idx in range(total_pages):
-            _assert_time_budget("Phase 3")
+            _keep_session_alive()
             page_num = page_idx + 1
             st.session_state.total_pages_processed_count = page_num
             prog_bar.progress(0.6 + page_num / total_pages * 0.4)

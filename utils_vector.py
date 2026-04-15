@@ -13,7 +13,7 @@ import base64
 from io import BytesIO
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional, Set, Any
-from collections import Counter
+from collections import Counter, defaultdict
 
 
 @dataclass
@@ -191,49 +191,82 @@ def points_close(p1: Tuple[float, float], p2: Tuple[float, float], tolerance: fl
 def group_connected_lines(lines: List[VectorLine], tolerance: float = 2.0) -> List[List[VectorLine]]:
     """
     Group lines that share endpoints (connected segments).
-    
+    Uses union-find with a spatial grid for O(n) average performance.
+
     Args:
         lines: List of VectorLine objects
         tolerance: Maximum distance to consider points connected
-    
+
     Returns:
         List of line groups, where each group contains connected lines
     """
     if not lines:
         return []
-    
-    groups = []
-    used = set()
-    
+
+    n = len(lines)
+
+    # Union-Find with path compression and union by rank
+    parent = list(range(n))
+    rank = [0] * n
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]  # path compression
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        if rank[ra] < rank[rb]:
+            ra, rb = rb, ra
+        parent[rb] = ra
+        if rank[ra] == rank[rb]:
+            rank[ra] += 1
+
+    # Spatial grid: snap endpoints to grid cells, then union lines
+    # that share (or have nearby) grid cells
+    cell_size = max(tolerance, 0.1)
+    grid = defaultdict(list)  # grid_key -> [(line_index, point)]
+
     for i, line in enumerate(lines):
-        if i in used:
-            continue
-        
-        group = [line]
-        used.add(i)
-        
-        # Find connected lines
-        changed = True
-        while changed:
-            changed = False
-            for j, other in enumerate(lines):
-                if j in used:
+        for pt in (line.start, line.end):
+            gx = int(pt[0] / cell_size)
+            gy = int(pt[1] / cell_size)
+            grid[(gx, gy)].append(i)
+
+    # For each grid cell, union all lines whose endpoints are within tolerance
+    # Check the cell and its 8 neighbors to handle points near cell boundaries
+    checked = set()
+    for (gx, gy), cell_lines in grid.items():
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                neighbor_key = (gx + dx, gy + dy)
+                if neighbor_key not in grid:
                     continue
-                
-                # Check if any endpoint connects
-                for g_line in group:
-                    if (points_close(g_line.start, other.start, tolerance) or
-                        points_close(g_line.start, other.end, tolerance) or
-                        points_close(g_line.end, other.start, tolerance) or
-                        points_close(g_line.end, other.end, tolerance)):
-                        group.append(other)
-                        used.add(j)
-                        changed = True
-                        break
-        
-        groups.append(group)
-    
-    return groups
+                for i in cell_lines:
+                    for j in grid[neighbor_key]:
+                        if i >= j:
+                            continue
+                        pair = (i, j)
+                        if pair in checked:
+                            continue
+                        checked.add(pair)
+                        # Check if any endpoint pair is close
+                        li, lj = lines[i], lines[j]
+                        if (points_close(li.start, lj.start, tolerance) or
+                            points_close(li.start, lj.end, tolerance) or
+                            points_close(li.end, lj.start, tolerance) or
+                            points_close(li.end, lj.end, tolerance)):
+                            union(i, j)
+
+    # Collect groups
+    groups_map = defaultdict(list)
+    for i in range(n):
+        groups_map[find(i)].append(lines[i])
+
+    return list(groups_map.values())
 
 
 def calculate_total_length(lines: List[VectorLine], scale_factor: float = 1.0) -> Dict:
