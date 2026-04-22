@@ -1,0 +1,19 @@
+[Unit]
+Description=Fence app watchdog probe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Probe timeout: how long curl waits for /_stcore/health. 10s is tight enough
+# to detect real hangs quickly while tolerating normal brief stalls.
+Environment=TIMEOUT_SECONDS=10
+# Auto-restart fence.service after FAIL_THRESHOLD consecutive failures.
+# The threshold is set high enough (15 min) that no legitimate heavy work
+# can trip it; it specifically targets the "alive but unresponsive" state
+# that systemd's Restart=always can't see. See check_fence_health.sh for
+# the long version of the rationale.
+Environment=RESTART_ON_FAIL=1
+Environment=FAIL_THRESHOLD=15
+Environment=SERVICE_NAME=fence.service
+ExecStart=/bin/bash /home/ubuntu/leo_streamlit/ops/watchdog/check_fence_health.sh http://127.0.0.1/_stcore/health

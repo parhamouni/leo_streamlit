@@ -1,0 +1,25 @@
+[Unit]
+Description=Fence Detector Streamlit App
+After=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/leo_streamlit
+# Flush stdout/stderr immediately so per-page SESSION LOG lines appear in
+# the journal in real time. Without this, Python block-buffers 4 KB and we
+# only see logs when the buffer fills or the process exits — which made
+# live debugging during the April outage much harder than it needed to be.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/leo_streamlit/venv/bin/streamlit run app_ade.py \
+  --server.headless true \
+  --server.address 127.0.0.1 \
+  --server.port 8501
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=true
+MemoryMax=12G
+MemoryHigh=10G
+
+[Install]
+WantedBy=multi-user.target
