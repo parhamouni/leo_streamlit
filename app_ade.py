@@ -1,6 +1,7 @@
 # app_ade_v2.py - ADE Fence Detector with app.py UI
 import streamlit as st
 import os
+import sys
 import toml
 import json
 import time
@@ -14,6 +15,13 @@ import gc
 import psutil
 import pandas as pd
 import fitz  # PyMuPDF
+# Silence MuPDF's chatty stderr (e.g. repeated "object out of range" on damaged
+# PDFs). The Python-level exceptions still fire; we just stop the C library from
+# spamming stderr with thousands of duplicate messages that drown out real logs.
+try:
+    fitz.TOOLS.mupdf_display_errors(False)
+except Exception:
+    pass
 from PIL import Image
 
 # Import our consolidated ADE utilities
@@ -1042,7 +1050,7 @@ if st.session_state.run_analysis_triggered and \
         doc_proc = fitz.open(stream=BytesIO(file_bytes), filetype="pdf")
         st.session_state.doc_total_pages = len(doc_proc)
         print(f"SESSION {current_session_id} LOG: PDF opened, {st.session_state.doc_total_pages} pages.")
-        
+
         MAX_PAGES = 300
         if st.session_state.doc_total_pages > MAX_PAGES:
             st.error(f"PDF has {st.session_state.doc_total_pages} pages (max {MAX_PAGES}). Please split the document.")
@@ -1051,6 +1059,46 @@ if st.session_state.run_analysis_triggered and \
             _mark_session_done()
             doc_proc.close()
             st.stop()
+
+        # Integrity scan — detect pages damaged by truncated/corrupt xref.
+        # Common when a PDF was split by file-size for email and recombined.
+        # We probe each page cheaply (just the page dict — fast even on large PDFs);
+        # deeper failures (e.g. content-stream objects missing) are caught again
+        # by per-phase try/except below and added to broken_pages on the fly.
+        _broken_pages = set()
+        for _pi in range(st.session_state.doc_total_pages):
+            try:
+                _p = doc_proc[_pi]
+                _ = _p.rect.width  # forces page-dict resolution; fails if page xref missing
+            except Exception as _pe:
+                _broken_pages.add(_pi)
+                print(f"SESSION {current_session_id} WARNING: page {_pi + 1} is damaged ({_pe}) — will be skipped")
+        st.session_state.broken_pages = _broken_pages
+        if _broken_pages:
+            _n_bad = len(_broken_pages)
+            _n_total = st.session_state.doc_total_pages
+            if _n_bad == _n_total:
+                st.error(
+                    f"This PDF is damaged — none of its {_n_total} pages could be read. "
+                    "This typically happens when a file was split by size (e.g. for email) "
+                    "and the pieces were not recombined correctly. Please re-export the original "
+                    "PDF using page-range split and re-upload."
+                )
+                st.session_state.processing_complete = True
+                st.session_state.analysis_halted_due_to_error = True
+                _mark_session_done()
+                doc_proc.close()
+                st.stop()
+            _bad_sorted = sorted(p + 1 for p in _broken_pages)
+            _bad_preview = ", ".join(str(p) for p in _bad_sorted[:15])
+            if len(_bad_sorted) > 15:
+                _bad_preview += f", … (+{len(_bad_sorted) - 15} more)"
+            st.warning(
+                f"⚠ This PDF is partially damaged: **{_n_bad} of {_n_total} pages** are unreadable "
+                f"(pages: {_bad_preview}). Analysis will continue on the {_n_total - _n_bad} "
+                "readable pages; the damaged pages will be marked as skipped. "
+                "Tip: if you split the PDF for email, split by *page range* rather than by file size."
+            )
     except Exception as e:
         st.error(f"Failed to open PDF: {e}")
         st.session_state.processing_complete = True
@@ -1093,43 +1141,124 @@ if st.session_state.run_analysis_triggered and \
         _page_dims = {}
         _single_page_pdfs = {}  # Cache for reuse in Phase 2 fallback
         
+        _broken = st.session_state.get('broken_pages', set())
         status_txt_area.text(f"Phase 1a — Extracting text from {total_pages} pages...")
+
+        # Per-page hard timeout for Phase 1a text extraction, via SUBPROCESS.
+        #
+        # Some pages in subtly-damaged PDFs cause fitz.get_text("dict") to
+        # enter MuPDF's internal recovery loop — 100% CPU, no progress, never
+        # returns. The loop happens in C code that holds the GIL without
+        # yielding, so no Python-level timeout (signal.alarm, threading
+        # timeout, asyncio) can interrupt it — we tried; the main thread
+        # also blocks trying to reacquire the GIL.
+        #
+        # The only reliable escape hatch is to run extraction in a separate
+        # OS process and SIGKILL it on timeout. ops/page_extractor.py reads
+        # the PDF from disk and prints one JSON line; subprocess.run with
+        # timeout gives us a hard time bound.
+        import subprocess, json as _json
+        PHASE_1A_PAGE_TIMEOUT = 20  # seconds — healthy pages finish in < 1s
+        _extractor_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "ops", "page_extractor.py"
+        )
+        _pdf_disk_path_for_extract = st.session_state.get('pdf_disk_path')
+
+        def _extract_via_subprocess(page_idx, timeout):
+            """Run get_native_pdf_lines in a subprocess; SIGKILL on timeout.
+            Returns (lines, error_or_None). Always returns within ~timeout
+            seconds, regardless of MuPDF's internal behavior."""
+            if not _pdf_disk_path_for_extract or not os.path.exists(_pdf_disk_path_for_extract):
+                return None, RuntimeError("PDF disk file missing — cannot extract out-of-process")
+            try:
+                result = subprocess.run(
+                    [sys.executable, _extractor_script, _pdf_disk_path_for_extract, str(page_idx)],
+                    capture_output=True, text=True, timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                return None, TimeoutError(
+                    f"page extraction exceeded {timeout}s — MuPDF recovery loop on malformed content"
+                )
+            except Exception as _se:
+                return None, RuntimeError(f"subprocess launch failed: {_se}")
+            if not result.stdout:
+                return None, RuntimeError(
+                    f"worker produced no output (rc={result.returncode}): {result.stderr[:200]}"
+                )
+            try:
+                resp = _json.loads(result.stdout.strip().splitlines()[-1])
+            except Exception as _je:
+                return None, RuntimeError(f"could not parse worker output: {_je}; raw={result.stdout[:200]}")
+            if resp.get("ok"):
+                return resp.get("lines", []), None
+            return None, RuntimeError(resp.get("error", "unknown worker failure"))
+
         for page_idx in range(total_pages):
             _keep_session_alive()
-            page = doc_proc[page_idx]
-            _page_dims[page_idx] = (page.rect.width, page.rect.height)
-            _pdf_lines_by_page[page_idx] = ade.get_native_pdf_lines(page)
-        
+            if page_idx in _broken:
+                _page_dims[page_idx] = (0, 0)
+                _pdf_lines_by_page[page_idx] = []
+                continue
+            # page dims are cheap and safe — read them from the in-process doc
+            try:
+                page = doc_proc[page_idx]
+                _page_dims[page_idx] = (page.rect.width, page.rect.height)
+            except Exception as _e:
+                print(f"SESSION {current_session_id} WARNING: Phase 1a page {page_idx + 1} open failed: {_e} — skipping")
+                _broken.add(page_idx)
+                _page_dims[page_idx] = (0, 0)
+                _pdf_lines_by_page[page_idx] = []
+                continue
+
+            # Text extraction runs in a subprocess with a hard kill on timeout.
+            lines, err = _extract_via_subprocess(page_idx, PHASE_1A_PAGE_TIMEOUT)
+            if err is not None:
+                print(f"SESSION {current_session_id} WARNING: Phase 1a page {page_idx + 1}: {err} — marking damaged and skipping")
+                _broken.add(page_idx)
+                _pdf_lines_by_page[page_idx] = []
+            else:
+                _pdf_lines_by_page[page_idx] = lines
+        st.session_state.broken_pages = _broken
+
         # Batch-create single-page PDFs for OCR (reused in Phase 2 fallback)
         # Uses one fitz.open() instead of N separate open/close cycles
         if google_cloud_config:
             for page_idx in range(total_pages):
-                _tmp = fitz.open()
-                _tmp.insert_pdf(doc_proc, from_page=page_idx, to_page=page_idx)
-                _single_page_pdfs[page_idx] = _tmp.tobytes()
-                _tmp.close()
+                if page_idx in _broken:
+                    continue
+                try:
+                    _tmp = fitz.open()
+                    _tmp.insert_pdf(doc_proc, from_page=page_idx, to_page=page_idx)
+                    _single_page_pdfs[page_idx] = _tmp.tobytes()
+                    _tmp.close()
+                except Exception as _e:
+                    print(f"SESSION {current_session_id} WARNING: single-page PDF prep failed for page {page_idx + 1}: {_e} — skipping")
+                    _broken.add(page_idx)
+        st.session_state.broken_pages = _broken
         
         # --- Step 1b: Run Google OCR in parallel across all pages ---
         _ocr_lines_by_page = {i: [] for i in range(total_pages)}
         
         if google_cloud_config:
             status_txt_area.text(f"Phase 1b — Running OCR on {total_pages} pages in parallel...")
-            
+
             def _run_ocr_for_page(page_idx):
                 """Worker function for parallel OCR."""
                 pdf_w, pdf_h = _page_dims[page_idx]
                 return page_idx, ade.run_google_ocr_blocks(
                     _single_page_pdfs[page_idx], google_cloud_config, pdf_w, pdf_h
                 )
-            
+
             # Use up to 4 parallel OCR workers (API rate-limited, don't overwhelm)
+            # Skip broken pages entirely — their single-page PDF wasn't created.
+            _ocr_page_indices = [pi for pi in range(total_pages) if pi not in _broken]
             with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = {executor.submit(_run_ocr_for_page, pi): pi for pi in range(total_pages)}
+                futures = {executor.submit(_run_ocr_for_page, pi): pi for pi in _ocr_page_indices}
                 completed = 0
                 for future in as_completed(futures):
                     _keep_session_alive()
                     completed += 1
-                    prog_bar.progress(completed / total_pages * 0.15)
+                    prog_bar.progress(completed / max(len(_ocr_page_indices), 1) * 0.15)
                     try:
                         pi, ocr_result = future.result()
                         _ocr_lines_by_page[pi] = ocr_result
@@ -1149,12 +1278,25 @@ if st.session_state.run_analysis_triggered and \
             _keep_session_alive()
             page_num = page_idx + 1
             prog_bar.progress(0.15 + page_num / total_pages * 0.15)
+            if page_idx in _broken:
+                print(f"SESSION {current_session_id} LOG: skipping damaged page {page_num} in Phase 1c.")
+                _page_cache[page_idx] = {
+                    'pdf_lines': [],
+                    'ocr_lines': [],
+                    'prefilter_result': {
+                        "fence_found": False,
+                        "method": "skipped_damaged",
+                        "matched_lines": [],
+                    },
+                    'skipped_damaged': True,
+                }
+                continue
             status_txt_area.text(f"Phase 1c — Classifying page {page_num}/{total_pages}...")
             print(f"SESSION {current_session_id} LOG: Pre-filtering page {page_num}.")
-            
+
             pdf_lines = _pdf_lines_by_page[page_idx]
             ocr_lines = _ocr_lines_by_page[page_idx]
-            
+
             prefilter_result = ade.fallback_fence_detection(
                 pdf_lines=pdf_lines,
                 ocr_lines=ocr_lines,
@@ -1181,8 +1323,11 @@ if st.session_state.run_analysis_triggered and \
         _ade_chunks_by_page = {}
         
         if use_ade and ade_key and _fence_page_indices:
+            # Belt-and-suspenders: damaged pages should never be fence pages
+            # (Phase 1c skipped them) but filter again in case something slipped through.
+            _fence_page_indices = [i for i in _fence_page_indices if i not in _broken]
             _batches = ade.create_page_batches(file_bytes, _fence_page_indices)
-            
+
             for _batch_idx, _batch in enumerate(_batches):
                 _keep_session_alive()
                 _batch_pages_str = ", ".join(str(i + 1) for i in _batch)
@@ -1191,22 +1336,32 @@ if st.session_state.run_analysis_triggered and \
                     f"pages {_batch_pages_str}..."
                 )
                 prog_bar.progress(0.3 + (_batch_idx + 1) / len(_batches) * 0.3)
-                
-                _batch_pdf = ade.create_multi_page_pdf(file_bytes, _batch)
+
+                try:
+                    _batch_pdf = ade.create_multi_page_pdf(file_bytes, _batch)
+                except Exception as _e:
+                    print(f"[APP] ADE batch {_batch_idx + 1} PDF-build failed ({_e}); marking all pages for fallback")
+                    for _orig_idx in _batch:
+                        _ade_chunks_by_page[_orig_idx] = None
+                    continue
                 print(f"SESSION {current_session_id} LOG: ADE batch {_batch_idx + 1}/{len(_batches)}: "
                       f"{len(_batch)} pages, {len(_batch_pdf) / 1024:.0f}KB")
-                
+
                 _ade_response = ade.ade_parse_document(_batch_pdf, ade_key)
-                
+
                 if _ade_response["success"]:
                     for _local_idx, _orig_idx in enumerate(_batch):
-                        _p = doc_proc[_orig_idx]
-                        _chunks = ade.align_ade_chunks_to_page(
-                            _ade_response, _local_idx,
-                            _p.rect.width, _p.rect.height
-                        )
-                        _ade_chunks_by_page[_orig_idx] = _chunks
-                        print(f"[APP] Page {_orig_idx + 1}: {len(_chunks)} ADE chunks from batch")
+                        try:
+                            _p = doc_proc[_orig_idx]
+                            _chunks = ade.align_ade_chunks_to_page(
+                                _ade_response, _local_idx,
+                                _p.rect.width, _p.rect.height
+                            )
+                            _ade_chunks_by_page[_orig_idx] = _chunks
+                            print(f"[APP] Page {_orig_idx + 1}: {len(_chunks)} ADE chunks from batch")
+                        except Exception as _e:
+                            _ade_chunks_by_page[_orig_idx] = None
+                            print(f"[APP] Page {_orig_idx + 1}: align failed ({_e}) — marking as no ADE")
                 else:
                     # Batch failed — fall back to per-page ADE for this batch
                     print(f"[APP] ADE batch {_batch_idx + 1} failed: {_ade_response.get('error')}")
@@ -1244,14 +1399,56 @@ if st.session_state.run_analysis_triggered and \
             page_num = page_idx + 1
             st.session_state.total_pages_processed_count = page_num
             prog_bar.progress(0.6 + page_num / total_pages * 0.4)
+
+            # Skip damaged pages entirely — render a clear "skipped" card and move on.
+            if page_idx in _broken:
+                status_txt_area.text(f"Phase 3 — Skipping damaged page {page_num}/{total_pages}...")
+                print(f"SESSION {current_session_id} LOG: Phase 3 skip damaged page {page_num}.")
+                st.session_state.non_fence_pages.append({
+                    'page_number': page_num,
+                    'page_index_in_original_doc': page_idx,
+                    'fence_found': False,
+                    'skipped_damaged': True,
+                })
+                with col_nf:
+                    with st.expander(f"Page {page_num} — ⚠ skipped (damaged)", expanded=False):
+                        st.warning(
+                            "This page could not be read because the PDF is damaged "
+                            "(missing content objects). It was skipped so the rest of "
+                            "the document could still be analyzed."
+                        )
+                summary_placeholder.markdown(
+                    f"### Summary (Processed: {page_num}/{total_pages})\n"
+                    f"- ✅ Fence: {len(st.session_state.fence_pages)}\n"
+                    f"- ❌ Non-Fence: {len(st.session_state.non_fence_pages) - sum(1 for p in st.session_state.non_fence_pages if p.get('skipped_damaged'))}\n"
+                    f"- ⚠ Skipped (damaged): {sum(1 for p in st.session_state.non_fence_pages if p.get('skipped_damaged'))}"
+                )
+                continue
+
             status_txt_area.text(f"Phase 3 — Processing page {page_num}/{total_pages}...")
             print(f"SESSION {current_session_id} LOG: Processing page {page_num}.")
-            
+
             # Get page dimensions (cheap) — defer image rendering to fence pages only
-            page = doc_proc[page_idx]
-            pdf_width, pdf_height = page.rect.width, page.rect.height
+            try:
+                page = doc_proc[page_idx]
+                pdf_width, pdf_height = page.rect.width, page.rect.height
+            except Exception as _e:
+                # Page became unreadable between phases — treat as damaged.
+                print(f"SESSION {current_session_id} WARNING: Phase 3 page {page_num} failed to open ({_e}); marking damaged")
+                _broken.add(page_idx)
+                st.session_state.broken_pages = _broken
+                st.session_state.non_fence_pages.append({
+                    'page_number': page_num,
+                    'page_index_in_original_doc': page_idx,
+                    'fence_found': False,
+                    'skipped_damaged': True,
+                })
+                with col_nf:
+                    with st.expander(f"Page {page_num} — ⚠ skipped (damaged)", expanded=False):
+                        st.warning("Page could not be opened — PDF is damaged. Skipped.")
+                continue
             page_img_bytes = None  # Rendered lazily below only for fence pages
-            
+
             # Load cached pre-filter results
             _cached = _page_cache[page_idx]
             pdf_lines = _cached['pdf_lines']
