@@ -1,0 +1,14 @@
+[Unit]
+Description=Check every 5 minutes for stuck fence analyses
+
+[Timer]
+# First fire 5 minutes after the timer is activated (no immediate fire).
+OnActiveSec=5min
+# Then every 5 minutes after the previous tick.
+OnUnitActiveSec=5min
+Unit=fence-stale-restart.service
+# Don't catch up missed runs if the machine was off.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

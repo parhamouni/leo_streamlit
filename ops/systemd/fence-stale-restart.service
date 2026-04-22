@@ -1,0 +1,9 @@
+[Unit]
+Description=Reap stuck fence analyses (restart fence.service if lock > 2h)
+After=fence.service
+
+[Service]
+Type=oneshot
+Environment=MAX_ANALYSIS_SECONDS=7200
+Environment=SERVICE_NAME=fence.service
+ExecStart=/bin/bash /home/ubuntu/leo_streamlit/ops/watchdog/check_stale_analysis.sh
