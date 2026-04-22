@@ -1273,13 +1273,26 @@ if st.session_state.run_analysis_triggered and \
             gc.collect()
             print(f"SESSION {current_session_id} LOG: Freed single-page PDF cache after OCR")
         
-        # --- Step 1c: Run fence detection (keyword scan + optional LLM, sequential) ---
+        # --- Step 1c: Run fence detection (keyword scan + optional LLM) ---
+        #
+        # This is the biggest wall-clock contributor: for each non-damaged page
+        # we make an LLM round-trip (use_llm_confirmation=True). Running them
+        # sequentially on a 136-page PDF used to take ~3 minutes.
+        #
+        # The LLM call is network-bound — the underlying HTTPS request releases
+        # the GIL while waiting for the response — so a ThreadPoolExecutor
+        # actually gives real concurrency here (unlike the MuPDF case in Phase
+        # 1a, where the C code held the GIL and threads gave no speedup).
+        # This is the same pattern Phase 1b uses for parallel OCR.
+        #
+        # Broken pages are filled in serially before dispatching — no point
+        # submitting work for something we'll skip anyway.
+
+        # Fill in cache stubs for damaged pages up front
+        _pending_indices = []
         for page_idx in range(total_pages):
-            _keep_session_alive()
-            page_num = page_idx + 1
-            prog_bar.progress(0.15 + page_num / total_pages * 0.15)
             if page_idx in _broken:
-                print(f"SESSION {current_session_id} LOG: skipping damaged page {page_num} in Phase 1c.")
+                print(f"SESSION {current_session_id} LOG: skipping damaged page {page_idx + 1} in Phase 1c.")
                 _page_cache[page_idx] = {
                     'pdf_lines': [],
                     'ocr_lines': [],
@@ -1290,30 +1303,71 @@ if st.session_state.run_analysis_triggered and \
                     },
                     'skipped_damaged': True,
                 }
-                continue
-            status_txt_area.text(f"Phase 1c — Classifying page {page_num}/{total_pages}...")
-            print(f"SESSION {current_session_id} LOG: Pre-filtering page {page_num}.")
+            else:
+                _pending_indices.append(page_idx)
 
+        def _classify_page(page_idx):
+            """Worker: run fence detection for one page. Returns (idx, result_dict)."""
             pdf_lines = _pdf_lines_by_page[page_idx]
             ocr_lines = _ocr_lines_by_page[page_idx]
-
             prefilter_result = ade.fallback_fence_detection(
                 pdf_lines=pdf_lines,
                 ocr_lines=ocr_lines,
                 fence_keywords=FENCE_KEYWORDS_APP,
                 llm=llm_analysis_instance,
-                use_llm_confirmation=True
+                use_llm_confirmation=True,
             )
-            
-            _page_cache[page_idx] = {
+            return page_idx, {
                 'pdf_lines': pdf_lines,
                 'ocr_lines': ocr_lines,
                 'prefilter_result': prefilter_result,
             }
-            
-            if prefilter_result["fence_found"]:
-                _fence_page_indices.append(page_idx)
-        
+
+        status_txt_area.text(
+            f"Phase 1c — Classifying {len(_pending_indices)} pages in parallel..."
+        )
+        # 4 workers matches Phase 1b and stays well under OpenAI rate limits.
+        with ThreadPoolExecutor(max_workers=4) as _cls_pool:
+            _cls_futures = {
+                _cls_pool.submit(_classify_page, pi): pi for pi in _pending_indices
+            }
+            _cls_completed = 0
+            for _fut in as_completed(_cls_futures):
+                _keep_session_alive()
+                _cls_completed += 1
+                # Progress bar slice for Phase 1c matches the old sequential math
+                prog_bar.progress(
+                    0.15 + _cls_completed / max(len(_pending_indices), 1) * 0.15
+                )
+                _idx = _cls_futures[_fut]
+                try:
+                    _, _cache_entry = _fut.result()
+                except Exception as _ce:
+                    # Treat a per-page classification failure as "not fence" so
+                    # analysis can continue. Mark it so Phase 3 shows a note.
+                    print(f"SESSION {current_session_id} WARNING: Phase 1c page {_idx + 1} failed: {_ce}")
+                    _page_cache[_idx] = {
+                        'pdf_lines': _pdf_lines_by_page[_idx],
+                        'ocr_lines': _ocr_lines_by_page[_idx],
+                        'prefilter_result': {
+                            "fence_found": False,
+                            "method": "classification_error",
+                            "matched_lines": [],
+                            "error": str(_ce),
+                        },
+                    }
+                    continue
+                _page_cache[_idx] = _cache_entry
+                if _cache_entry['prefilter_result'].get("fence_found"):
+                    _fence_page_indices.append(_idx)
+                # Occasional status refresh (every 10 pages) so the UI moves.
+                if _cls_completed % 10 == 0 or _cls_completed == len(_pending_indices):
+                    status_txt_area.text(
+                        f"Phase 1c — Classified {_cls_completed}/{len(_pending_indices)} pages..."
+                    )
+
+        # Keep original page order for deterministic batching and display.
+        _fence_page_indices.sort()
         print(f"SESSION {current_session_id} LOG: Phase 1 complete — "
               f"{len(_fence_page_indices)}/{total_pages} fence pages detected")
         
