@@ -5283,6 +5283,59 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         page_idx = page_data['page_index_in_original_doc']
         pdf_width = page_data.get('pdf_width', 792)
         pdf_height = page_data.get('pdf_height', 612)
+
+        # On-demand re-sync of auto_lines from the phase3_measure disk
+        # cache. When a page's auto_lines slot is empty but the cache
+        # has a real measurement_result (either 'layer' or 'llm_guided'),
+        # build auto_lines here so the canvas shows them. This lets the
+        # user open the measurement tool AFTER a run finished and still
+        # see layer-less (site-plan-style) pages populated — without
+        # having to re-run analysis or flip the Non-layer suggestions
+        # toggle. Idempotent: skipped if auto_lines already populated.
+        _sync_meas = st.session_state.unified_measurements.get(page_key, {})
+        if not _sync_meas.get('auto_lines'):
+            _cached_meas = _cache_get("phase3_measure", _pdf_sha, _cache_params,
+                                      page_idx=page_idx)
+            if _cached_meas and _cached_meas.get('all_fence_lines'):
+                _mm = _cached_meas.get('measurement_method', 'none')
+                if _mm in ('layer', 'llm_guided'):
+                    _l2c = _cached_meas.get('layer_to_category', {}) or {}
+                    _sf = _cached_meas.get('page_info', {}).get('scale_factor', 1.0)
+                    _fallback_cat = "🔍 Auto-detected (LLM-guided)" if _mm == 'llm_guided' else None
+                    _auto_now = []
+                    for _ln in _cached_meas['all_fence_lines']:
+                        _lyr = getattr(_ln, 'layer', None) or ''
+                        _cat = _l2c.get(_lyr)
+                        if not _cat and _lyr:
+                            for _ml, _c in _l2c.items():
+                                if _ml in _lyr or _lyr in _ml:
+                                    _cat = _c
+                                    break
+                        if not _cat:
+                            _cat = _fallback_cat
+                        if not _cat:
+                            continue
+                        _lpts = _ln.length_pts
+                        _auto_now.append({
+                            'start': _ln.start,
+                            'end': _ln.end,
+                            'length_pts': _lpts,
+                            'length_feet': ((_lpts / 72.0) * _sf) / 12.0,
+                            'layer': _lyr,
+                            'category': _cat,
+                            'source': 'auto',
+                            'method': _mm,
+                        })
+                    if _auto_now:
+                        if page_key not in st.session_state.unified_measurements:
+                            st.session_state.unified_measurements[page_key] = {
+                                'auto_lines': [], 'manual_lines': [],
+                                'drawn_lines': [], 'accepted_auto': set(),
+                            }
+                        st.session_state.unified_measurements[page_key]['auto_lines'] = _auto_now
+                        st.session_state.unified_measurements[page_key]['accepted_auto'] = set(range(len(_auto_now)))
+                        print(f"[UMT] page {page_num}: synced {len(_auto_now)} auto lines "
+                              f"from phase3_measure cache (method={_mm})")
         
         # Extract lines from PDF page (cached)
         lines_cache_key = f"lines_{page_num}_{min_line_pts}"
