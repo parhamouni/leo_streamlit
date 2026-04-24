@@ -3809,7 +3809,41 @@ if st.session_state.run_analysis_triggered and \
                                 "Keywords present but rejected: "
                                 + ", ".join(prefilter_result["matched_keywords"][:6])
                             )
-                        st.caption("Page image available in the results view below.")
+                        # Lazy-load the actual page render. Button gate
+                        # keeps memory flat when the user just scrolls past
+                        # this panel — rendering a 150 DPI image of a
+                        # 36x24 engineering sheet is ~2-5 MB per page.
+                        _nf_img_flag = f'_nf_img_loaded_{page_idx}'
+                        if not st.session_state.get(_nf_img_flag):
+                            if st.button("🖼️ Load page image",
+                                         key=f'_btn_{_nf_img_flag}',
+                                         use_container_width=True):
+                                st.session_state[_nf_img_flag] = True
+                                st.rerun()
+                            st.caption("Click to render this page from the PDF.")
+                        else:
+                            _pdf_bytes_nf = _get_pdf_bytes()
+                            _nf_orig, _nf_hl = None, None
+                            if _pdf_bytes_nf:
+                                try:
+                                    _kw_for_nf = [
+                                        k for k in (prefilter_result.get("matched_lines") or [])
+                                        if all(key in k for key in ['x0', 'y0', 'x1', 'y1'])
+                                    ]
+                                    _nf_orig, _nf_hl = get_page_image_on_demand(
+                                        _pdf_sha, _pdf_bytes_nf, page_idx,
+                                        [], [], _kw_for_nf,
+                                        pdf_width, pdf_height,
+                                        bool(highlight_fence_text_app) and bool(_kw_for_nf),
+                                        dpi=DISPLAY_IMAGE_DPI,
+                                    )
+                                except Exception as _nf_e:
+                                    print(f"[APP] non-fence image render for page {page_num} failed: {_nf_e}")
+                            _disp_nf = _nf_hl or _nf_orig
+                            if _disp_nf:
+                                st.image(_disp_nf, caption=f"Page {page_num}")
+                            else:
+                                st.caption("📷 Image unavailable.")
                 # Update summary
                 summary_placeholder.markdown(
                     f"### Summary (Processed: {page_num}/{total_pages})\n"
@@ -4175,48 +4209,60 @@ if st.session_state.run_analysis_triggered and \
                     if reasons:
                         exp_title += f" ({' & '.join(reasons)})"
                 
-                with st.expander(exp_title, expanded=True):
+                # Fence pages start collapsed on purpose. Expanding is
+                # what triggers get_page_image_on_demand to render + cache
+                # the page image — leaving 60 expanders open would pin
+                # 60 rendered PNGs in session_state (blowing past the
+                # LRU cap), and the user doesn't want to see all of them
+                # at once anyway.
+                with st.expander(exp_title, expanded=False):
                     img_col, det_col = st.columns([2, 1])
 
                     with img_col:
-                        # Image goes through the per-session LRU
-                        # (get_page_image_on_demand) rather than being
-                        # rendered inline + held in Python locals.
-                        # Memory: capped at FENCE_IMG_CACHE_MAX (default
-                        # 10) entries × ~3 MB — bounded regardless of
-                        # how many fence pages there are. First call
-                        # renders, subsequent re-renders are cache hits.
-                        _pdf_bytes_live = _get_pdf_bytes()
-                        _orig_live, _hl_live = None, None
-                        if _pdf_bytes_live:
-                            try:
-                                # highlight_page_image expects lists of DICTS
-                                # (needs .get('x0')/.get('y0')). Pass the raw
-                                # structures through; the LRU cache key is
-                                # computed from their JSON form inside
-                                # _img_cache_key, so we don't need to
-                                # pre-flatten them here.
-                                _kw_filtered = [
-                                    k for k in (keyword_matches or [])
-                                    if all(key in k for key in ['x0', 'y0', 'x1', 'y1'])
-                                ]
-                                _orig_live, _hl_live = get_page_image_on_demand(
-                                    _pdf_sha, _pdf_bytes_live, page_idx,
-                                    definitions or [], instances or [], _kw_filtered,
-                                    pdf_width, pdf_height,
-                                    bool(highlight_fence_text_app) and bool(fence_found),
-                                    dpi=DISPLAY_IMAGE_DPI,
-                                )
-                            except Exception as _img_e:
-                                print(f"[APP] live image render for page {page_num} failed: {_img_e}")
-                        _disp_live = _hl_live or _orig_live
-                        if _disp_live:
-                            st.image(
-                                _disp_live,
-                                caption=f"Page {page_num}{' (Highlighted)' if _hl_live else ''}",
-                            )
+                        # Lazy page-image loading. Streamlit's expander
+                        # still executes its body even when collapsed, so
+                        # we can't rely on expander state alone to defer
+                        # the (2-5 MB PNG) render. Instead we gate behind
+                        # a session_state flag set by an explicit button;
+                        # before the user clicks, we only show the button
+                        # and nothing gets rendered / cached. After click,
+                        # the flag stays set so the image is shown on
+                        # every rerun of this expander.
+                        _img_flag = f'_fence_img_loaded_{page_idx}'
+                        if not st.session_state.get(_img_flag):
+                            if st.button("🖼️ Load page image",
+                                         key=f'_btn_{_img_flag}',
+                                         use_container_width=True):
+                                st.session_state[_img_flag] = True
+                                st.rerun()
+                            st.caption("Image not rendered yet (saves memory). "
+                                       "Click above to read from disk.")
                         else:
-                            st.caption("📷 Image unavailable (page or PDF read error)")
+                            _pdf_bytes_live = _get_pdf_bytes()
+                            _orig_live, _hl_live = None, None
+                            if _pdf_bytes_live:
+                                try:
+                                    _kw_filtered = [
+                                        k for k in (keyword_matches or [])
+                                        if all(key in k for key in ['x0', 'y0', 'x1', 'y1'])
+                                    ]
+                                    _orig_live, _hl_live = get_page_image_on_demand(
+                                        _pdf_sha, _pdf_bytes_live, page_idx,
+                                        definitions or [], instances or [], _kw_filtered,
+                                        pdf_width, pdf_height,
+                                        bool(highlight_fence_text_app) and bool(fence_found),
+                                        dpi=DISPLAY_IMAGE_DPI,
+                                    )
+                                except Exception as _img_e:
+                                    print(f"[APP] live image render for page {page_num} failed: {_img_e}")
+                            _disp_live = _hl_live or _orig_live
+                            if _disp_live:
+                                st.image(
+                                    _disp_live,
+                                    caption=f"Page {page_num}{' (Highlighted)' if _hl_live else ''}",
+                                )
+                            else:
+                                st.caption("📷 Image unavailable (page or PDF read error)")
                     
                     with det_col:
                         # Detection method badge
@@ -5355,21 +5401,30 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         base_img_bytes = page_data.get('highlighted_image_bytes') or page_data.get('original_image_bytes')
         _pdf_bytes_img = _get_pdf_bytes() if not base_img_bytes else None
         if not base_img_bytes and _pdf_bytes_img:
-            # Regenerate on demand
-            _defs = page_data.get('definitions', [])
-            _insts = page_data.get('instances', [])
-            _kws = page_data.get('keyword_matches', [])
-            _defs_h = tuple(tuple(sorted(d.items())) for d in _defs) if _defs else ()
-            _insts_h = tuple(tuple(sorted(i.items())) for i in _insts) if _insts else ()
-            _kws_h = tuple(tuple(sorted(k.items())) for k in _kws if all(key in k for key in ['x0','y0','x1','y1'])) if _kws else ()
+            # Regenerate on demand. Pass raw dict lists — NOT the
+            # hash-flattened tuples the earlier version built. The hash
+            # is computed inside _img_cache_key; the renderer needs
+            # .get('x0') access on each item for the highlight overlay
+            # to draw. Flattened tuples silently broke the overlay and
+            # returned the un-highlighted original PNG, which is what
+            # the line-selection canvas was showing.
+            _defs = page_data.get('definitions', []) or []
+            _insts = page_data.get('instances', []) or []
+            _kws = [
+                k for k in (page_data.get('keyword_matches', []) or [])
+                if all(key in k for key in ['x0', 'y0', 'x1', 'y1'])
+            ]
             _orig_img, _hl_img = get_page_image_on_demand(
                 st.session_state.current_pdf_hash,
                 _pdf_bytes_img,
-                page_idx, _defs_h, _insts_h, _kws_h,
+                page_idx, _defs, _insts, _kws,
                 pdf_width, pdf_height,
                 page_data.get('highlight_fence_text_app_setting', True),
                 dpi=DISPLAY_IMAGE_DPI,
             )
+            # Prefer the highlighted base for the line-selection canvas
+            # — users expect to see the green-definition / magenta-instance
+            # rectangles while picking lines, not the raw page.
             base_img_bytes = _hl_img or _orig_img
         
         if base_img_bytes:
