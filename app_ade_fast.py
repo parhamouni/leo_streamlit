@@ -3100,9 +3100,49 @@ if st.session_state.run_analysis_triggered and \
                 print(f"SESSION {current_session_id} LOG: ADE batch {batch_idx + 1}: "
                       f"{len(batch)} pages, {len(batch_pdf) / 1024:.0f}KB")
 
+                # Helper — re-run ADE on ONE page and store its result.
+                # Used both for whole-batch failures and for single-page
+                # "zero chunks returned in a multi-page batch" recovery.
+                # Returns True if the single-page call produced a non-empty
+                # chunk list (caller can use that to count retries).
+                def _retry_single(orig_idx):
+                    try:
+                        if _pdf_path_for_phase2 and os.path.exists(_pdf_path_for_phase2):
+                            single_pdf = ade.safe_single_page_pdf_from_path(
+                                _pdf_path_for_phase2, orig_idx,
+                                max_bytes=_ADE_PAGE_MAX_BYTES,
+                            )
+                        else:
+                            single_pdf = ade.create_single_page_pdf(file_bytes, orig_idx)
+                        single_resp = ade.ade_parse_document(single_pdf, ade_key)
+                        del single_pdf
+                        if single_resp["success"]:
+                            pdf_w, pdf_h = _page_dims.get(orig_idx, (0.0, 0.0))
+                            chunks = ade.align_ade_chunks_to_page(single_resp, 0, pdf_w, pdf_h)
+                            result[orig_idx] = chunks
+                            _cache_put("phase2", _pdf_sha, _cache_params, chunks,
+                                       page_idx=orig_idx, user_scope=_worker_scope)
+                            return bool(chunks)
+                        result[orig_idx] = None
+                        print(f"[APP] Page {orig_idx + 1}: individual ADE also failed")
+                        return False
+                    except Exception as _e:
+                        result[orig_idx] = None
+                        print(f"[APP] Page {orig_idx + 1}: individual ADE error: {_e}")
+                        return False
+
                 resp = ade.ade_parse_document(batch_pdf, ade_key)
                 del batch_pdf  # release the transient batch-PDF bytes ASAP
                 if resp["success"]:
+                    # Track pages that came back with zero chunks so we can
+                    # retry them individually. ADE's per-document context
+                    # occasionally merges/drops small regions when many
+                    # dense engineering detail pages share one request —
+                    # the same page alone usually returns a proper chunk
+                    # list. Only retry inside MULTI-page batches; a legit
+                    # empty page in a single-page batch shouldn't be
+                    # double-billed.
+                    _zero_chunk_retries = []
                     for local_idx, orig_idx in enumerate(batch):
                         try:
                             pdf_w, pdf_h = _page_dims.get(orig_idx, (0.0, 0.0))
@@ -3110,37 +3150,25 @@ if st.session_state.run_analysis_triggered and \
                             result[orig_idx] = chunks
                             _cache_put("phase2", _pdf_sha, _cache_params, chunks,
                                        page_idx=orig_idx, user_scope=_worker_scope)
+                            if len(batch) > 1 and not chunks:
+                                _zero_chunk_retries.append(orig_idx)
                         except Exception as _e:
                             result[orig_idx] = None
                             print(f"[APP] Page {orig_idx + 1}: align failed ({_e}) — marking as no ADE")
+                    if _zero_chunk_retries:
+                        print(f"[APP] ADE batch {batch_idx + 1}: "
+                              f"{len(_zero_chunk_retries)} page(s) returned 0 chunks "
+                              "— retrying individually: "
+                              + ", ".join(str(i + 1) for i in _zero_chunk_retries))
+                        for orig_idx in _zero_chunk_retries:
+                            _retry_single(orig_idx)
                 else:
-                    # Batch failed — retry pages individually (sequential within
-                    # this batch's worker; other batches keep running in parallel).
-                    # Each single-page PDF is also size-capped via safe_*.
+                    # Batch failed — retry every page individually
+                    # (sequential within this worker; other batches keep
+                    # running in parallel).
                     print(f"[APP] ADE batch {batch_idx + 1} failed: {resp.get('error')} — retrying individually")
                     for orig_idx in batch:
-                        try:
-                            if _pdf_path_for_phase2 and os.path.exists(_pdf_path_for_phase2):
-                                single_pdf = ade.safe_single_page_pdf_from_path(
-                                    _pdf_path_for_phase2, orig_idx,
-                                    max_bytes=_ADE_PAGE_MAX_BYTES,
-                                )
-                            else:
-                                single_pdf = ade.create_single_page_pdf(file_bytes, orig_idx)
-                            single_resp = ade.ade_parse_document(single_pdf, ade_key)
-                            del single_pdf
-                            if single_resp["success"]:
-                                pdf_w, pdf_h = _page_dims.get(orig_idx, (0.0, 0.0))
-                                chunks = ade.align_ade_chunks_to_page(single_resp, 0, pdf_w, pdf_h)
-                                result[orig_idx] = chunks
-                                _cache_put("phase2", _pdf_sha, _cache_params, chunks,
-                                           page_idx=orig_idx, user_scope=_worker_scope)
-                            else:
-                                result[orig_idx] = None
-                                print(f"[APP] Page {orig_idx + 1}: individual ADE also failed")
-                        except Exception as _e:
-                            result[orig_idx] = None
-                            print(f"[APP] Page {orig_idx + 1}: individual ADE error: {_e}")
+                        _retry_single(orig_idx)
                 return result
 
             status_txt_area.text(
