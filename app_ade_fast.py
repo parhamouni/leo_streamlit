@@ -5908,6 +5908,48 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
     # "Load this page" button so a user who only wants Page 3 doesn't
     # pay the cost for pages 1, 2, 4, 5 they never touched. Edits they
     # make on any loaded page persist in session_state regardless.
+    def _evict_other_umt_pages(active_pg_num: int):
+        """Purge heavy per-page measurement state for EVERY page except
+        active_pg_num. Keeps memory to one page's worth of rendered
+        image + line stats at a time. The user's actual EDITS
+        (line_assignments, user_drawn_lines, page_categories) live in
+        per-page dicts and are NOT touched — they persist across page
+        switches so the user can come back to a page and see their
+        assignments.
+        """
+        _heavy_prefixes = (
+            "base_img_", "base_img_size_", "drawn_img_", "orig_img_size_",
+            "line_stats_", "lines_", "auto_synced_", "auto_matched_indices_",
+            "click_key_",
+        )
+        _active_suffix = f"_{active_pg_num}_"
+        _active_exact = f"_{active_pg_num}"
+        purged = 0
+        for k in list(st.session_state.keys()):
+            if not any(k.startswith(p) for p in _heavy_prefixes):
+                continue
+            # These keys embed the page number in their name, e.g.
+            # base_img_3_1200, drawn_img_5_1200_<hash>, line_stats_2_30_360.0.
+            # Keep only entries tagged with the active page; drop the rest.
+            _rest = k.split("_", 2)[-1] if "_" in k else ""
+            if f"_{active_pg_num}_" in k or k.endswith(_active_exact):
+                continue
+            try:
+                del st.session_state[k]
+                purged += 1
+            except Exception:
+                pass
+        if purged:
+            import gc as _gc
+            _gc.collect()
+            try:
+                import ctypes as _ct
+                _ct.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
+            print(f"SESSION {current_session_id} LOG: UMT evicted "
+                  f"{purged} heavy state keys for non-active pages")
+
     for tab_idx, (tab, page_data) in enumerate(zip(page_tabs, st.session_state.fence_pages)):
         with tab:
             _umt_pg_num = page_data['page_number']
@@ -5919,12 +5961,24 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                                  key=f"_umt_pg_btn_{_umt_pg_num}",
                                  type="primary",
                                  use_container_width=True):
+                        # Evict other pages' heavy state before loading
+                        # this one — at most ONE page's worth of images
+                        # + line stats is in memory at a time. Edits
+                        # persist across pages via session_state dicts.
+                        _evict_other_umt_pages(_umt_pg_num)
+                        # Also clear the other tabs' "loaded" flags so
+                        # they revert to showing their own Load button.
+                        for _k in list(st.session_state.keys()):
+                            if _k.startswith("_umt_pg_loaded_") and _k != _umt_pg_flag:
+                                del st.session_state[_k]
                         st.session_state[_umt_pg_flag] = True
                         st.rerun()
                 with _cap_col:
                     st.caption(
                         "Click to detect vector lines + render the measurement "
-                        "canvas for this page. Other tabs stay dormant."
+                        "canvas for this page. Opens this page and offloads "
+                        "any other currently-loaded page's images from memory. "
+                        "Your line assignments persist across page switches."
                     )
             else:
                 render_page_fragment(page_data, zoom_level, min_line_pts)
