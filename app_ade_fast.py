@@ -4806,8 +4806,32 @@ elif st.session_state.processing_complete:
                         exp_title_res += f" ({' & '.join(reasons_res)})"
                 
                 _pidx_for_exp = res_data_item.get('page_index_in_original_doc', 0)
-                _res_expanded = bool(st.session_state.get(f'_page_img_loaded_{_pidx_for_exp}'))
+                _flag_for_exp = f'_page_img_loaded_{_pidx_for_exp}'
+                _res_expanded = bool(st.session_state.get(_flag_for_exp))
                 with st.expander(exp_title_res, expanded=_res_expanded):
+                    # Full-body gate. Streamlit runs every expander's body
+                    # on every script rerun — 62 fence pages with pandas
+                    # DataFrames for definitions + instances + element
+                    # specs was rendering thousands of DOM rows on every
+                    # interaction, which made the fence column feel
+                    # "frozen" while the non-fence column looked fine (it
+                    # just renders a couple of text captions per page).
+                    # Gate the whole content behind the per-page loaded
+                    # flag so collapsed pages show only a single button.
+                    if not st.session_state.get(_flag_for_exp):
+                        if st.button(
+                            "🖼️ Load page details",
+                            key=f'_btn_expand_{_pidx_for_exp}',
+                            use_container_width=True,
+                        ):
+                            st.session_state[_flag_for_exp] = True
+                            st.rerun()
+                        st.caption(
+                            "Click to render the page image + definitions + "
+                            "instances + measurements from disk."
+                        )
+                        continue  # skip the heavy body for collapsed pages
+
                     img_col_r, det_col_r = st.columns([2, 1])
 
                     with img_col_r:
