@@ -5138,7 +5138,32 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
     st.markdown("---")
     st.markdown("<h2>📏 Unified Measurement Tool</h2>", unsafe_allow_html=True)
     st.caption("🤖 Auto-detected lines shown in cyan | 👆 Click to select manual lines | ✏️ Draw custom lines")
-    
+
+    # Whole-tool lazy gate. Rendering the tool for every fence page
+    # costs ~1-4 MB of session_state per page plus an LLM scale-detect
+    # call per page — a 68-fence-page deck paid that on every rerun.
+    # Gate the entire section behind an explicit button; only users who
+    # actually need the interactive measurement canvas load it. The
+    # user's modifications (line assignments, drawn lines) are
+    # persisted in session_state, so re-opening the tool restores them.
+    _UMT_LOADED_KEY = "_umt_tool_loaded"
+    if not st.session_state.get(_UMT_LOADED_KEY):
+        _umt_col1, _umt_col2 = st.columns([1, 3])
+        with _umt_col1:
+            if st.button("📏 Open Measurement Tool",
+                         key="_umt_open_btn",
+                         type="primary",
+                         use_container_width=True):
+                st.session_state[_UMT_LOADED_KEY] = True
+                st.rerun()
+        with _umt_col2:
+            st.caption(
+                "Interactive canvas for auto-detected + manually drawn fence lines. "
+                "Heavy (scale-detect LLM + vector line detection per page) — "
+                "only loads when requested. Your assignments are saved."
+            )
+        st.stop()  # skip the rest of the tool this run
+
     # Auto-detect and verify scale PER PAGE using LLM
     from utils_vector import verify_scale_with_bar
     
