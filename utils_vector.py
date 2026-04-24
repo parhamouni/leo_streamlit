@@ -833,6 +833,100 @@ If no scale found, set found=false and scale_inches=null."""
     return result
 
 
+def _regex_scan_scale(page: fitz.Page) -> Dict:
+    """Pure-regex scale extraction from page text (no LLM). Returns the
+    same-shaped dict as verify_scale_with_bar. `success=True` when a
+    convincing scale pattern is found; otherwise a zero-cost miss.
+
+    Pulled out of verify_scale_with_bar so it can be tried BEFORE any
+    LLM call — 70-90% of engineering drawings put the scale in a title-
+    block text string and don't need vision/LLM inference.
+    """
+    result = {
+        'success': False,
+        'verified_scale': None,
+        'scale_text': None,
+        'confidence': 'low',
+        'message': '',
+        'method': 'regex',
+    }
+    try:
+        text = page.get_text() or ""
+    except Exception as e:
+        result['message'] = f"page text read failed: {e}"
+        return result
+    if not text.strip():
+        result['message'] = "no text on page"
+        return result
+
+    # Patterns ordered by specificity. First match wins.
+    # Look near the word "SCALE" to avoid false hits from random numbers.
+    scale_patterns = [
+        # "SCALE: 1" = 30'-0"" or "SCALE 1"=30'"
+        (r'SCALE[:\s]*1\s*["\']?\s*=\s*(\d+)\s*[\'′]', 'feet'),
+        # "1/4" = 1'-0"" or "1/8"=1'-0""
+        (r'(\d+)\s*/\s*(\d+)\s*["\']?\s*=\s*1\s*[\'′]', 'fraction_feet'),
+        # "1" = 30'" (no explicit SCALE: prefix — weaker signal)
+        (r'1\s*["\']?\s*=\s*(\d+)\s*[\'′]', 'feet_weak'),
+        # "1:48" or "1/48" ratio
+        (r'SCALE[:\s]*1\s*[:/]\s*(\d+)\b', 'ratio'),
+    ]
+
+    upper = text.upper()
+    for pattern, kind in scale_patterns:
+        m = re.search(pattern, upper)
+        if not m:
+            continue
+        try:
+            if kind == 'fraction_feet':
+                # e.g. 1/4" = 1' → 1" = 4' → 48 inches
+                num, den = float(m.group(1)), float(m.group(2))
+                if num <= 0:
+                    continue
+                scale_inches = (den / num) * 12.0
+            elif kind in ('feet', 'feet_weak'):
+                scale_inches = float(m.group(1)) * 12.0
+            elif kind == 'ratio':
+                scale_inches = float(m.group(1))
+            else:
+                continue
+        except (ValueError, ZeroDivisionError):
+            continue
+
+        if scale_inches <= 0 or scale_inches > 100000:
+            continue  # sanity guard
+
+        result['success'] = True
+        result['verified_scale'] = scale_inches
+        result['scale_text'] = m.group(0).strip()
+        # "SCALE:" anchor gives high confidence; bare "1"=X'" is medium
+        result['confidence'] = 'medium' if kind == 'feet_weak' else 'high'
+        result['message'] = f"regex scale: {result['scale_text']} → 1\"={scale_inches/12:.1f}'"
+        return result
+
+    result['message'] = "no scale pattern matched"
+    return result
+
+
+def verify_scale_with_bar_fast(page: fitz.Page, llm: Any = None) -> Dict:
+    """Speed-optimized drop-in for verify_scale_with_bar.
+
+    Order:
+      1. Regex on page text (free) — if confident, return immediately.
+      2. Fall back to the existing LLM chain (vision → text LLM).
+
+    On engineering drawings with a clear title-block scale notation
+    this avoids the vision-LLM round-trip entirely (2-5s → 0ms).
+    """
+    regex_result = _regex_scan_scale(page)
+    if regex_result.get('success') and regex_result.get('confidence') in ('high', 'medium'):
+        return regex_result
+
+    # No confident regex hit — use the LLM chain if available, otherwise
+    # fall through to the bar-line detector in verify_scale_with_bar.
+    return verify_scale_with_bar(page, llm=llm)
+
+
 def verify_scale_with_bar(page: fitz.Page, llm: Any = None) -> Dict:
     """
     Detect scale factor using LLM (preferred) or regex fallback.

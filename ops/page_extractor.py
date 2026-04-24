@@ -43,16 +43,84 @@ except Exception:
 from utils_ade import get_native_pdf_lines  # noqa: E402
 
 
-def main() -> int:
-    if len(sys.argv) != 3:
-        sys.stdout.write(json.dumps({"ok": False, "error": "usage: page_extractor.py PDF_PATH PAGE_INDEX"}))
-        return 2
-    pdf_path = sys.argv[1]
+def _page_health_probe(doc, page_idx: int) -> tuple[bool, str]:
+    """Cheap health check run BEFORE expensive text extraction.
+
+    Catches most structurally-damaged pages without triggering MuPDF's
+    recovery loop. Pages that pass the probe can still hang during
+    extraction (if the content stream is subtly malformed), so the
+    parent subprocess still needs a wall-clock timeout — but healthy
+    pages finish in <1 ms here, so the probe is effectively free for
+    the common case.
+
+    Returns (ok, reason). ok=False means mark the page as damaged and
+    skip extraction.
+    """
     try:
-        page_idx = int(sys.argv[2])
-    except ValueError:
-        sys.stdout.write(json.dumps({"ok": False, "error": f"invalid page index: {sys.argv[2]!r}"}))
+        if page_idx < 0 or page_idx >= len(doc):
+            return False, f"page index {page_idx} out of range (0..{len(doc) - 1})"
+        page = doc[page_idx]
+        # Page-dict + dims access. Breaks on missing xref, bad kids, etc.
+        w, h = page.rect.width, page.rect.height
+        if w <= 0 or h <= 0:
+            return False, f"non-positive page dimensions: {w}x{h}"
+        # Content-stream reference check. Broken pages often have an
+        # empty or unresolvable contents array.
+        contents = page.get_contents()
+        if contents is None:
+            return False, "page.get_contents() returned None"
+        return True, ""
+    except Exception as e:
+        return False, f"probe failed: {e}"
+
+
+def _extract_one(doc, page_idx: int) -> dict:
+    """Extract one page from an already-open doc. Runs a cheap health
+    probe first, skips expensive extraction if the probe fails."""
+    ok, reason = _page_health_probe(doc, page_idx)
+    if not ok:
+        return {"page_idx": page_idx, "ok": False, "error": f"damaged: {reason}"}
+    try:
+        page = doc[page_idx]
+        lines = get_native_pdf_lines(page)
+        return {"page_idx": page_idx, "ok": True, "lines": lines}
+    except Exception as e:
+        return {"page_idx": page_idx, "ok": False, "error": f"extract failed: {e}"}
+
+
+def main() -> int:
+    """Usage forms:
+        page_extractor.py PDF_PATH PAGE_INDEX                  (single page, legacy)
+        page_extractor.py PDF_PATH --pages 3,5,7,9,11          (batch)
+
+    Legacy output (single-page): {"ok": bool, "lines": [...]} or {"ok": false, "error": ...}
+    Batch output: {"ok": true, "results": [{"page_idx": N, "ok": bool, "lines": [...]/"error": ...}, ...]}
+    """
+    args = sys.argv[1:]
+    if len(args) < 2:
+        sys.stdout.write(json.dumps({"ok": False,
+                                     "error": "usage: page_extractor.py PDF_PATH PAGE_INDEX | PDF_PATH --pages N,N,N"}))
         return 2
+    pdf_path = args[0]
+
+    # Parse page indices (legacy single-int form OR --pages list form)
+    batch_mode = False
+    page_indices = []
+    if args[1] == "--pages" and len(args) >= 3:
+        batch_mode = True
+        try:
+            page_indices = [int(x) for x in args[2].split(",") if x.strip() != ""]
+        except ValueError:
+            sys.stdout.write(json.dumps({"ok": False,
+                                         "error": f"invalid --pages list: {args[2]!r}"}))
+            return 2
+    else:
+        try:
+            page_indices = [int(args[1])]
+        except ValueError:
+            sys.stdout.write(json.dumps({"ok": False,
+                                         "error": f"invalid page index: {args[1]!r}"}))
+            return 2
 
     try:
         doc = fitz.open(pdf_path)
@@ -61,22 +129,30 @@ def main() -> int:
         return 1
 
     try:
-        if page_idx < 0 or page_idx >= len(doc):
-            sys.stdout.write(json.dumps({"ok": False, "error": f"page index {page_idx} out of range (0..{len(doc) - 1})"}))
-            return 1
-        page = doc[page_idx]
-        lines = get_native_pdf_lines(page)
-    except Exception as e:
-        sys.stdout.write(json.dumps({"ok": False, "error": f"extract failed: {e}"}))
+        if batch_mode:
+            # Stream one JSON line per page so the parent can recover any
+            # pages that finished before the subprocess got SIGKILL'd on
+            # a MuPDF hang. Each line is complete JSON on its own; a final
+            # "done" line signals clean finish.
+            for pi in page_indices:
+                r = _extract_one(doc, pi)
+                sys.stdout.write(json.dumps({"page_result": r}) + "\n")
+                sys.stdout.flush()
+            sys.stdout.write(json.dumps({"done": True}) + "\n")
+            sys.stdout.flush()
+            return 0
+        # Legacy single-page response shape (keep existing callers working).
+        r = _extract_one(doc, page_indices[0])
+        if r["ok"]:
+            sys.stdout.write(json.dumps({"ok": True, "lines": r["lines"]}))
+            return 0
+        sys.stdout.write(json.dumps({"ok": False, "error": r["error"]}))
         return 1
     finally:
         try:
             doc.close()
         except Exception:
             pass
-
-    sys.stdout.write(json.dumps({"ok": True, "lines": lines}))
-    return 0
 
 
 if __name__ == "__main__":

@@ -78,11 +78,38 @@ def ade_parse_document(pdf_bytes: bytes, api_key: str, zdr: bool = False) -> Dic
 
 
 def align_ade_chunks_to_page(ade_result: Dict, page_idx: int, page_width: float, page_height: float) -> List[Dict]:
+    """Filter the flat ADE chunk list down to chunks belonging to `page_idx`.
+
+    Defensive about page-index base: LandingAI ADE docs don't commit to 0- vs
+    1-based `grounding.page`, and we saw cases on dense detail sheets where
+    pages appeared to get 0 chunks despite ADE returning data. Check both
+    candidates (page_idx and page_idx+1) — if the chunks' observed min page
+    is >0, treat the API as 1-based for THIS response.
+    """
     chunks = ade_result.get("data", {}).get("chunks", [])
+    if not chunks:
+        return []
+
+    # Determine base: if the smallest grounding.page we see is >= 1 AND
+    # there are no page-0 chunks, the API is 1-based for this call.
+    pages_seen = set()
+    for c in chunks:
+        p = c.get("grounding", {}).get("page")
+        if isinstance(p, int):
+            pages_seen.add(p)
+    is_one_based = bool(pages_seen) and 0 not in pages_seen and min(pages_seen) >= 1
+    target_page = page_idx + 1 if is_one_based else page_idx
+
+    if is_one_based:
+        # One-line log helps verify next run. Safe to keep — fires at most
+        # once per ADE response.
+        print(f"[DEBUG] ADE response is 1-based (pages seen: {sorted(pages_seen)[:10]}); "
+              f"mapping requested page_idx={page_idx} → target_page={target_page}")
+
     page_chunks = []
     for chunk in chunks:
         grounding = chunk.get("grounding", {})
-        if grounding.get("page") != page_idx:
+        if grounding.get("page") != target_page:
             continue
 
         box = grounding.get("box", {})
@@ -99,6 +126,14 @@ def align_ade_chunks_to_page(ade_result: Dict, page_idx: int, page_width: float,
             "x0": x0, "y0": y0, "x1": x1, "y1": y1,
             "bbox": (x0, y0, x1, y1)
         })
+
+    # Extra diagnostics when we come up empty — helps find cases where
+    # ADE returned chunks but none matched our page_idx filter.
+    if not page_chunks and pages_seen:
+        print(f"[DEBUG] align: NO chunks matched page_idx={page_idx} "
+              f"(target_page={target_page}, pages_seen={sorted(pages_seen)}, "
+              f"total_chunks={len(chunks)})")
+
     return page_chunks
 
 
@@ -156,6 +191,112 @@ def get_docai_client(google_cloud_config: Dict):
     except Exception as e:
         print(f"[DEBUG] ❌ Error creating DocAI client: {e}")
         return None
+
+
+def run_google_ocr_blocks_multipage(
+    multipage_pdf_bytes: bytes,
+    google_cloud_config: Dict,
+    page_dims_by_local_idx: Dict[int, Tuple[float, float]],
+) -> Dict[int, List[Dict]]:
+    """Run Google Document AI OCR on a multi-page PDF in one API call.
+
+    Instead of N calls × 1 page, sends one request with up to 15 pages
+    as a PDF (DocAI's sync per-request page cap). Returns a dict keyed
+    by the LOCAL page index within the PDF (0, 1, …, N-1). The caller
+    is responsible for mapping local → original page index.
+
+    page_dims_by_local_idx: {local_idx: (pdf_width, pdf_height)} — used
+    to convert normalized vertices to PDF coordinate space per page.
+
+    Each value in the returned dict is the same shape as
+    run_google_ocr_blocks() returned for a single page.
+    """
+    print(f"[DEBUG] Starting multi-page Google OCR ({len(page_dims_by_local_idx)} pages)...")
+    client = get_docai_client(google_cloud_config)
+    if not client:
+        return {i: [] for i in page_dims_by_local_idx}
+
+    project_id = google_cloud_config.get("project_number")
+    location = google_cloud_config.get("location")
+    processor_id = google_cloud_config.get("processor_id")
+    name = f"projects/{project_id}/locations/{location}/processors/{processor_id}"
+
+    raw_document = documentai.RawDocument(content=multipage_pdf_bytes, mime_type="application/pdf")
+    request = documentai.ProcessRequest(name=name, raw_document=raw_document)
+
+    try:
+        result = client.process_document(request=request, timeout=180)
+        doc_result = result.document
+        print(f"[DEBUG] Multi-page OCR returned; total text length: {len(doc_result.text)}, "
+              f"pages: {len(doc_result.pages)}")
+    except Exception as e:
+        print(f"[DEBUG] ❌ DocAI Multi-page OCR failed: {e}")
+        return {i: [] for i in page_dims_by_local_idx}
+
+    out: Dict[int, List[Dict]] = {i: [] for i in page_dims_by_local_idx}
+    for local_idx, ocr_page in enumerate(doc_result.pages):
+        if local_idx not in page_dims_by_local_idx:
+            continue
+        pdf_width, pdf_height = page_dims_by_local_idx[local_idx]
+        lines: List[Dict] = []
+
+        for paragraph in ocr_page.paragraphs:
+            text_content = ""
+            layout = paragraph.layout
+            for segment in layout.text_anchor.text_segments:
+                text_content += doc_result.text[segment.start_index:segment.end_index]
+            text_content = text_content.strip()
+            if not text_content:
+                continue
+            vertices = layout.bounding_poly.normalized_vertices
+            if not vertices:
+                continue
+            xs = [v.x * pdf_width for v in vertices if v.x is not None]
+            ys = [v.y * pdf_height for v in vertices if v.y is not None]
+            if not xs or not ys:
+                continue
+            lines.append({
+                "text": text_content,
+                "x0": min(xs), "y0": min(ys),
+                "x1": max(xs), "y1": max(ys),
+                "source": "ocr_paragraph",
+            })
+
+        # Token-level (same dedup logic as the single-page variant).
+        existing_positions = set((round(l['x0']), round(l['y0']), l['text']) for l in lines)
+        token_source = list(getattr(ocr_page, 'tokens', None) or [])
+        if not token_source:
+            for line in getattr(ocr_page, 'lines', []):
+                for word in getattr(line, 'words', []):
+                    token_source.append(word)
+        for token in token_source:
+            layout = token.layout
+            text_content = ""
+            for segment in layout.text_anchor.text_segments:
+                text_content += doc_result.text[segment.start_index:segment.end_index]
+            text_content = text_content.strip()
+            if not text_content:
+                continue
+            vertices = layout.bounding_poly.normalized_vertices
+            if not vertices:
+                continue
+            xs = [v.x * pdf_width for v in vertices if v.x is not None]
+            ys = [v.y * pdf_height for v in vertices if v.y is not None]
+            if not xs or not ys:
+                continue
+            x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+            pos_key = (round(x0), round(y0), text_content)
+            if pos_key in existing_positions:
+                continue
+            existing_positions.add(pos_key)
+            lines.append({
+                "text": text_content,
+                "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+                "source": "ocr_token",
+            })
+
+        out[local_idx] = lines
+    return out
 
 
 def run_google_ocr_blocks(page_bytes: bytes, google_cloud_config: Dict, pdf_width: float, pdf_height: float) -> List[Dict]:
@@ -398,6 +539,103 @@ def find_best_bbox(search_text: str, pdf_lines: List[Dict], ocr_lines: List[Dict
 # ==============================================================================
 
 
+def llm_extract_fence_elements_batch(llm, texts_by_id, keywords: List[str], batch_size: int = 6):
+    """Extract fence-related legend entries from multiple chunks in one
+    LLM round-trip. Output is attributed back to input chunk ids.
+
+    Args:
+      texts_by_id: dict {chunk_id (hashable): chunk_text}
+      keywords: fence keywords hint
+
+    Returns:
+      dict {chunk_id: [items]} where items match llm_extract_fence_elements output.
+
+    On parse failure or missing ids, falls back to per-chunk
+    llm_extract_fence_elements so robustness matches the unbatched path.
+    """
+    out = {}
+    if not llm or not texts_by_id:
+        return {k: [] for k in (texts_by_id or {})}
+
+    ids = list(texts_by_id.keys())
+    hint_keywords = ", ".join(sorted(set(keywords)))
+
+    try:
+        from langchain_core.messages import SystemMessage, HumanMessage  # type: ignore
+        _use_messages = True
+    except Exception:
+        _use_messages = False
+
+    system_prompt = (
+        "You are an assistant reviewing engineering drawing documentation. "
+        "For EACH chunk provided, extract fence-related legend entries, callouts or "
+        "tags, and return them as paired indicator + text elements.\n\n"
+        f"Only return items that clearly map to: {hint_keywords}.\n\n"
+        "Respond with JSON ONLY, exactly this shape:\n"
+        '{"results": [{"chunk_id": "<string>", "items": [{"indicator": "...", '
+        '"text_element": "...", "description": "..."}]}, ...]}\n'
+        "The chunk_id in each result must match the <chunk id=\"...\"> from the "
+        "user message. Include one result per chunk — never skip a chunk. "
+        "If a chunk has no fence-related items, return items=[]."
+    )
+
+    # Process in batches so we don't blow past the model's context.
+    for start in range(0, len(ids), batch_size):
+        batch_ids = ids[start:start + batch_size]
+        chunk_blocks = []
+        for cid in batch_ids:
+            txt = (texts_by_id[cid] or "").strip()[:4000]
+            chunk_blocks.append(f'<chunk id="{cid}">\n{txt}\n</chunk>')
+        user_content = "Chunks:\n" + "\n\n".join(chunk_blocks)
+
+        parsed_by_id = {}
+        try:
+            if _use_messages:
+                raw = llm.invoke([
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_content),
+                ])
+            else:
+                raw = llm.invoke(system_prompt + "\n\n" + user_content) if hasattr(llm, "invoke") \
+                      else llm(system_prompt + "\n\n" + user_content)
+            text = getattr(raw, "content", str(raw))
+            m = re.search(r'\{.*\}', text, re.DOTALL)
+            if m:
+                data = json.loads(m.group(0))
+                for entry in data.get("results", []):
+                    if not isinstance(entry, dict):
+                        continue
+                    cid = str(entry.get("chunk_id", ""))
+                    if not cid:
+                        continue
+                    clean = []
+                    for it in entry.get("items", []) or []:
+                        if not isinstance(it, dict):
+                            continue
+                        ind = str(it.get("indicator") or "").strip()
+                        txt_e = str(it.get("text_element") or "").strip()
+                        desc = str(it.get("description") or "").strip()
+                        if ind or txt_e:
+                            clean.append({"indicator": ind, "text_element": txt_e, "description": desc})
+                    parsed_by_id[cid] = clean
+        except Exception as e:
+            print(f"[llm_extract_fence_elements_batch] batch parse failed: {e}")
+
+        # Fill in each chunk — if the model skipped one, fall back to a
+        # per-chunk call so the caller always gets a value for every id.
+        for cid in batch_ids:
+            key = str(cid)
+            if key in parsed_by_id:
+                out[cid] = parsed_by_id[key]
+            else:
+                print(f"[llm_extract_fence_elements_batch] chunk {cid} missing from batch response; falling back")
+                try:
+                    out[cid] = llm_extract_fence_elements(llm, texts_by_id[cid], keywords)
+                except Exception as _e2:
+                    out[cid] = []
+    return out
+
+
 def llm_extract_fence_elements(llm, text: str, keywords: List[str], max_items: int = 100) -> List[Dict]:
     if not llm or not text:
         return []
@@ -452,8 +690,17 @@ def extract_legend_entries(
     ocr_lines: List[Dict],
     fence_keywords: List[str],
     llm,
-    figure_chunks: List[Dict] = None
+    figure_chunks: List[Dict] = None,
+    prefilled_legend_items=None,  # optional {chunk_idx: [items]} — skip LLM when hit
+    prefilled_figure_items=None,  # optional {chunk_idx: [items]} — skip LLM when hit
 ) -> List[Dict]:
+    """extract_legend_entries with optional prefilled-items kwargs.
+
+    When a caller (the fast build) has already called a batched LLM
+    extractor for multiple pages' chunks at once, it can pass the
+    per-chunk items in via these dicts to skip the per-chunk LLM call
+    here. Behavior is 100% backward-compatible when kwargs are None.
+    """
     print("[DEBUG] Extracting Legend Entries and Matching BBoxes...")
     results = []
 
@@ -515,11 +762,14 @@ def extract_legend_entries(
                     })
 
     # Pass 1: Process legend chunks (primary source)
-    for chunk in legend_chunks:
+    for _ci, chunk in enumerate(legend_chunks):
         text = chunk.get("text", "")
         if not text:
             continue
-        items = llm_extract_fence_elements(llm, text, fence_keywords)
+        if prefilled_legend_items is not None and _ci in prefilled_legend_items:
+            items = prefilled_legend_items[_ci]
+        else:
+            items = llm_extract_fence_elements(llm, text, fence_keywords)
         _process_chunk(chunk, items, results, extraction_pass="legend")
 
     # Check quality of legend results — filter out bad indicators
@@ -528,7 +778,7 @@ def extract_legend_entries(
     # Pass 2: If legend chunks yielded few good results, also extract from figure chunks
     if len(good_results) < 3 and figure_chunks:
         print(f"[DEBUG] Legend extraction yielded only {len(good_results)} good results, trying figure chunks...")
-        for chunk in figure_chunks:
+        for _ci, chunk in enumerate(figure_chunks):
             text = chunk.get("text", "")
             if not text:
                 continue
@@ -536,7 +786,10 @@ def extract_legend_entries(
             text_lower = text.lower()
             if not any(kw.lower() in text_lower for kw in fence_keywords):
                 continue
-            items = llm_extract_fence_elements(llm, text, fence_keywords)
+            if prefilled_figure_items is not None and _ci in prefilled_figure_items:
+                items = prefilled_figure_items[_ci]
+            else:
+                items = llm_extract_fence_elements(llm, text, fence_keywords)
             _process_chunk(chunk, items, results, extraction_pass="figure")
     
     # Pass 3: If still few results, try extracting from OCR lines with fence keywords
@@ -922,6 +1175,189 @@ def find_instances_in_figures(legend_entries: List[Dict], figure_chunks: List[Di
     return instances
 
 
+def find_instances_in_figures_fast(legend_entries: List[Dict], figure_chunks: List[Dict], all_tokens: List[Dict], ocr_lines: List[Dict] = None) -> List[Dict]:
+    """Performance variant of find_instances_in_figures.
+
+    Semantically identical — matches and ordering are bit-equivalent to the
+    original. The only difference is that the "which tokens are inside
+    which figure chunks?" step uses a single numpy pass instead of
+    O(chunks × tokens) Python-level comparisons.
+
+    On a page with ~500 tokens and ~100 figure chunks the prefilter alone
+    is 10-50x faster; overall speedup depends on how many tokens survive
+    the prefilter.
+    """
+    import numpy as np
+
+    print("[DEBUG-FAST] Finding Instances in Figure Chunks (numpy prefilter)...")
+    print(f"[DEBUG-FAST] Figure chunks count: {len(figure_chunks)}")
+
+    # --- OCR merge: identical to the original ---
+    if ocr_lines:
+        existing_positions = set()
+        for t in all_tokens:
+            existing_positions.add((round(t['x0']), round(t['y0']), t.get('text', '')))
+
+        ocr_added = 0
+        for ocr_line in ocr_lines:
+            text = ocr_line.get('text', '').strip()
+            if not text:
+                continue
+            words = text.split()
+            if len(words) <= 1:
+                pos_key = (round(ocr_line.get('x0', 0)), round(ocr_line.get('y0', 0)), text)
+                if pos_key not in existing_positions:
+                    all_tokens.append({
+                        'text': text,
+                        'x0': ocr_line.get('x0', 0),
+                        'y0': ocr_line.get('y0', 0),
+                        'x1': ocr_line.get('x1', 0),
+                        'y1': ocr_line.get('y1', 0),
+                    })
+                    existing_positions.add(pos_key)
+                    ocr_added += 1
+            else:
+                total_len = sum(len(w) for w in words)
+                x0 = ocr_line.get('x0', 0)
+                x1 = ocr_line.get('x1', 0)
+                y0 = ocr_line.get('y0', 0)
+                y1 = ocr_line.get('y1', 0)
+                span = x1 - x0
+                cursor = x0
+                for w in words:
+                    w_span = (len(w) / max(total_len, 1)) * span
+                    pos_key = (round(cursor), round(y0), w)
+                    if pos_key not in existing_positions:
+                        all_tokens.append({
+                            'text': w,
+                            'x0': cursor,
+                            'y0': y0,
+                            'x1': cursor + w_span,
+                            'y1': y1,
+                        })
+                        existing_positions.add(pos_key)
+                        ocr_added += 1
+                    cursor += w_span
+        print(f"[DEBUG-FAST] Merged {ocr_added} OCR tokens into {len(all_tokens)} total tokens (deduped)")
+
+    instances = []
+
+    def normalize_indicator(s):
+        parts = s.split('.')
+        normalized_parts = []
+        for p in parts:
+            if p.lstrip('0').isdigit():
+                normalized_parts.append(p.lstrip('0') or '0')
+            elif p.isdigit() or (p and p[0].isdigit()):
+                normalized_parts.append(p.lstrip('0') or '0')
+            else:
+                normalized_parts.append(p)
+        return '.'.join(normalized_parts)
+
+    indicators_to_find = set()
+    norm_to_original = {}
+    for item in legend_entries:
+        ind = item.get("indicator", "").strip()
+        if ind:
+            indicators_to_find.add(ind)
+            clean_ind = re.sub(r'[^\w]', '', ind)
+            if clean_ind and clean_ind != ind and not clean_ind.isdigit():
+                indicators_to_find.add(clean_ind)
+            norm_key = normalize_indicator(ind)
+            norm_to_original.setdefault(norm_key, ind)
+            if clean_ind and clean_ind != ind and not clean_ind.isdigit():
+                norm_clean = normalize_indicator(clean_ind)
+                norm_to_original.setdefault(norm_clean, ind)
+
+    if not indicators_to_find or not figure_chunks:
+        return []
+
+    legend_bboxes = []
+    for entry in legend_entries:
+        if entry.get("extraction_pass", "legend") != "legend":
+            continue
+        if all(k in entry for k in ['x0', 'y0', 'x1', 'y1']):
+            legend_bboxes.append((entry['x0'], entry['y0'], entry['x1'], entry['y1']))
+
+    def is_in_legend_area(token):
+        margin = 20
+        tx, ty = (token['x0'] + token['x1']) / 2, (token['y0'] + token['y1']) / 2
+        for lx0, ly0, lx1, ly1 in legend_bboxes:
+            if lx0 - margin <= tx <= lx1 + margin and ly0 - margin <= ty <= ly1 + margin:
+                return True
+        return False
+
+    # --- FAST bbox prefilter: numpy instead of nested Python loop ---
+    # Vectorize token centers once; iterate chunks and accumulate per-chunk
+    # hits in the SAME order as the original (chunks outer, tokens inner)
+    # so downstream behavior (found_positions proximity dedup) is
+    # bit-identical.
+    if not all_tokens:
+        return []
+    tok_cx = np.empty(len(all_tokens), dtype=np.float64)
+    tok_cy = np.empty(len(all_tokens), dtype=np.float64)
+    for _i, _t in enumerate(all_tokens):
+        tok_cx[_i] = (_t['x0'] + _t['x1']) / 2.0
+        tok_cy[_i] = (_t['y0'] + _t['y1']) / 2.0
+
+    figure_tokens = []
+    for chunk in figure_chunks:
+        cx0, cy0, cx1, cy1 = chunk["x0"], chunk["y0"], chunk["x1"], chunk["y1"]
+        mask = (tok_cx >= cx0) & (tok_cx <= cx1) & (tok_cy >= cy0) & (tok_cy <= cy1)
+        # np.nonzero returns sorted indices → preserves original token order
+        for _i in np.nonzero(mask)[0]:
+            figure_tokens.append(all_tokens[int(_i)])
+
+    print(f"[DEBUG-FAST] Tokens inside figure chunks: {len(figure_tokens)} (out of {len(all_tokens)} total)")
+
+    # --- Match loop: identical to the original ---
+    found_positions = set()
+    for token in figure_tokens:
+        token_text = token.get("text", "").strip()
+        if not token_text:
+            continue
+
+        matched_indicator = None
+        for ind in indicators_to_find:
+            if token_text == ind:
+                matched_indicator = ind
+                break
+            if token_text == f"({ind})" or token_text == f"[{ind}]":
+                matched_indicator = ind
+                break
+            if ind.startswith("(") and token_text == ind:
+                matched_indicator = ind
+                break
+
+        if not matched_indicator:
+            stripped = token_text.strip('()[] ')
+            norm_token = normalize_indicator(stripped)
+            if norm_token in norm_to_original:
+                matched_indicator = norm_to_original[norm_token]
+
+        if matched_indicator:
+            if is_in_legend_area(token):
+                continue
+            tx, ty = (token['x0'] + token['x1']) / 2, (token['y0'] + token['y1']) / 2
+            is_dup = False
+            for prev_ind, prev_x, prev_y in found_positions:
+                if prev_ind == matched_indicator and abs(tx - prev_x) < 30 and abs(ty - prev_y) < 30:
+                    is_dup = True
+                    break
+            if is_dup:
+                continue
+            found_positions.add((matched_indicator, tx, ty))
+            instances.append({
+                "indicator": matched_indicator,
+                "x0": token["x0"], "y0": token["y0"],
+                "x1": token["x1"], "y1": token["y1"],
+                "source": "figure_instance",
+            })
+
+    print(f"[DEBUG-FAST] Total instances found: {len(instances)}")
+    return instances
+
+
 # ==============================================================================
 # 6. Visualization & Utils
 # ==============================================================================
@@ -991,7 +1427,7 @@ def create_single_page_pdf(pdf_bytes: bytes, page_index: int) -> bytes:
 
 def create_multi_page_pdf(full_pdf_bytes: bytes, page_indices: List[int]) -> bytes:
     """Create a PDF containing only the specified pages (preserving order).
-    
+
     In the resulting PDF, pages are numbered 0..len(page_indices)-1,
     so callers must map local index back to the original page index.
     """
@@ -1003,6 +1439,199 @@ def create_multi_page_pdf(full_pdf_bytes: bytes, page_indices: List[int]) -> byt
     doc.close()
     new_doc.close()
     return out
+
+
+# Path-based variants: open the source PDF from disk instead of holding
+# its bytes in RAM. Semantically identical output to the bytes-based
+# functions above — the caller just hands over a path. Used by the
+# memory-reduced fast build so Phase 2 workers don't need file_bytes
+# kept alive.
+def create_single_page_pdf_from_path(pdf_path: str, page_index: int) -> bytes:
+    doc = fitz.open(pdf_path)
+    new_doc = fitz.open()
+    new_doc.insert_pdf(doc, from_page=page_index, to_page=page_index)
+    out = new_doc.tobytes()
+    doc.close()
+    new_doc.close()
+    return out
+
+
+def create_multi_page_pdf_from_path(pdf_path: str, page_indices: List[int]) -> bytes:
+    doc = fitz.open(pdf_path)
+    new_doc = fitz.open()
+    for idx in page_indices:
+        new_doc.insert_pdf(doc, from_page=idx, to_page=idx)
+    out = new_doc.tobytes()
+    doc.close()
+    new_doc.close()
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Oversized-page handling
+#
+# Both DocAI (40 MB per request, strictly enforced) and LandingAI ADE
+# (~15 MB per page in practice before 422s appear) reject giant inputs.
+# Engineering-drawing PDFs sometimes contain pages that embed a single
+# huge raster — one page can be 100+ MB. The helpers below (a) report
+# the real size of a one-page copy cheaply, and (b) build a "safe"
+# single-page PDF by rasterising at a lower DPI when the native copy
+# exceeds the caller's byte budget.
+#
+# Rasterising loses vector fidelity — that's an acceptable trade for
+# ADE/OCR which operate on pixel content anyway, and it's the only way
+# to stay under the provider limits without dropping the page entirely.
+# ---------------------------------------------------------------------------
+
+def measure_page_bytes(pdf_path: str, page_index: int) -> int:
+    """Return the serialized byte length of a one-page PDF containing
+    just `page_index`. Used by size-aware batching."""
+    try:
+        doc = fitz.open(pdf_path)
+        new_doc = fitz.open()
+        new_doc.insert_pdf(doc, from_page=page_index, to_page=page_index)
+        n = len(new_doc.tobytes())
+        doc.close()
+        new_doc.close()
+        return n
+    except Exception:
+        return 0
+
+
+def _render_page_as_image_pdf(doc: 'fitz.Document', page_index: int, dpi: int,
+                              jpeg_quality: int = 85) -> bytes:
+    """Render one page as a JPEG and wrap it in a single-page PDF of the
+    same physical size. Vector → raster; uses JPEG because PNG balloons
+    on complex line art (we've seen PNG at 250 DPI outgrow the original
+    vector PDF). JPEG at q=85 preserves engineering text/lines while
+    cutting size by ~10× vs PNG.
+
+    Physical-pixel safety: if the requested DPI would produce an image
+    larger than MAX_EDGE_PX on either axis (e.g. poster-size drawings),
+    scale DPI down so the pixmap stays bounded. Avoids 100 MB images
+    from huge page dimensions regardless of DPI.
+    """
+    MAX_EDGE_PX = 6000  # ~40in × 150dpi; keeps JPEG under ~3 MB on typical drawings
+
+    src_page = doc.load_page(page_index)
+    # Target pixel size at the requested DPI
+    w_pts = src_page.rect.width
+    h_pts = src_page.rect.height
+    w_px = (w_pts / 72.0) * dpi
+    h_px = (h_pts / 72.0) * dpi
+    effective_dpi = int(dpi)
+    if max(w_px, h_px) > MAX_EDGE_PX:
+        effective_dpi = max(36, int(dpi * (MAX_EDGE_PX / max(w_px, h_px))))
+
+    pix = src_page.get_pixmap(dpi=effective_dpi, alpha=False)
+    # fitz's .tobytes("jpeg") accepts a jpg_quality kwarg in recent
+    # builds; fall back to PIL if the installed fitz is older.
+    try:
+        img_bytes = pix.tobytes("jpeg", jpg_quality=jpeg_quality)
+    except TypeError:
+        from PIL import Image
+        import io as _io
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        buf = _io.BytesIO()
+        img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+        img_bytes = buf.getvalue()
+    del pix
+
+    new_doc = fitz.open()
+    new_page = new_doc.new_page(width=w_pts, height=h_pts)
+    new_page.insert_image(new_page.rect, stream=img_bytes)
+    out = new_doc.tobytes()
+    new_doc.close()
+    return out
+
+
+def safe_single_page_pdf_from_path(
+    pdf_path: str,
+    page_index: int,
+    max_bytes: int = 15 * 1024 * 1024,
+    # DPI floor 150 preserves readable text/lines for both DocAI (reads
+    # text) and LandingAI ADE (detects symbols). Below 150 the risk of
+    # misreading small callouts and numbers is real. If a page can't fit
+    # the caller's size budget at 150 DPI, we still return the result —
+    # caller can log / skip as appropriate.
+    dpi_ladder: tuple = (250, 200, 175, 150),
+) -> bytes:
+    """Build a single-page PDF ≤ max_bytes.
+
+    Strategy:
+      1. Try a naive page-copy (fast path — preserves vectors).
+      2. If the copy exceeds max_bytes, re-render the page as PNG at
+         progressively lower DPI until the result fits. The last DPI
+         in `dpi_ladder` is returned even if it still exceeds the cap
+         (caller can decide to give up vs. send it).
+    """
+    doc = fitz.open(pdf_path)
+    try:
+        return _safe_single_page_pdf_from_doc(doc, page_index, max_bytes, dpi_ladder)
+    finally:
+        doc.close()
+
+
+def _safe_single_page_pdf_from_doc(
+    doc: 'fitz.Document',
+    page_index: int,
+    max_bytes: int,
+    dpi_ladder: tuple,
+) -> bytes:
+    """Internal: same as safe_single_page_pdf_from_path but reuses a doc
+    handle (avoids re-opening the PDF for every page in a batch)."""
+    new_doc = fitz.open()
+    new_doc.insert_pdf(doc, from_page=page_index, to_page=page_index)
+    native = new_doc.tobytes()
+    new_doc.close()
+    if len(native) <= max_bytes:
+        return native
+    last_out = native
+    for dpi in dpi_ladder:
+        try:
+            out = _render_page_as_image_pdf(doc, page_index, dpi)
+        except Exception as e:
+            print(f"[downsample] page {page_index+1} render@{dpi}dpi failed: {e}")
+            continue
+        print(f"[downsample] page {page_index+1}: native={len(native)/1024/1024:.1f}MB "
+              f"→ @{dpi}dpi={len(out)/1024/1024:.1f}MB")
+        last_out = out
+        if len(out) <= max_bytes:
+            return out
+    return last_out
+
+
+def safe_multi_page_pdf_from_path(
+    pdf_path: str,
+    page_indices: List[int],
+    per_page_max_bytes: int = 15 * 1024 * 1024,
+    # DPI floor 150 preserves readable text/lines for both DocAI (reads
+    # text) and LandingAI ADE (detects symbols). Below 150 the risk of
+    # misreading small callouts and numbers is real. If a page can't fit
+    # the caller's size budget at 150 DPI, we still return the result —
+    # caller can log / skip as appropriate.
+    dpi_ladder: tuple = (250, 200, 175, 150),
+) -> bytes:
+    """Multi-page variant of safe_single_page_pdf_from_path.
+
+    For each requested page: naive-copy if it fits the per-page cap;
+    otherwise render at decreasing DPI until it does. The resulting
+    multi-page PDF has deterministic page order (same as page_indices).
+    """
+    doc = fitz.open(pdf_path)
+    new_doc = fitz.open()
+    try:
+        for pi in page_indices:
+            safe_bytes = _safe_single_page_pdf_from_doc(
+                doc, pi, per_page_max_bytes, dpi_ladder,
+            )
+            tmp = fitz.open(stream=safe_bytes, filetype="pdf")
+            new_doc.insert_pdf(tmp, from_page=0, to_page=0)
+            tmp.close()
+        return new_doc.tobytes()
+    finally:
+        new_doc.close()
+        doc.close()
 
 
 def create_page_batches(
@@ -1053,6 +1682,86 @@ def create_page_batches(
     return batches
 
 
+def create_page_batches_from_path(
+    pdf_path: str,
+    page_indices: List[int],
+    max_batch_bytes: int = 15 * 1024 * 1024,
+    max_pages_per_batch: int = 10,
+    per_page_hard_cap: int = 40 * 1024 * 1024,
+) -> List[List[int]]:
+    """Size-aware batching.
+
+    Earlier versions used (total PDF size / page count) × 1.3 as the
+    estimate and capped batches at 10 pages. That fails when one page
+    embeds a massive raster — a single 145 MB page would sit in a batch
+    alongside 9 small pages and the whole batch would be 150 MB, well
+    past LandingAI's limit.
+
+    This version measures each page individually (cheap: fitz open +
+    single-page copy), then greedily packs pages into batches with a
+    hard byte cap. Any page whose native size exceeds
+    `per_page_hard_cap` gets its OWN batch so the caller knows to
+    downsample it.
+
+    Return value still mirrors the old API: list[list[int]].
+    """
+    import os as _os
+    if not page_indices:
+        return []
+    try:
+        total_pdf_size = _os.path.getsize(pdf_path)
+    except Exception:
+        total_pdf_size = 0
+    try:
+        doc_probe = fitz.open(pdf_path)
+        total_pages_in_doc = len(doc_probe)
+        doc_probe.close()
+    except Exception:
+        total_pages_in_doc = max(page_indices) + 1
+
+    # Measure per-page size. This opens the source PDF once per page —
+    # expensive O(P) but fence-page counts are tens, not thousands.
+    page_bytes: dict = {}
+    oversized: list = []
+    for pi in page_indices:
+        sz = measure_page_bytes(pdf_path, pi)
+        page_bytes[pi] = sz
+        if sz > per_page_hard_cap:
+            oversized.append((pi, sz))
+
+    if oversized:
+        pretty = ", ".join(f"p{pi+1}={sz/1024/1024:.1f}MB" for pi, sz in oversized)
+        print(f"[BATCH-PATH] ⚠ oversized pages (each in own batch, will be downsampled): {pretty}")
+
+    batches: List[List[int]] = []
+    current: List[int] = []
+    current_bytes = 0
+    for pi in page_indices:
+        sz = page_bytes.get(pi, 0)
+        if sz > per_page_hard_cap:
+            # Flush the running batch; the giant page gets its own batch.
+            if current:
+                batches.append(current); current = []; current_bytes = 0
+            batches.append([pi])
+            continue
+        if (current_bytes + sz > max_batch_bytes
+                or len(current) >= max_pages_per_batch):
+            if current:
+                batches.append(current)
+            current = [pi]; current_bytes = sz
+        else:
+            current.append(pi); current_bytes += sz
+    if current:
+        batches.append(current)
+
+    print(f"[BATCH-PATH] PDF: {total_pdf_size/1024/1024:.1f}MB, {total_pages_in_doc} pages; "
+          f"{len(page_indices)} target pages → {len(batches)} batch(es). "
+          f"Sizes: " + ", ".join(
+              f"{sum(page_bytes.get(p, 0) for p in b)/1024/1024:.1f}MB"
+              for b in batches))
+    return batches
+
+
 # ==============================================================================
 # 7. Fallback Page Classification (Keyword + LLM)
 # ==============================================================================
@@ -1062,16 +1771,16 @@ def scan_page_for_keywords(pdf_lines: List[Dict], ocr_lines: List[Dict], fence_k
     """
     Scan page text for fence-related keywords using word boundary matching.
     Returns dict with matched keywords and their locations.
-    
+
     Uses regex word boundaries to avoid false positives like "gate" in "aggregate".
     Also handles common plural forms (gate -> gates, fence -> fences, etc.)
     """
     all_lines = pdf_lines + ocr_lines
     combined_text = " ".join(line.get("text", "") for line in all_lines).lower()
-    
+
     matches = []
     matched_lines = []
-    
+
     for keyword in fence_keywords:
         kw_lower = keyword.lower()
         # Use word boundary matching with optional plural suffix (s, es, ing)
@@ -1092,7 +1801,60 @@ def scan_page_for_keywords(pdf_lines: List[Dict], ocr_lines: List[Dict], fence_k
                         "y1": line.get("y1", 0),
                         "source": line.get("source", "unknown")
                     })
-    
+
+    return {
+        "has_keywords": len(matches) > 0,
+        "matched_keywords": list(set(matches)),
+        "matched_lines": matched_lines,
+        "total_text_length": len(combined_text)
+    }
+
+
+# Fast path: precompile keyword regex ONCE per unique keyword list (LRU-cached
+# by the keyword tuple). The original function recompiles on every call
+# (CPython's internal regex cache helps, but explicit is faster and clearer).
+# Semantics are identical to scan_page_for_keywords.
+import functools
+
+@functools.lru_cache(maxsize=8)
+def _compile_keyword_patterns(keyword_tuple):
+    """Return [(keyword, compiled_pattern), ...] for a tuple of keywords.
+    LRU-cached by the tuple so the same config doesn't re-compile."""
+    out = []
+    for kw in keyword_tuple:
+        kw_lower = kw.lower()
+        pat = re.compile(r'\b' + re.escape(kw_lower) + r'(?:s|es|ing)?\b')
+        out.append((kw, pat))
+    return out
+
+
+def scan_page_for_keywords_fast(pdf_lines: List[Dict], ocr_lines: List[Dict], fence_keywords: List[str]) -> Dict:
+    """Drop-in replacement for scan_page_for_keywords with precompiled regex.
+    Keep behavior identical — callers can swap transparently."""
+    all_lines = pdf_lines + ocr_lines
+    combined_text = " ".join(line.get("text", "") for line in all_lines).lower()
+
+    patterns = _compile_keyword_patterns(tuple(fence_keywords))
+
+    matches = []
+    matched_lines = []
+
+    for keyword, pat in patterns:
+        if pat.search(combined_text):
+            matches.append(keyword)
+            for line in all_lines:
+                line_text = line.get("text", "").lower()
+                if pat.search(line_text):
+                    matched_lines.append({
+                        "keyword": keyword,
+                        "text": line.get("text", ""),
+                        "x0": line.get("x0", 0),
+                        "y0": line.get("y0", 0),
+                        "x1": line.get("x1", 0),
+                        "y1": line.get("y1", 0),
+                        "source": line.get("source", "unknown")
+                    })
+
     return {
         "has_keywords": len(matches) > 0,
         "matched_keywords": list(set(matches)),
@@ -1154,6 +1916,127 @@ Respond with JSON only:
         print(f"[DEBUG] LLM page classification failed: {e}")
     
     return {"is_fence_related": False, "confidence": 0.0, "reason": "LLM parsing failed"}
+
+
+def llm_classify_pages_batch(llm, pages, fence_keywords, batch_size=10):
+    """Classify multiple pages in a single LLM round-trip.
+
+    Prompt layout is stable-prefix-first (system message with rubric +
+    keyword context) followed by a user message containing the dynamic
+    page blocks. OpenAI auto-caches identical prompt prefixes ≥1024
+    tokens across calls in a short window — so keeping the rubric in
+    the system message and pages separate lets the provider skip
+    re-processing the prefix on subsequent batches in the same run.
+
+    Args:
+      llm: a ChatOpenAI-like instance with .invoke(prompt) → obj with .content
+      pages: list of (page_idx, page_text, matched_keywords) tuples
+      fence_keywords: full keyword list (for prompt context)
+      batch_size: how many pages per LLM call
+
+    Returns:
+      dict {page_idx: {"is_fence_related": bool, "confidence": float,
+                       "signals": list, "reason": str}}
+
+    Missing pages (parse failure or model drift) fall back to
+    per-page llm_classify_page so robustness matches the unbatched path.
+    """
+    out = {}
+    if not pages:
+        return out
+    if not llm:
+        for idx, _text, _kws in pages:
+            out[idx] = {"is_fence_related": True, "confidence": 0.4,
+                        "signals": [], "reason": "LLM unavailable, keyword-only pass"}
+        return out
+
+    kw_hint = ", ".join(fence_keywords[:15])
+
+    # Static system prompt — identical across every batch in a run, which
+    # is what OpenAI's prompt cache keys on. If this ever grows past
+    # 1024 tokens, cache hits light up automatically.
+    system_prompt = (
+        "You are analyzing engineering drawing pages to determine which "
+        "contain fence-related content.\n\n"
+        f"Fence-related terms to watch for: {kw_hint}\n\n"
+        "For EACH page provided by the user, decide independently whether "
+        "it's fence-related.\n"
+        "Look for: fence specifications, dimensions, materials, gate details, "
+        "barriers, guardrails, railings, posts, chain link, mesh, panels, "
+        "bollards, handrails, CMU walls, or related construction details.\n"
+        "Do NOT flag a page as fence-related just because it mentions a "
+        "construction term that could appear in any drawing (e.g. 'post', "
+        "'rail' alone are not enough — context must point to fencing).\n\n"
+        "Respond with JSON ONLY, exactly this shape:\n"
+        '{"results": [{"id": <int>, "is_fence_related": true|false, '
+        '"confidence": 0.0-1.0, "signals": [...], "reason": "<brief>"}, ...]}\n'
+        "The id field must match the <page id=\"N\"> from the user message. "
+        "Include one result per page — never skip a page."
+    )
+
+    # LangChain's SystemMessage / HumanMessage give OpenAI a clean
+    # system+user split, which is what the cache groups on.
+    try:
+        from langchain_core.messages import SystemMessage, HumanMessage  # type: ignore
+        _use_messages = True
+    except Exception:
+        _use_messages = False
+
+    for batch_start in range(0, len(pages), batch_size):
+        batch = pages[batch_start:batch_start + batch_size]
+
+        page_blocks = []
+        for idx, text, matched in batch:
+            excerpt = (text or "")[:1200]
+            matched_hint = ", ".join(matched[:8]) if matched else ""
+            page_blocks.append(
+                f'<page id="{idx}" matched="{matched_hint}">\n{excerpt}\n</page>'
+            )
+        user_content = "Pages:\n" + "\n\n".join(page_blocks)
+
+        parsed_by_id = {}
+        try:
+            if _use_messages:
+                raw = llm.invoke([
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_content),
+                ])
+            else:
+                # Fallback for bare-callable LLMs: concatenate in
+                # prefix-first order so caching still has a chance.
+                prompt = system_prompt + "\n\n" + user_content
+                raw = llm.invoke(prompt) if hasattr(llm, "invoke") else llm(prompt)
+            text = getattr(raw, "content", str(raw))
+            m = re.search(r'\{.*\}', text, re.DOTALL)
+            if m:
+                data = json.loads(m.group(0))
+                for entry in data.get("results", []):
+                    try:
+                        pid = int(entry.get("id"))
+                    except (TypeError, ValueError):
+                        continue
+                    parsed_by_id[pid] = {
+                        "is_fence_related": bool(entry.get("is_fence_related", False)),
+                        "confidence": float(entry.get("confidence", 0.0)),
+                        "signals": entry.get("signals", []) or [],
+                        "reason": entry.get("reason", "") or "",
+                    }
+        except Exception as e:
+            print(f"[llm_classify_pages_batch] batch parse failed: {e}")
+
+        # Fill in each page — if the model skipped one, fall back to a
+        # per-page call so robustness matches the unbatched path.
+        for idx, text, _kws in batch:
+            if idx in parsed_by_id:
+                out[idx] = parsed_by_id[idx]
+            else:
+                print(f"[llm_classify_pages_batch] page {idx} missing from batch response; falling back")
+                try:
+                    out[idx] = llm_classify_page(llm, text, fence_keywords)
+                except Exception as _e2:
+                    out[idx] = {"is_fence_related": False, "confidence": 0.0,
+                                "reason": f"batch+fallback failed: {_e2}"}
+    return out
 
 
 def fallback_fence_detection(
@@ -1232,6 +2115,63 @@ def fallback_fence_detection(
         "matched_keywords": keyword_result["matched_keywords"],
         "matched_lines": keyword_result["matched_lines"],
         "llm_result": llm_result
+    }
+
+
+def fallback_fence_detection_fast(
+    pdf_lines: List[Dict],
+    ocr_lines: List[Dict],
+    fence_keywords: List[str],
+    llm=None,
+    use_llm_confirmation: bool = True
+) -> Dict:
+    """Same behavior as fallback_fence_detection, but uses precompiled
+    regex for the keyword scan. Drop-in replacement for the fast build."""
+    keyword_result = scan_page_for_keywords_fast(pdf_lines, ocr_lines, fence_keywords)
+
+    if not keyword_result["has_keywords"]:
+        return {
+            "fence_found": False,
+            "method": "keyword_scan",
+            "matched_keywords": [],
+            "matched_lines": [],
+            "llm_result": None,
+        }
+
+    HIGH_SIGNAL_KEYWORDS = {
+        'fence', 'fencing', 'gate', 'gates', 'chain link', 'guardrail',
+        'railing', 'handrail', 'bollard', 'barrier'
+    }
+    matched_lower = {kw.lower() for kw in keyword_result["matched_keywords"]}
+    if matched_lower & HIGH_SIGNAL_KEYWORDS:
+        return {
+            "fence_found": True,
+            "method": "keyword_high_signal",
+            "matched_keywords": keyword_result["matched_keywords"],
+            "matched_lines": keyword_result["matched_lines"],
+            "llm_result": None,
+        }
+
+    llm_result = None
+    if use_llm_confirmation and llm:
+        all_lines = pdf_lines + ocr_lines
+        page_text = " ".join(line.get("text", "") for line in all_lines)
+        llm_result = llm_classify_page(llm, page_text, fence_keywords)
+        if llm_result["confidence"] >= 0.5:
+            return {
+                "fence_found": llm_result["is_fence_related"],
+                "method": "llm_confirmed",
+                "matched_keywords": keyword_result["matched_keywords"],
+                "matched_lines": keyword_result["matched_lines"],
+                "llm_result": llm_result,
+            }
+
+    return {
+        "fence_found": True,
+        "method": "keyword_only",
+        "matched_keywords": keyword_result["matched_keywords"],
+        "matched_lines": keyword_result["matched_lines"],
+        "llm_result": llm_result,
     }
 
 
@@ -1724,7 +2664,8 @@ def measure_fence_elements(
     figure_chunks: List[Dict] = None,
     llm=None,
     scale_factor: Optional[float] = None,
-    ocr_text: str = None
+    ocr_text: str = None,
+    light_llm=None,  # optional: cheaper/faster model for layer-name matching
 ) -> Dict:
     """
     Measure fence-related vector elements based on detected indicators.
@@ -1781,11 +2722,14 @@ def measure_fence_elements(
     layer_names = extract_layer_names(page)
     print(f"[DEBUG] Found {len(layer_names)} layers on page")
     
-    # Use LLM to identify fence-related layers
+    # Use LLM to identify fence-related layers. These are simple
+    # "does this layer name sound like fencing?" tasks — route them to
+    # the lighter model if caller provided one.
+    _light = light_llm or llm
     fence_layers = []
-    if llm:
-        fence_layers = llm_identify_fence_layers(llm, layer_names, fence_definitions)
-    
+    if _light:
+        fence_layers = llm_identify_fence_layers(_light, layer_names, fence_definitions)
+
     # If LLM didn't find layers, fall back to keyword matching
     if not fence_layers:
         print("[DEBUG] Falling back to keyword-based layer detection")
@@ -1795,11 +2739,11 @@ def measure_fence_elements(
             if any(kw in layer_upper for kw in fence_keywords):
                 fence_layers.append(layer)
         print(f"[DEBUG] Keyword-matched fence layers: {fence_layers}")
-    
-    # Match fence layers to definition categories using LLM
+
+    # Match fence layers to definition categories — also routed to light.
     layer_to_category = {}
-    if fence_layers and llm and fence_definitions:
-        layer_to_category = llm_match_layers_to_definitions(llm, fence_layers, fence_definitions)
+    if fence_layers and _light and fence_definitions:
+        layer_to_category = llm_match_layers_to_definitions(_light, fence_layers, fence_definitions)
     
     # Extract lines from fence-related layers
     if fence_layers:
