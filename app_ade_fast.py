@@ -3419,13 +3419,103 @@ if st.session_state.run_analysis_triggered and \
             # fence_cache writes from that worker (if any) still land.
             FENCE_PHASE3_PAGE_TIMEOUT = _workers("FENCE_PHASE3_PAGE_TIMEOUT", 180, cap=600)
 
+            # Opt-in subprocess isolation. When FENCE_PHASE3_USE_SUBPROCESS=true
+            # each per-page worker runs in a short-lived child process
+            # (ops/phase3_worker.py) instead of a thread. Trades a small
+            # per-page startup cost for dramatic memory hygiene: each
+            # subprocess peaks around 150-200 MB and releases every byte
+            # to the OS on exit. Main process RSS stays flat. Hung LLM
+            # calls are actually killable (SIGKILL on timeout, which
+            # Python threads don't support).
+            FENCE_PHASE3_USE_SUBPROCESS = os.environ.get(
+                "FENCE_PHASE3_USE_SUBPROCESS", "false"
+            ).lower() == "true"
+            _phase3_worker_script = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "ops", "phase3_worker.py"
+            )
+
+            def _phase3_precompute_via_subprocess(page_idx):
+                """Subprocess-isolated per-page worker. Blocks until the
+                child exits or hits FENCE_PHASE3_PAGE_TIMEOUT + a small
+                IPC budget. All results go through fence_cache on disk,
+                so there's nothing to return to the parent."""
+                import subprocess as _sp
+                import json as _json
+                # Build the task JSON. The heavy fields (pdf_lines,
+                # ocr_lines, ade_chunks) are typically 10-200 KB per
+                # page — well within stdin buffer limits.
+                _page_prefill = {
+                    _pci: _items
+                    for (_ppi, _pci), _items in _prefill_legend.items()
+                    if _ppi == page_idx
+                }
+                _task = {
+                    "pdf_path":                 _pdf_disk_path_for_phase3,
+                    "page_idx":                 int(page_idx),
+                    "pdf_sha":                  _pdf_sha,
+                    "cache_params":             _cache_params,
+                    "user_scope":               _cache_scope(),
+                    "fence_cache_dir":          os.environ.get("FENCE_CACHE_DIR", ""),
+                    "openai_api_key":           openai_key or "",
+                    "analysis_model":           st.session_state.get("selected_model_for_analysis", "gpt-5.1"),
+                    "classifier_model":         FENCE_CLASSIFIER_MODEL,
+                    "scale_model":              st.session_state.get("selected_model_for_analysis", "gpt-5.1"),
+                    "fence_keywords":           list(FENCE_KEYWORDS_APP),
+                    "pdf_lines":                _pdf_lines_by_page.get(page_idx, []),
+                    "ocr_lines":                _ocr_lines_by_page.get(page_idx, []),
+                    "ade_chunks":               _ade_chunks_by_page.get(page_idx) or [],
+                    "legend_prefill":           _page_prefill,
+                    "highlight_fence_text_app": bool(highlight_fence_text_app),
+                    "enable_unified_measurement": bool(enable_unified_measurement),
+                }
+                task_json = _json.dumps(_task, default=str)
+                # 15s IPC budget (task write + startup imports) on top
+                # of the per-page LLM budget. Keeps the SIGKILL bounded.
+                _wallclock_cap = FENCE_PHASE3_PAGE_TIMEOUT + 15
+                proc = _sp.Popen(
+                    [sys.executable, _phase3_worker_script],
+                    stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.PIPE, text=True,
+                )
+                try:
+                    out, err = proc.communicate(task_json, timeout=_wallclock_cap)
+                    rc = proc.returncode
+                except _sp.TimeoutExpired:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        out, err = proc.communicate(timeout=5)
+                    except Exception:
+                        out, err = "", ""
+                    raise TimeoutError(
+                        f"phase3 worker for page {page_idx + 1} exceeded "
+                        f"{_wallclock_cap}s — SIGKILLed"
+                    )
+                if rc != 0:
+                    # Worker reported failure; parse the last JSON line
+                    # for an error description (still useful for logs).
+                    try:
+                        _last = out.strip().splitlines()[-1]
+                        _rec = _json.loads(_last)
+                        raise RuntimeError(
+                            f"subprocess exit={rc}: {_rec.get('error', 'unknown')}"
+                        )
+                    except Exception:
+                        raise RuntimeError(
+                            f"phase3 worker exit={rc}; stderr={err[:200]}"
+                        )
+
             def _phase3_precompute_timed(page_idx):
-                """Wrap _phase3_precompute with per-page timing + telemetry
-                emission so we can see progress per-page in the log stream
-                rather than only at phase3_end."""
+                """Wrap the chosen worker impl with per-page timing +
+                telemetry emission so we see progress per-page in the
+                log stream rather than only at phase3_end."""
                 _t0 = time.perf_counter()
                 try:
-                    _phase3_precompute(page_idx)
+                    if FENCE_PHASE3_USE_SUBPROCESS:
+                        _phase3_precompute_via_subprocess(page_idx)
+                    else:
+                        _phase3_precompute(page_idx)
                     _status = "ok"
                 except Exception as _pe:
                     _status = f"error:{type(_pe).__name__}"
@@ -3439,6 +3529,7 @@ if st.session_state.run_analysis_triggered and \
                         page_idx=page_idx,
                         wall_s=round(_dt, 3),
                         status=_status,
+                        worker=("subprocess" if FENCE_PHASE3_USE_SUBPROCESS else "thread"),
                     )
                 except Exception:
                     pass
