@@ -4097,32 +4097,54 @@ if st.session_state.run_analysis_triggered and \
                         measurement_result = {}
                 
                 # Store auto-detected lines in unified measurement structure
-                # ONLY for layer-based detection (reliable) - skip LLM-guided fallback
+                # for BOTH layer-based and llm_guided detection. Layer-based
+                # is the reliable path (explicit fence layers in the PDF),
+                # llm_guided is the fallback for layerless site plans. We
+                # used to skip llm_guided entirely because it's noisier, but
+                # that meant Page 1 of a typical site-plan PDF showed zero
+                # auto-lines even when Phase 3 had actually completed — the
+                # user couldn't tell "no fence content" from "we dropped
+                # the LLM-guided result". Now we show both, relying on the
+                # user to pick/reject individual lines in the canvas.
                 measurement_method = measurement_result.get('measurement_method', 'none') if measurement_result else 'none'
-                
-                if measurement_result and measurement_result.get('all_fence_lines') and measurement_method == 'layer':
+                _accept_methods = ('layer', 'llm_guided')
+
+                if measurement_result and measurement_result.get('all_fence_lines') and measurement_method in _accept_methods:
                     auto_lines = []
                     all_fence_lines = measurement_result.get('all_fence_lines', [])
                     scale_factor = measurement_result.get('page_info', {}).get('scale_factor', 1.0)
                     layer_to_category = measurement_result.get('layer_to_category', {})
                     
-                    # Map each line to its category using layer→category mapping
+                    # Map each line to its category using layer→category mapping.
+                    # For llm_guided results the PDF has no explicit fence
+                    # layers and layer_to_category is empty; in that case
+                    # assign a single fallback category so the lines still
+                    # appear on the canvas (user can re-categorize later).
+                    _is_llm_guided = (measurement_method == 'llm_guided')
+                    _fallback_cat = "🔍 Auto-detected (LLM-guided)" if _is_llm_guided else None
                     for line in all_fence_lines:
                         length_pts = line.length_pts
                         length_inches = length_pts / 72.0
                         length_feet = (length_inches * scale_factor) / 12.0
-                        
+
                         line_layer = getattr(line, 'layer', None) or ''
                         # Use LLM-matched layer→category mapping
                         category = layer_to_category.get(line_layer)
-                        
+
                         # Fallback: if layer not in mapping, try partial match
                         if not category and line_layer:
                             for mapped_layer, cat in layer_to_category.items():
                                 if mapped_layer in line_layer or line_layer in mapped_layer:
                                     category = cat
                                     break
-                        
+
+                        # Final fallback: llm_guided site plans have no layers
+                        # at all. Tag every candidate line as the fallback
+                        # category so the UI renders them instead of silently
+                        # dropping them.
+                        if not category:
+                            category = _fallback_cat
+
                         if category:
                             auto_lines.append({
                                 'start': line.start,
@@ -4131,7 +4153,8 @@ if st.session_state.run_analysis_triggered and \
                                 'length_feet': length_feet,
                                 'layer': line_layer,
                                 'category': category,
-                                'source': 'auto'
+                                'source': 'auto',
+                                'method': measurement_method,
                             })
                     
                     if auto_lines:
@@ -5972,7 +5995,16 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                             if _k.startswith("_umt_pg_loaded_") and _k != _umt_pg_flag:
                                 del st.session_state[_k]
                         st.session_state[_umt_pg_flag] = True
-                        st.rerun()
+                        # NOTE: no st.rerun() here. An explicit rerun
+                        # was resetting Streamlit's active-tab state
+                        # (the st.tabs widget remembers the clicked tab
+                        # through a WIDGET interaction, but a
+                        # script-level st.rerun drops that link), so the
+                        # user would see Page 1's tab come back up
+                        # instead of the Page N they just clicked Load
+                        # on. Streamlit's automatic rerun from the
+                        # button click itself preserves the tab — it
+                        # carries the same widget-interaction context.
                 with _cap_col:
                     st.caption(
                         "Click to detect vector lines + render the measurement "
