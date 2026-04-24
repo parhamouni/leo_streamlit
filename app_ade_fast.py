@@ -735,7 +735,7 @@ def _reset_analysis_state(purge_cache: bool = True, preserve_uploader: bool = Fa
         'base_img_', 'drawn_img_', 'line_stats_', 'lines_',
         'auto_synced_', 'auto_matched_indices_',
         'orig_img_size_', 'base_img_size_', 'click_key_',
-        '_phase3_', '_img_cache',
+        '_phase3_', '_img_cache', '_page_img_loaded_',
     )
     _clear_exact = {
         'fence_pages', 'non_fence_pages', 'processing_complete',
@@ -3830,7 +3830,7 @@ if st.session_state.run_analysis_triggered and \
                     # otherwise Streamlit snaps it back to expanded=False
                     # on the next run and the user sees their click as
                     # "the expander closed itself".
-                    _nf_expanded = bool(st.session_state.get(f'_nf_img_loaded_{page_idx}'))
+                    _nf_expanded = bool(st.session_state.get(f'_page_img_loaded_{page_idx}'))
                     with st.expander(f"Page {page_num}", expanded=_nf_expanded):
                         _bits = []
                         if prefilter_result.get("method"):
@@ -3853,7 +3853,7 @@ if st.session_state.run_analysis_triggered and \
                         # keeps memory flat when the user just scrolls past
                         # this panel — rendering a 150 DPI image of a
                         # 36x24 engineering sheet is ~2-5 MB per page.
-                        _nf_img_flag = f'_nf_img_loaded_{page_idx}'
+                        _nf_img_flag = f'_page_img_loaded_{page_idx}'
                         if not st.session_state.get(_nf_img_flag):
                             # st.rerun() is REQUIRED here — the button's
                             # returned-True is visible in the SAME run,
@@ -4265,7 +4265,7 @@ if st.session_state.run_analysis_triggered and \
                 # LRU cap), and the user doesn't want to see all of them
                 # at once anyway.
                 # Keep the expander open across the Load-image rerun.
-                _live_expanded = bool(st.session_state.get(f'_fence_img_loaded_{page_idx}'))
+                _live_expanded = bool(st.session_state.get(f'_page_img_loaded_{page_idx}'))
                 with st.expander(exp_title, expanded=_live_expanded):
                     img_col, det_col = st.columns([2, 1])
 
@@ -4279,7 +4279,7 @@ if st.session_state.run_analysis_triggered and \
                         # and nothing gets rendered / cached. After click,
                         # the flag stays set so the image is shown on
                         # every rerun of this expander.
-                        _img_flag = f'_fence_img_loaded_{page_idx}'
+                        _img_flag = f'_page_img_loaded_{page_idx}'
                         if not st.session_state.get(_img_flag):
                             # See note in the non-fence lazy-load: we
                             # need st.rerun() here. The flag check that
@@ -4806,7 +4806,7 @@ elif st.session_state.processing_complete:
                         exp_title_res += f" ({' & '.join(reasons_res)})"
                 
                 _pidx_for_exp = res_data_item.get('page_index_in_original_doc', 0)
-                _res_expanded = bool(st.session_state.get(f'_res_img_loaded_{_pidx_for_exp}'))
+                _res_expanded = bool(st.session_state.get(f'_page_img_loaded_{_pidx_for_exp}'))
                 with st.expander(exp_title_res, expanded=_res_expanded):
                     img_col_r, det_col_r = st.columns([2, 1])
 
@@ -4827,7 +4827,7 @@ elif st.session_state.processing_complete:
                         # first "Load page image" click.
                         _orig_r, _hl_r = None, None
                         _pidx_r = res_data_item.get('page_index_in_original_doc', 0)
-                        _img_flag_r = f'_res_img_loaded_{_pidx_r}'
+                        _img_flag_r = f'_page_img_loaded_{_pidx_r}'
                         if not st.session_state.get(_img_flag_r):
                             # st.rerun() is necessary: the flag check
                             # that routed us into this branch was
