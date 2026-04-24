@@ -2995,6 +2995,21 @@ if st.session_state.run_analysis_triggered and \
             print(f"SESSION {current_session_id} LOG: Phase 2 cache hits: "
                   f"{_phase2_cache_hits}/{len(_fence_page_indices)}; "
                   f"{len(_fence_pages_to_fetch)} pages need ADE")
+
+            # LandingAI documented sync-endpoint caps: 50 MB / 50 pages
+            # per request. Our defaults are conservative (15 MB / 10 pages)
+            # because empirically ADE starts rejecting with 422 well
+            # before the 50 MB cap. All three knobs env-configurable.
+            _ADE_BATCH_MAX_BYTES = int(os.environ.get("FENCE_ADE_BATCH_MAX_BYTES", str(15 * 1024 * 1024)))
+            _ADE_PAGE_MAX_BYTES  = int(os.environ.get("FENCE_ADE_PAGE_MAX_BYTES",  str(12 * 1024 * 1024)))
+            # Set FENCE_ADE_BATCH_PAGES=1 to disable multi-page batching
+            # — each fence page gets its own ADE request. Slower overall
+            # (50 round-trips instead of 5-6) but sometimes yields
+            # different chunking on dense engineering detail sheets
+            # where ADE's per-document context may merge or drop small
+            # regions in a crowded multi-page batch.
+            _ADE_BATCH_PAGES = int(os.environ.get("FENCE_ADE_BATCH_PAGES", "10"))
+
             # Path-based batching: avoids keeping the whole PDF in RAM for
             # size-estimation / batch-PDF construction. Workers read from
             # disk on demand (fitz demand-loads pages from path).
@@ -3017,19 +3032,6 @@ if st.session_state.run_analysis_triggered and \
             # hits the ADE endpoint, aligns chunks). doc_proc is NOT thread-
             # safe, so we use _page_dims (populated in Phase 1a) for page
             # dimensions instead of reaching into doc_proc from workers.
-            # LandingAI documented sync-endpoint caps: 50 MB / 50 pages
-            # per request. Our defaults are conservative (15 MB / 10 pages)
-            # because empirically ADE starts rejecting with 422 well
-            # before the 50 MB cap. All three knobs env-configurable.
-            _ADE_BATCH_MAX_BYTES = int(os.environ.get("FENCE_ADE_BATCH_MAX_BYTES", str(15 * 1024 * 1024)))
-            _ADE_PAGE_MAX_BYTES  = int(os.environ.get("FENCE_ADE_PAGE_MAX_BYTES",  str(12 * 1024 * 1024)))
-            # Set FENCE_ADE_BATCH_PAGES=1 to disable multi-page batching
-            # — each fence page gets its own ADE request. Slower overall
-            # (50 round-trips instead of 5-6) but sometimes yields
-            # different chunking on dense engineering detail sheets
-            # where ADE's per-document context may merge or drop small
-            # regions in a crowded multi-page batch.
-            _ADE_BATCH_PAGES = int(os.environ.get("FENCE_ADE_BATCH_PAGES", "10"))
 
             def _run_phase2_batch(batch_idx, batch):
                 """Worker: process one batch. Returns {page_idx: chunks_or_None}.
