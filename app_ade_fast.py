@@ -3703,12 +3703,16 @@ if st.session_state.run_analysis_triggered and \
                 # =====================================================================
                 # STEP 5: Process chunks (runs for ALL fence pages)
                 # =====================================================================
-                # Debug visualization
+                # Debug visualization — DEBUG_MODE only, renders its own
+                # copy of the page image on demand (live analysis loop no
+                # longer keeps page_img_bytes around).
                 if DEBUG_MODE and (legend_chunks or pdf_lines or ocr_lines):
+                    _dbg_img = page.get_pixmap(dpi=DISPLAY_IMAGE_DPI).tobytes("png")
                     debug_bytes = ade.debug_visualize_coordinates(
-                        page_img_bytes, legend_chunks, pdf_lines, ocr_lines, pdf_width, pdf_height
+                        _dbg_img, legend_chunks, pdf_lines, ocr_lines, pdf_width, pdf_height
                     )
                     st.image(debug_bytes, caption=f"DEBUG: Layers Page {page_num}", use_container_width=True)
+                    del _dbg_img
                 
                 # Extract fence-related definitions from legend chunks
                 if highlight_fence_text_app and legend_chunks:
@@ -3952,31 +3956,19 @@ if st.session_state.run_analysis_triggered and \
             elif fallback_result and fallback_result.get("matched_keywords"):
                 text_snippet = "Keywords: " + ", ".join(fallback_result["matched_keywords"][:5])
             
-            # Generate images — render only for fence pages (lazy)
-            if fence_found and page_img_bytes is None:
-                page_img_bytes = page.get_pixmap(dpi=DISPLAY_IMAGE_DPI).tobytes("png")
-            original_img_bytes = page_img_bytes
+            # Images are NOT rendered here anymore (see #4 in the perf
+            # plan). Previously we paid ~300-500 ms CPU per fence page
+            # rendering page_img_bytes + highlight overlays + cyan fence
+            # lines, then sent 2-6 MB of PNG bytes over WS per card. On
+            # a 68-fence-page PDF that was ~25 s of CPU + ~200-400 MB
+            # of transient image data. The post-analysis
+            # display_page_result_expander re-renders images on demand
+            # via the per-session LRU (get_page_image_on_demand), so
+            # moving the render there is net-zero for UX once results
+            # settle, and a big memory/CPU win during the live loop.
+            page_img_bytes = None
+            original_img_bytes = None
             highlighted_img_bytes = None
-            
-            if highlight_fence_text_app and page_img_bytes:
-                if definitions or instances:
-                    # Primary highlighting: definitions (green) + instances (purple)
-                    highlighted_img_bytes = ade.highlight_page_image(
-                        page_img_bytes, definitions, instances, pdf_width, pdf_height
-                    )
-                elif keyword_matches:
-                    # Fallback highlighting: keyword matches (orange)
-                    highlighted_img_bytes = ade.highlight_keyword_matches(
-                        page_img_bytes, keyword_matches, pdf_width, pdf_height
-                    )
-                
-                # Highlight measured fence lines (cyan) - only for layer-based or if non-layer toggle enabled
-                if measurement_result and measurement_result.get('all_fence_lines') and (measurement_method == 'layer' or enable_nonlayer_suggestions):
-                    highlighted_img_bytes = ade.highlight_fence_lines(
-                        highlighted_img_bytes or page_img_bytes,
-                        measurement_result['all_fence_lines'],
-                        pdf_width, pdf_height
-                    )
             
             # Build result structure (matching app.py format)
             # detection_method already set above based on flow
@@ -4040,20 +4032,17 @@ if st.session_state.run_analysis_triggered and \
                 
                 with st.expander(exp_title, expanded=True):
                     img_col, det_col = st.columns([2, 1])
-                    
+
                     with img_col:
-                        disp_img = highlighted_img_bytes if highlighted_img_bytes else original_img_bytes
-                        if disp_img:
-                            st.image(disp_img, caption=f"Page {page_num}{' (Highlighted)' if highlighted_img_bytes else ''}")
-                        
-                        # Download links
-                        dl_links = []
-                        if highlighted_img_bytes:
-                            dl_links.append(get_image_download_link_html(highlighted_img_bytes, f"page_{page_num}_hl.png", "DL HL Img"))
-                        if original_img_bytes:
-                            dl_links.append(get_image_download_link_html(original_img_bytes, f"page_{page_num}_orig.png", "DL Orig Img"))
-                        if dl_links:
-                            st.markdown(" ".join(dl_links), unsafe_allow_html=True)
+                        # Deferred image render — the page image is loaded
+                        # on demand in the post-analysis results section
+                        # below (see display_page_result_expander). This
+                        # keeps the live analysis loop free of transient
+                        # PNG bytes.
+                        st.caption(
+                            "📷 Page image + highlights render on demand in "
+                            "the results section below."
+                        )
                     
                     with det_col:
                         # Detection method badge
