@@ -134,32 +134,39 @@ FENCE_PHASE3_PREVIEW = _workers("FENCE_PHASE3_PREVIEW", 5, cap=40)
 
 
 # --- Cache housekeeping ---
-# Sweep aged cache entries at startup. Safe on any run; no-op if cache
-# dir is empty or unwritable.
-try:
-    # Per-run cache policy: on process start, wipe EVERY session_* dir
-    # under the cache root. They can only belong to dead prior sessions
-    # (no current process owns them yet). This is the third tier of
-    # purge protection alongside the "new upload" and "finally" purges
-    # that run during a live session.
-    import shutil as _boot_sh
-    _root = fence_cache.cache_root()
-    _boot_wiped = 0
-    for _d in _root.iterdir() if _root.exists() else []:
-        if _d.is_dir() and _d.name.startswith("session_"):
-            try:
-                _boot_sh.rmtree(_d, ignore_errors=True)
-                _boot_wiped += 1
-            except Exception:
-                pass
-    if _boot_wiped:
-        print(f"[fence_cache] boot: wiped {_boot_wiped} orphan session dirs")
-    # TTL sweep is legacy safety for anything that escapes our purges.
-    _purged_dirs = fence_cache.sweep_old(ttl_days=float(os.environ.get("FENCE_CACHE_TTL_DAYS", "1")))
-    if _purged_dirs:
-        print(f"[fence_cache] Swept {_purged_dirs} expired PDF directories on startup.")
-except Exception as _e:
-    print(f"[fence_cache] Startup sweep failed (non-fatal): {_e}")
+# Sweep aged cache entries at PROCESS startup. Guard with a module-level
+# flag because Streamlit re-executes this entire script on every widget
+# interaction, and without the guard the wipe below would nuke the
+# cache dir that the live session was actively reading from — manifests
+# as cache_hits=0 on every rerun, the analysis block re-entering from
+# Phase 1a, and the browser appearing to "freeze" because every UI
+# click silently restarts a 30+-minute analysis.
+if not globals().get("_FENCE_BOOT_CLEANUP_DONE"):
+    try:
+        # Per-run cache policy: on process start, wipe EVERY session_*
+        # dir under the cache root. They can only belong to dead prior
+        # sessions (no current process owns them yet). This is the
+        # third tier of purge protection alongside the "new upload"
+        # and "finally" purges that run during a live session.
+        import shutil as _boot_sh
+        _root = fence_cache.cache_root()
+        _boot_wiped = 0
+        for _d in _root.iterdir() if _root.exists() else []:
+            if _d.is_dir() and _d.name.startswith("session_"):
+                try:
+                    _boot_sh.rmtree(_d, ignore_errors=True)
+                    _boot_wiped += 1
+                except Exception:
+                    pass
+        if _boot_wiped:
+            print(f"[fence_cache] boot: wiped {_boot_wiped} orphan session dirs")
+        # TTL sweep is legacy safety for anything that escapes our purges.
+        _purged_dirs = fence_cache.sweep_old(ttl_days=float(os.environ.get("FENCE_CACHE_TTL_DAYS", "1")))
+        if _purged_dirs:
+            print(f"[fence_cache] Swept {_purged_dirs} expired PDF directories on startup.")
+    except Exception as _e:
+        print(f"[fence_cache] Startup sweep failed (non-fatal): {_e}")
+    _FENCE_BOOT_CLEANUP_DONE = True
 
 st.set_page_config(page_title="ADE Fence Detector", layout="wide")
 
