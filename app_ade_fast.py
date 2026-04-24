@@ -4453,7 +4453,21 @@ if st.session_state.run_analysis_triggered and \
             )
             
             time.sleep(0.05)
-        
+
+        # Mark processing_complete as soon as fence_pages / non_fence_pages
+        # are fully populated by the render loop. Everything that follows
+        # (element detail LLM, timings persist, combined-highlighted-PDF
+        # generation) is polish that updates session_state in place — it
+        # doesn't need the gate open. With the flag set here, any
+        # Streamlit rerun triggered by a button click (e.g. "🖼️ Load page
+        # image" inside an expander) now enters the post-analysis display
+        # branch immediately instead of re-entering the analysis block
+        # and running the render loop again. Previously the user would
+        # see progress bars cycle through Phase 1-3 every click because
+        # processing_complete only flipped at the very end of the
+        # analysis branch, after the highlighted-PDF combine.
+        st.session_state.processing_complete = True
+
         # Free Phase 1/2 caches to reduce memory (especially for large PDFs)
         del _page_cache, _pdf_lines_by_page, _ocr_lines_by_page, _ade_chunks_by_page
         _single_page_pdfs.clear()
