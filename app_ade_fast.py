@@ -4791,6 +4791,14 @@ elif st.session_state.processing_complete:
                         # ONE page would fire a rerun and render images
                         # for ALL pages. The flag is scoped per-page so
                         # only pages the user has clicked actually render.
+                        #
+                        # Initialise _orig_r / _hl_r up here so the
+                        # download-link block below always has a defined
+                        # binding — even for pages the user hasn't
+                        # expanded. Without this the rerun path into the
+                        # download links raised UnboundLocalError on the
+                        # first "Load page image" click.
+                        _orig_r, _hl_r = None, None
                         _pidx_r = res_data_item.get('page_index_in_original_doc', 0)
                         _img_flag_r = f'_res_img_loaded_{_pidx_r}'
                         if not st.session_state.get(_img_flag_r):
@@ -4808,7 +4816,6 @@ elif st.session_state.processing_complete:
                             # un-highlighted PNG. The LRU cache key is
                             # computed from json.dumps inside
                             # _img_cache_key, so raw structures are fine.
-                            _orig_r, _hl_r = None, None
                             _pdf_bytes_r = _get_pdf_bytes()
                             if _pdf_bytes_r and not res_data_item.get('skipped_damaged'):
                                 _kws_for_r = [
