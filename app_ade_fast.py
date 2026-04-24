@@ -536,6 +536,21 @@ def acquire_analysis_slot(session_id: str):
 
 
 def release_analysis_slot(session_id: str):
+    # Diagnostic: every slot release now logs the top user-code frame that
+    # called it. Helps untangle "which path fired?" when a run dies
+    # unexpectedly — button click, finally, file-missing bail-out, etc.
+    try:
+        import traceback as _tb
+        _stack = _tb.extract_stack(limit=8)
+        # Drop this frame itself; pick the nearest caller inside app_ade_fast.
+        _caller = "unknown"
+        for f in reversed(_stack[:-1]):
+            if "app_ade_fast.py" in (f.filename or ""):
+                _caller = f"{os.path.basename(f.filename)}:{f.lineno} in {f.name}"
+                break
+    except Exception:
+        _caller = "trace_failed"
+
     slots = _read_slots()
     held = any(s.get("session_id") == session_id for s in slots)
     new_slots = [s for s in slots if s.get("session_id") != session_id]
@@ -545,7 +560,8 @@ def release_analysis_slot(session_id: str):
         print(f"[slots] release write failed: {e}")
     if held:
         telemetry.event("slot_released", session_id=session_id,
-                        active_count=len(new_slots))
+                        active_count=len(new_slots),
+                        caller=_caller)
 
 
 # --- FIFO waiter queue (Stage E11) ---
