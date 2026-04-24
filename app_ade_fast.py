@@ -4613,46 +4613,17 @@ if st.session_state.run_analysis_triggered and \
         prog_bar.empty()
         status_txt_area.success("All pages processed!")
 
-        # --- Show the timing table in the UI (right below the status) ---
-        with st.container():
-            st.markdown("### ⏱️ Run timings")
-            _rows = []
-            for _ph_key, _ph_label in _phase_name_map.items():
-                _s = _phase_timings.get(_ph_key, 0.0)
-                _pct = 100.0 * _s / max(_total_analysis_s, 1e-9)
-                _rows.append({"phase": _ph_label, "seconds": round(_s, 1), "% of total": f"{_pct:.0f}%"})
-            _rows.append({"phase": "TOTAL", "seconds": round(_total_analysis_s, 1), "% of total": "100%"})
-            st.table(_rows)
-            # Load the last 5 runs on this PDF for comparison
-            try:
-                _tdir = fence_cache.cache_root() / "_timings"
-                if _tdir.exists():
-                    _history = []
-                    for _tp in sorted(_tdir.glob(f"*_{_pdf_sha[:12]}.json"),
-                                      key=lambda p: p.stat().st_mtime, reverse=True)[:5]:
-                        try:
-                            with open(_tp, "r", encoding="utf-8") as _tf:
-                                _history.append(json.load(_tf))
-                        except Exception:
-                            continue
-                    if len(_history) > 1:
-                        st.markdown(f"**History for this PDF** ({len(_history)} recent runs):")
-                        _hrows = []
-                        for _h in _history:
-                            _when = time.strftime("%Y-%m-%d %H:%M", time.localtime(_h.get('timestamp', 0)))
-                            _hrows.append({
-                                "when": _when,
-                                "total (s)": _h.get('total_seconds', 0),
-                                "1a": _h.get('phase_seconds', {}).get('1a', 0),
-                                "1b": _h.get('phase_seconds', {}).get('1b', 0),
-                                "1c": _h.get('phase_seconds', {}).get('1c', 0),
-                                "2":  _h.get('phase_seconds', {}).get('2',  0),
-                                "3":  _h.get('phase_seconds', {}).get('3',  0),
-                                "classifier": _h.get('classifier', '?'),
-                            })
-                        st.table(_hrows)
-            except Exception as _he:
-                print(f"[timings] history read failed (non-fatal): {_he}")
+        # Run timings + per-PDF run history are still persisted to disk
+        # (telemetry + ~/.cache/fence_ade/_timings/*.json) and still
+        # printed to server stdout — see the phase-timings print block
+        # earlier in this function. The user doesn't need the pandas
+        # tables in the UI, so we just log them server-side.
+        print(f"SESSION {current_session_id} LOG: === run timings ===")
+        for _ph_key, _ph_label in _phase_name_map.items():
+            _s = _phase_timings.get(_ph_key, 0.0)
+            _pct = 100.0 * _s / max(_total_analysis_s, 1e-9)
+            print(f"SESSION {current_session_id} LOG:   {_ph_label}: {_s:.1f}s ({_pct:.0f}%)")
+        print(f"SESSION {current_session_id} LOG:   TOTAL: {_total_analysis_s:.1f}s")
         
         # Generate combined PDF
         _pdf_for_highlight = _get_pdf_bytes()
