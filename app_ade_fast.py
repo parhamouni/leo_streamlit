@@ -665,17 +665,23 @@ def _cache_scope() -> str:
     """Per-session cache dir name. Never shared, never reused."""
     return f"session_{get_session_id()}"
 
-def _cache_get(phase, pdf_sha, params, page_idx=None):
+def _cache_get(phase, pdf_sha, params, page_idx=None, user_scope=None):
+    # user_scope= lets a caller pin the scope explicitly. Phase 2 / Phase 3
+    # worker threads MUST pass this — calling _cache_scope() from a
+    # ThreadPoolExecutor worker gives you a bogus ghost session because
+    # `st.session_state` isn't bound to the thread's script run context,
+    # so the fallback creates a fresh uuid. Data then lives under one
+    # user scope and gets looked up under another.
     return fence_cache.get(phase, pdf_sha, params, page_idx=page_idx,
-                           user_scope=_cache_scope())
+                           user_scope=user_scope or _cache_scope())
 
-def _cache_put(phase, pdf_sha, params, value, page_idx=None):
+def _cache_put(phase, pdf_sha, params, value, page_idx=None, user_scope=None):
     return fence_cache.put(phase, pdf_sha, params, value, page_idx=page_idx,
-                           user_scope=_cache_scope())
+                           user_scope=user_scope or _cache_scope())
 
-def _cache_probe(phase, pdf_sha, params, page_indices=None):
+def _cache_probe(phase, pdf_sha, params, page_indices=None, user_scope=None):
     return fence_cache.probe(phase, pdf_sha, params, page_indices=page_indices,
-                             user_scope=_cache_scope())
+                             user_scope=user_scope or _cache_scope())
 
 def _reset_analysis_state(purge_cache: bool = True):
     """Tear down all state related to the current analysis so the user
@@ -2975,7 +2981,14 @@ if st.session_state.run_analysis_triggered and \
         # PHASE 2: Batch ADE for fence pages (smart batching by size)
         # =================================================================
         _ade_chunks_by_page = {}
-        
+
+        # Capture the authoritative cache scope ONCE, in the main thread.
+        # Phase 2 worker threads must use this scope — calling
+        # _cache_scope() from inside a ThreadPoolExecutor worker does
+        # not see st.session_state and would land writes under a ghost
+        # session dir the main thread can never read back.
+        _worker_scope = _cache_scope()
+
         if use_ade and ade_key and _fence_page_indices:
             # Belt-and-suspenders: damaged pages should never be fence pages
             # (Phase 1c skipped them) but filter again in case something slipped through.
@@ -3069,7 +3082,8 @@ if st.session_state.run_analysis_triggered and \
                             pdf_w, pdf_h = _page_dims.get(orig_idx, (0.0, 0.0))
                             chunks = ade.align_ade_chunks_to_page(resp, local_idx, pdf_w, pdf_h)
                             result[orig_idx] = chunks
-                            _cache_put("phase2", _pdf_sha, _cache_params, chunks, page_idx=orig_idx)
+                            _cache_put("phase2", _pdf_sha, _cache_params, chunks,
+                                       page_idx=orig_idx, user_scope=_worker_scope)
                         except Exception as _e:
                             result[orig_idx] = None
                             print(f"[APP] Page {orig_idx + 1}: align failed ({_e}) — marking as no ADE")
@@ -3093,7 +3107,8 @@ if st.session_state.run_analysis_triggered and \
                                 pdf_w, pdf_h = _page_dims.get(orig_idx, (0.0, 0.0))
                                 chunks = ade.align_ade_chunks_to_page(single_resp, 0, pdf_w, pdf_h)
                                 result[orig_idx] = chunks
-                                _cache_put("phase2", _pdf_sha, _cache_params, chunks, page_idx=orig_idx)
+                                _cache_put("phase2", _pdf_sha, _cache_params, chunks,
+                                           page_idx=orig_idx, user_scope=_worker_scope)
                             else:
                                 result[orig_idx] = None
                                 print(f"[APP] Page {orig_idx + 1}: individual ADE also failed")
@@ -3344,7 +3359,8 @@ if st.session_state.run_analysis_triggered and \
                     # 1. Legend entries
                     definitions = []
                     if highlight_fence_text_app and legend_chunks:
-                        cached = _cache_get("phase3_legend", _pdf_sha, _cache_params, page_idx=page_idx)
+                        cached = _cache_get("phase3_legend", _pdf_sha, _cache_params,
+                                            page_idx=page_idx, user_scope=_worker_scope)
                         if cached is not None:
                             definitions = cached
                         else:
@@ -3358,7 +3374,8 @@ if st.session_state.run_analysis_triggered and \
                                     figure_chunks=figure_chunks,
                                     prefilled_legend_items=_page_legend_prefill or None,
                                 )
-                                _cache_put("phase3_legend", _pdf_sha, _cache_params, definitions, page_idx=page_idx)
+                                _cache_put("phase3_legend", _pdf_sha, _cache_params, definitions,
+                                           page_idx=page_idx, user_scope=_worker_scope)
                             except Exception as _le:
                                 print(f"[phase3_precompute] page {page_idx + 1} legend error: {_le}")
 
@@ -3399,7 +3416,8 @@ if st.session_state.run_analysis_triggered and \
 
                     # 4. Scale detection (vision LLM) — cache-aware
                     detected_scale = None
-                    scale_cached = _cache_get("phase3_scale", _pdf_sha, _cache_params, page_idx=page_idx)
+                    scale_cached = _cache_get("phase3_scale", _pdf_sha, _cache_params,
+                                              page_idx=page_idx, user_scope=_worker_scope)
                     if scale_cached is not None:
                         detected_scale = scale_cached.get('verified_scale')
                     else:
@@ -3411,7 +3429,8 @@ if st.session_state.run_analysis_triggered and \
                                 worker_page, llm=scale_llm_instance or llm_analysis_instance
                             )
                             if scale_info.get('success') is not False or scale_info.get('verified_scale'):
-                                _cache_put("phase3_scale", _pdf_sha, _cache_params, scale_info, page_idx=page_idx)
+                                _cache_put("phase3_scale", _pdf_sha, _cache_params, scale_info,
+                                           page_idx=page_idx, user_scope=_worker_scope)
                             if scale_info.get('success') and scale_info.get('verified_scale'):
                                 detected_scale = scale_info['verified_scale']
                         except Exception as _se:
@@ -3419,7 +3438,8 @@ if st.session_state.run_analysis_triggered and \
 
                     # 5. Measurement (geometry + LLM layer match) — cache-aware
                     if enable_unified_measurement and (definitions or instances):
-                        if _cache_get("phase3_measure", _pdf_sha, _cache_params, page_idx=page_idx) is None:
+                        if _cache_get("phase3_measure", _pdf_sha, _cache_params,
+                                      page_idx=page_idx, user_scope=_worker_scope) is None:
                             try:
                                 ocr_full_text = "\n".join(line.get('text', '') for line in ocr_lines) if ocr_lines else None
                                 measurement_result = ade.measure_fence_elements(
@@ -3432,7 +3452,8 @@ if st.session_state.run_analysis_triggered and \
                                 )
                                 if measurement_result:
                                     _cache_put("phase3_measure", _pdf_sha, _cache_params,
-                                                    measurement_result, page_idx=page_idx)
+                                               measurement_result, page_idx=page_idx,
+                                               user_scope=_worker_scope)
                             except Exception as _me:
                                 print(f"[phase3_precompute] page {page_idx + 1} measure error: {_me}")
                 finally:
@@ -3488,7 +3509,7 @@ if st.session_state.run_analysis_triggered and \
                     "page_idx":                 int(page_idx),
                     "pdf_sha":                  _pdf_sha,
                     "cache_params":             _cache_params,
-                    "user_scope":               _cache_scope(),
+                    "user_scope":               _worker_scope,
                     "fence_cache_dir":          os.environ.get("FENCE_CACHE_DIR", ""),
                     "openai_api_key":           openai_key or "",
                     "analysis_model":           st.session_state.get("selected_model_for_analysis", "gpt-5.1"),
