@@ -2984,20 +2984,36 @@ if st.session_state.run_analysis_triggered and \
             # disk on demand (fitz demand-loads pages from path).
             _pdf_path_for_phase2 = st.session_state.get('pdf_disk_path') or ''
             if _pdf_path_for_phase2 and os.path.exists(_pdf_path_for_phase2):
-                _batches = ade.create_page_batches_from_path(_pdf_path_for_phase2, _fence_pages_to_fetch) if _fence_pages_to_fetch else []
+                _batches = ade.create_page_batches_from_path(
+                    _pdf_path_for_phase2, _fence_pages_to_fetch,
+                    max_batch_bytes=_ADE_BATCH_MAX_BYTES,
+                    max_pages_per_batch=_ADE_BATCH_PAGES,
+                ) if _fence_pages_to_fetch else []
             else:
-                _batches = ade.create_page_batches(file_bytes, _fence_pages_to_fetch) if _fence_pages_to_fetch else []
+                _batches = ade.create_page_batches(
+                    file_bytes, _fence_pages_to_fetch,
+                    max_batch_bytes=_ADE_BATCH_MAX_BYTES,
+                    max_pages_per_batch=_ADE_BATCH_PAGES,
+                ) if _fence_pages_to_fetch else []
 
             # Parallelize batches across FENCE_WORKERS_PHASE2 workers. Each
             # worker is self-contained (builds its own single/multi-page PDF,
             # hits the ADE endpoint, aligns chunks). doc_proc is NOT thread-
             # safe, so we use _page_dims (populated in Phase 1a) for page
             # dimensions instead of reaching into doc_proc from workers.
-            # LandingAI ADE starts returning 422 for inputs above ~15 MB
-            # in practice. Per-page cap is a bit lower to leave room for
-            # multi-page batches.
+            # LandingAI documented sync-endpoint caps: 50 MB / 50 pages
+            # per request. Our defaults are conservative (15 MB / 10 pages)
+            # because empirically ADE starts rejecting with 422 well
+            # before the 50 MB cap. All three knobs env-configurable.
             _ADE_BATCH_MAX_BYTES = int(os.environ.get("FENCE_ADE_BATCH_MAX_BYTES", str(15 * 1024 * 1024)))
             _ADE_PAGE_MAX_BYTES  = int(os.environ.get("FENCE_ADE_PAGE_MAX_BYTES",  str(12 * 1024 * 1024)))
+            # Set FENCE_ADE_BATCH_PAGES=1 to disable multi-page batching
+            # — each fence page gets its own ADE request. Slower overall
+            # (50 round-trips instead of 5-6) but sometimes yields
+            # different chunking on dense engineering detail sheets
+            # where ADE's per-document context may merge or drop small
+            # regions in a crowded multi-page batch.
+            _ADE_BATCH_PAGES = int(os.environ.get("FENCE_ADE_BATCH_PAGES", "10"))
 
             def _run_phase2_batch(batch_idx, batch):
                 """Worker: process one batch. Returns {page_idx: chunks_or_None}.
@@ -4125,15 +4141,41 @@ if st.session_state.run_analysis_triggered and \
                     img_col, det_col = st.columns([2, 1])
 
                     with img_col:
-                        # Deferred image render — the page image is loaded
-                        # on demand in the post-analysis results section
-                        # below (see display_page_result_expander). This
-                        # keeps the live analysis loop free of transient
-                        # PNG bytes.
-                        st.caption(
-                            "📷 Page image + highlights render on demand in "
-                            "the results section below."
-                        )
+                        # Image goes through the per-session LRU
+                        # (get_page_image_on_demand) rather than being
+                        # rendered inline + held in Python locals.
+                        # Memory: capped at FENCE_IMG_CACHE_MAX (default
+                        # 10) entries × ~3 MB — bounded regardless of
+                        # how many fence pages there are. First call
+                        # renders, subsequent re-renders are cache hits.
+                        _pdf_bytes_live = _get_pdf_bytes()
+                        _orig_live, _hl_live = None, None
+                        if _pdf_bytes_live:
+                            try:
+                                _defs_h = tuple(tuple(sorted(d.items())) for d in definitions) if definitions else ()
+                                _inst_h = tuple(tuple(sorted(i.items())) for i in instances) if instances else ()
+                                _kw_h = tuple(
+                                    tuple(sorted(k.items()))
+                                    for k in keyword_matches
+                                    if all(key in k for key in ['x0', 'y0', 'x1', 'y1'])
+                                ) if keyword_matches else ()
+                                _orig_live, _hl_live = get_page_image_on_demand(
+                                    _pdf_sha, _pdf_bytes_live, page_idx,
+                                    _defs_h, _inst_h, _kw_h,
+                                    pdf_width, pdf_height,
+                                    bool(highlight_fence_text_app) and bool(fence_found),
+                                    dpi=DISPLAY_IMAGE_DPI,
+                                )
+                            except Exception as _img_e:
+                                print(f"[APP] live image render for page {page_num} failed: {_img_e}")
+                        _disp_live = _hl_live or _orig_live
+                        if _disp_live:
+                            st.image(
+                                _disp_live,
+                                caption=f"Page {page_num}{' (Highlighted)' if _hl_live else ''}",
+                            )
+                        else:
+                            st.caption("📷 Image unavailable (page or PDF read error)")
                     
                     with det_col:
                         # Detection method badge
