@@ -3526,7 +3526,15 @@ if st.session_state.run_analysis_triggered and \
             # running in the background (Python can't cancel threads)
             # but the main loop is no longer blocked by it, and the
             # fence_cache writes from that worker (if any) still land.
-            FENCE_PHASE3_PAGE_TIMEOUT = _workers("FENCE_PHASE3_PAGE_TIMEOUT", 180, cap=600)
+            # Bumped default from 180s to 300s. Each subprocess runs 3
+            # serial LLM calls (legend → scale → measure); on dense
+            # title pages with 8-12 legend items, the legend step alone
+            # can take 90s + scale 30s + measure 60s = 180s at the edge,
+            # and a slow OpenAI response on any one call pushed clean
+            # pages into timeouts. 300s gives real headroom; we still
+            # cap at 600s so a genuinely hung subprocess eventually
+            # dies instead of blocking the whole analysis forever.
+            FENCE_PHASE3_PAGE_TIMEOUT = _workers("FENCE_PHASE3_PAGE_TIMEOUT", 300, cap=600)
 
             # Opt-in subprocess isolation. When FENCE_PHASE3_USE_SUBPROCESS=true
             # each per-page worker runs in a short-lived child process
@@ -3597,6 +3605,15 @@ if st.session_state.run_analysis_triggered and \
                         out, err = proc.communicate(timeout=5)
                     except Exception:
                         out, err = "", ""
+                    # Dump the drained stderr so we can see WHICH step the
+                    # subprocess was executing when the wallclock cap hit
+                    # — previously we just raised TimeoutError and lost
+                    # the stderr breadcrumbs, leaving "why did this page
+                    # time out?" unanswerable.
+                    if err:
+                        _err_tail = err.strip().splitlines()[-20:]
+                        for _line in _err_tail:
+                            print(f"[phase3_worker page {page_idx + 1} stderr on timeout] {_line}")
                     raise TimeoutError(
                         f"phase3 worker for page {page_idx + 1} exceeded "
                         f"{_wallclock_cap}s — SIGKILLed"

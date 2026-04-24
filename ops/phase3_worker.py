@@ -154,6 +154,13 @@ def main() -> int:
         except Exception as e:
             raise RuntimeError(f"page {page_idx} not accessible: {e}")
 
+        # Per-step breadcrumbs to stderr — when the parent SIGKILLs us
+        # on wallclock-cap expiry, it now drains and logs our stderr, so
+        # we'll see which step was active at the moment of death.
+        def _step(label: str) -> None:
+            print(f"[phase3_worker pg{page_idx + 1}] {label} @ +{time.perf_counter() - t0:.1f}s",
+                  file=sys.stderr, flush=True)
+
         # --- 1. Legend entries -------------------------------------------------
         legend_chunks, figure_chunks = ade.segment_chunks(ade_chunks) if ade_chunks else ([], [])
         definitions = []
@@ -162,7 +169,9 @@ def main() -> int:
                                      page_idx=page_idx, user_scope=user_scope)
             if cached is not None:
                 definitions = cached
+                _step("legend: cache hit")
             else:
+                _step(f"legend: start ({len(legend_chunks)} chunks)")
                 try:
                     definitions = ade.extract_legend_entries(
                         legend_chunks=legend_chunks,
@@ -173,6 +182,7 @@ def main() -> int:
                         figure_chunks=figure_chunks,
                         prefilled_legend_items=legend_prefill or None,
                     )
+                    _step(f"legend: done ({len(definitions)} items)")
                     fence_cache.put("phase3_legend", pdf_sha, cache_params,
                                     definitions, page_idx=page_idx, user_scope=user_scope)
                     wrote.append("phase3_legend")
@@ -222,9 +232,12 @@ def main() -> int:
                                        page_idx=page_idx, user_scope=user_scope)
         if scale_cached is not None:
             detected_scale = scale_cached.get("verified_scale")
+            _step("scale: cache hit")
         else:
+            _step("scale: start")
             try:
                 scale_info = verify_scale_with_bar_fast(worker_page, llm=llm_scale)
+                _step("scale: done")
                 if scale_info.get("success") is not False or scale_info.get("verified_scale"):
                     fence_cache.put("phase3_scale", pdf_sha, cache_params,
                                     scale_info, page_idx=page_idx, user_scope=user_scope)
@@ -239,6 +252,7 @@ def main() -> int:
         if enable_unified_measure and (definitions or instances):
             if fence_cache.get("phase3_measure", pdf_sha, cache_params,
                                page_idx=page_idx, user_scope=user_scope) is None:
+                _step(f"measure: start (defs={len(definitions)}, inst={len(instances)})")
                 try:
                     ocr_full_text = "\n".join(line.get("text", "") for line in ocr_lines) if ocr_lines else None
                     measurement_result = ade.measure_fence_elements(
@@ -249,6 +263,7 @@ def main() -> int:
                         scale_factor=detected_scale or 1.0,
                         ocr_text=ocr_full_text,
                     )
+                    _step("measure: done")
                     if measurement_result:
                         fence_cache.put("phase3_measure", pdf_sha, cache_params,
                                         measurement_result, page_idx=page_idx,
