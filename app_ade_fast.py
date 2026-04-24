@@ -736,6 +736,7 @@ def _reset_analysis_state(purge_cache: bool = True, preserve_uploader: bool = Fa
         'auto_synced_', 'auto_matched_indices_',
         'orig_img_size_', 'base_img_size_', 'click_key_',
         '_phase3_', '_img_cache', '_page_img_loaded_',
+        '_umt_pg_loaded_', '_umt_tool_loaded',
     )
     _clear_exact = {
         'fence_pages', 'non_fence_pages', 'processing_complete',
@@ -5900,10 +5901,33 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         else:
             st.warning("Image not available")
     
-    # Render each page tab using the fragment
+    # Render each page tab using the fragment. BUT: Streamlit tabs
+    # run every tab's body on every rerun, and render_page_fragment
+    # kicks off vector line detection + image resize + canvas build —
+    # that's ~1-4 MB session_state per page. Gate each tab behind a
+    # "Load this page" button so a user who only wants Page 3 doesn't
+    # pay the cost for pages 1, 2, 4, 5 they never touched. Edits they
+    # make on any loaded page persist in session_state regardless.
     for tab_idx, (tab, page_data) in enumerate(zip(page_tabs, st.session_state.fence_pages)):
         with tab:
-            render_page_fragment(page_data, zoom_level, min_line_pts)
+            _umt_pg_num = page_data['page_number']
+            _umt_pg_flag = f"_umt_pg_loaded_{_umt_pg_num}"
+            if not st.session_state.get(_umt_pg_flag):
+                _btn_col, _cap_col = st.columns([1, 3])
+                with _btn_col:
+                    if st.button(f"📏 Load page {_umt_pg_num}",
+                                 key=f"_umt_pg_btn_{_umt_pg_num}",
+                                 type="primary",
+                                 use_container_width=True):
+                        st.session_state[_umt_pg_flag] = True
+                        st.rerun()
+                with _cap_col:
+                    st.caption(
+                        "Click to detect vector lines + render the measurement "
+                        "canvas for this page. Other tabs stay dormant."
+                    )
+            else:
+                render_page_fragment(page_data, zoom_level, min_line_pts)
     
     # Overall summary across all pages - grouped by category
     st.markdown("---")
