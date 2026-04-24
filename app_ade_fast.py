@@ -751,7 +751,21 @@ def _reset_analysis_state(purge_cache: bool = True):
         st.cache_data.clear()
     except Exception:
         pass
+    # Also drop @st.cache_resource entries (cached LLM / fitz clients).
+    # These objects hold httpx connection pools and pymupdf doc handles
+    # that can pin 100+ MB of RSS between runs otherwise.
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
     gc.collect()
+    # Return freed arenas to the OS where we can; without this the
+    # glibc heap retains the high-water mark of the previous run.
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
     print(f"SESSION {current_session_id} LOG: _reset_analysis_state done "
           "(slot released, state cleared)")
 
@@ -1832,43 +1846,29 @@ if uploaded_pdf_file_obj:
         del _raw_bytes
         # Don't reset state or clear caches — session results are still valid
 
-    if st.session_state.last_uploaded_file_id != current_file_id:
-        print(f"SESSION {current_session_id} LOG: New file detected. Resetting state for {current_file_id}.")
-        # Preserve some settings across resets
-        current_selected_model = st.session_state.selected_model_for_analysis
-        current_keywords = st.session_state.fence_keywords_app
+    if st.session_state.get('last_uploaded_file_id') != current_file_id:
+        print(f"SESSION {current_session_id} LOG: New file detected. Full reset for {current_file_id}.")
 
-        # Per-run cache policy: when the user swaps PDFs, the previous
-        # PDF's cache under this session is dead weight. Wipe the whole
-        # session cache dir now instead of piece-by-piece.
-        _purge_session_cache()
+        # Full tear-down via the same helper the explicit Cancel / New
+        # Analysis buttons use. Previously this branch only purged a
+        # subset of state (dynamic image-cache prefixes, measurement
+        # dicts) and left behind the big-ticket items between runs:
+        #   - highlighted_pdf_bytes_for_download (~100-200 MB for a
+        #     ~50-fence-page deck)
+        #   - _img_cache LRU of rendered PNGs
+        #   - @st.cache_resource LLM / DocAI clients with their httpx
+        #     connection pools
+        # Each re-upload on the same Streamlit session therefore bled
+        # ~500-700 MB of RSS the OS could never reclaim. Route through
+        # _reset_analysis_state so every known source of retained state
+        # gets wiped in one place — if we miss something new, we add it
+        # there and every reset path picks it up.
+        _reset_analysis_state(purge_cache=True)
 
-        # Purge all dynamic cache keys accumulated during previous session
-        _DYNAMIC_PREFIXES = (
-            'base_img_', 'drawn_img_', 'line_stats_', 'lines_',
-            'auto_synced_', 'auto_matched_indices_',
-            'orig_img_size_', 'base_img_size_', 'click_key_',
-        )
-        _purged = 0
-        for k in list(st.session_state.keys()):
-            if any(k.startswith(p) for p in _DYNAMIC_PREFIXES):
-                del st.session_state[k]
-                _purged += 1
-        # Reset lazily-initialized measurement dicts
-        for _dict_key in ('user_drawn_lines', 'line_assignments', 'drawing_mode',
-                          'pending_line_start', 'unified_measurements',
-                          'per_page_scale_info', 'page_categories',
-                          'active_category_per_page', 'element_details',
-                          'fence_page_texts'):
-            st.session_state[_dict_key] = {}
-        if _purged:
-            gc.collect()
-            print(f"SESSION {current_session_id} LOG: Purged {_purged} dynamic cache keys on file switch.")
-
+        # Rebuild the default keys (_reset_analysis_state preserves only
+        # session_id + user preferences; everything else needs a fresh
+        # default before we repopulate with this upload).
         initialize_session_state(current_session_id)
-
-        st.session_state.selected_model_for_analysis = current_selected_model
-        st.session_state.fence_keywords_app = current_keywords
 
         st.session_state.uploaded_pdf_name = uploaded_pdf_file_obj.name
         _raw_bytes = uploaded_pdf_file_obj.getvalue()
@@ -1886,15 +1886,7 @@ if uploaded_pdf_file_obj:
         del _raw_bytes
         st.session_state.last_uploaded_file_id = current_file_id
 
-        st.cache_data.clear()
-        # Also evict the shared fitz Document — its key is the old PDF hash,
-        # but clearing is cheap and avoids any risk of it pointing at a
-        # stale path after upload.
-        try:
-            st.cache_resource.clear()
-        except Exception:
-            pass
-        print(f"SESSION {current_session_id} LOG: Cleared all @st.cache_data + resource caches due to new file.")
+        print(f"SESSION {current_session_id} LOG: New-file reset complete; rerunning.")
         st.rerun()
     
     if openai_key and llm_analysis_instance and \
