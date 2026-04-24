@@ -683,7 +683,7 @@ def _cache_probe(phase, pdf_sha, params, page_indices=None, user_scope=None):
     return fence_cache.probe(phase, pdf_sha, params, page_indices=page_indices,
                              user_scope=user_scope or _cache_scope())
 
-def _reset_analysis_state(purge_cache: bool = True):
+def _reset_analysis_state(purge_cache: bool = True, preserve_uploader: bool = False):
     """Tear down all state related to the current analysis so the user
     can upload/start fresh. Called by the "New Analysis" / "Cancel" buttons.
 
@@ -732,6 +732,13 @@ def _reset_analysis_state(purge_cache: bool = True):
         'highlighted_pdf_filename_for_download', 'last_run_timings',
         'pdf_uploader_main',
     }
+    if preserve_uploader:
+        # When _reset_analysis_state is invoked from the new-file
+        # upload path, the file widget is the one that triggered us —
+        # deleting 'pdf_uploader_main' from session_state would drop
+        # the just-uploaded file, and the script's next rerun would
+        # see file_uploader return None. Keep it in that case.
+        _clear_exact.discard('pdf_uploader_main')
     for k in list(st.session_state.keys()):
         if k in _clear_exact or any(k.startswith(p) for p in _clear_prefixes):
             try:
@@ -1862,8 +1869,10 @@ if uploaded_pdf_file_obj:
         # ~500-700 MB of RSS the OS could never reclaim. Route through
         # _reset_analysis_state so every known source of retained state
         # gets wiped in one place — if we miss something new, we add it
-        # there and every reset path picks it up.
-        _reset_analysis_state(purge_cache=True)
+        # there and every reset path picks it up. preserve_uploader=True
+        # keeps the file-uploader widget's state so the file we just
+        # accepted from the user isn't dropped before we can save it.
+        _reset_analysis_state(purge_cache=True, preserve_uploader=True)
 
         # Rebuild the default keys (_reset_analysis_state preserves only
         # session_id + user preferences; everything else needs a fresh
