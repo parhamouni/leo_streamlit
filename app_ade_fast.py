@@ -4198,16 +4198,19 @@ if st.session_state.run_analysis_triggered and \
                         _orig_live, _hl_live = None, None
                         if _pdf_bytes_live:
                             try:
-                                _defs_h = tuple(tuple(sorted(d.items())) for d in definitions) if definitions else ()
-                                _inst_h = tuple(tuple(sorted(i.items())) for i in instances) if instances else ()
-                                _kw_h = tuple(
-                                    tuple(sorted(k.items()))
-                                    for k in keyword_matches
+                                # highlight_page_image expects lists of DICTS
+                                # (needs .get('x0')/.get('y0')). Pass the raw
+                                # structures through; the LRU cache key is
+                                # computed from their JSON form inside
+                                # _img_cache_key, so we don't need to
+                                # pre-flatten them here.
+                                _kw_filtered = [
+                                    k for k in (keyword_matches or [])
                                     if all(key in k for key in ['x0', 'y0', 'x1', 'y1'])
-                                ) if keyword_matches else ()
+                                ]
                                 _orig_live, _hl_live = get_page_image_on_demand(
                                     _pdf_sha, _pdf_bytes_live, page_idx,
-                                    _defs_h, _inst_h, _kw_h,
+                                    definitions or [], instances or [], _kw_filtered,
                                     pdf_width, pdf_height,
                                     bool(highlight_fence_text_app) and bool(fence_found),
                                     dpi=DISPLAY_IMAGE_DPI,
