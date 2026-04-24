@@ -2342,6 +2342,12 @@ if st.session_state.run_analysis_triggered and \
             unified_measurement=bool(enable_unified_measurement),
             dpi=DISPLAY_IMAGE_DPI,
         )
+        # Persist so post-analysis code paths (UMT tab sync, etc.) can
+        # read back from phase3_measure cache using the SAME keys the
+        # analysis wrote with. Without this, render_page_fragment had
+        # no way to reach the cache and raised NameError.
+        st.session_state['_pdf_sha_cached'] = _pdf_sha
+        st.session_state['_cache_params_cached'] = _cache_params
         print(f"SESSION {current_session_id} LOG: cache key pdf={_pdf_sha[:8]} params={_cache_params}")
 
         # Per-phase timing accumulators (logged at end of each phase).
@@ -5293,8 +5299,15 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         # having to re-run analysis or flip the Non-layer suggestions
         # toggle. Idempotent: skipped if auto_lines already populated.
         _sync_meas = st.session_state.unified_measurements.get(page_key, {})
-        if not _sync_meas.get('auto_lines'):
-            _cached_meas = _cache_get("phase3_measure", _pdf_sha, _cache_params,
+        # _pdf_sha / _cache_params are closure vars of the analysis
+        # block — not visible from here. The analysis saves them to
+        # session_state right after computing so this post-analysis
+        # code can pull them back out. If they're missing (analysis
+        # hasn't run yet this session) just skip the sync.
+        _umt_pdf_sha = st.session_state.get('_pdf_sha_cached')
+        _umt_cache_params = st.session_state.get('_cache_params_cached')
+        if not _sync_meas.get('auto_lines') and _umt_pdf_sha and _umt_cache_params:
+            _cached_meas = _cache_get("phase3_measure", _umt_pdf_sha, _umt_cache_params,
                                       page_idx=page_idx)
             if _cached_meas and _cached_meas.get('all_fence_lines'):
                 _mm = _cached_meas.get('measurement_method', 'none')
