@@ -3849,11 +3849,17 @@ if st.session_state.run_analysis_triggered and \
                         # 36x24 engineering sheet is ~2-5 MB per page.
                         _nf_img_flag = f'_nf_img_loaded_{page_idx}'
                         if not st.session_state.get(_nf_img_flag):
+                            # No explicit st.rerun() after setting the
+                            # flag: Streamlit already reruns on button
+                            # click, and firing our own rerun on top of
+                            # that made the expander collapse between the
+                            # two reruns. Leaving the click's built-in
+                            # rerun as the single source of truth keeps
+                            # the expander open on the very first click.
                             if st.button("🖼️ Load page image",
                                          key=f'_btn_{_nf_img_flag}',
                                          use_container_width=True):
                                 st.session_state[_nf_img_flag] = True
-                                st.rerun()
                             st.caption("Click to render this page from the PDF.")
                         else:
                             _pdf_bytes_nf = _get_pdf_bytes()
@@ -4264,11 +4270,15 @@ if st.session_state.run_analysis_triggered and \
                         # every rerun of this expander.
                         _img_flag = f'_fence_img_loaded_{page_idx}'
                         if not st.session_state.get(_img_flag):
+                            # See note in the non-fence lazy-load below:
+                            # NO explicit st.rerun() after setting the
+                            # flag — the button click already triggers
+                            # a rerun, and a second rerun on top would
+                            # collapse the expander on the first click.
                             if st.button("🖼️ Load page image",
                                          key=f'_btn_{_img_flag}',
                                          use_container_width=True):
                                 st.session_state[_img_flag] = True
-                                st.rerun()
                             st.caption("Image not rendered yet (saves memory). "
                                        "Click above to read from disk.")
                         else:
@@ -4802,11 +4812,14 @@ elif st.session_state.processing_complete:
                         _pidx_r = res_data_item.get('page_index_in_original_doc', 0)
                         _img_flag_r = f'_res_img_loaded_{_pidx_r}'
                         if not st.session_state.get(_img_flag_r):
+                            # No explicit st.rerun() — the button click
+                            # already triggers one, and a second rerun
+                            # was collapsing the expander on the first
+                            # click. User had to click twice.
                             if st.button("🖼️ Load page image",
                                          key=f'_btn_{_img_flag_r}',
                                          use_container_width=True):
                                 st.session_state[_img_flag_r] = True
-                                st.rerun()
                             st.caption("Click above to render this page from the PDF.")
                         else:
                             # Pass raw dict lists (NOT hash-flattened
