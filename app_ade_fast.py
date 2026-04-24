@@ -4784,29 +4784,53 @@ elif st.session_state.processing_complete:
                     img_col_r, det_col_r = st.columns([2, 1])
 
                     with img_col_r:
-                        # Regenerate images on demand (not stored in session_state).
-                        # Same LRU-cached path for fence AND non-fence pages.
-                        _orig_r, _hl_r = None, None
-                        _pdf_bytes_r = _get_pdf_bytes()
-                        if _pdf_bytes_r and not res_data_item.get('skipped_damaged'):
-                            _defs_hashable = tuple(tuple(sorted(d.items())) for d in definitions) if definitions else ()
-                            _inst_hashable = tuple(tuple(sorted(i.items())) for i in instances) if instances else ()
-                            _kw_hashable = tuple(tuple(sorted(k.items())) for k in keyword_matches if all(key in k for key in ['x0','y0','x1','y1'])) if keyword_matches else ()
-                            _orig_r, _hl_r = get_page_image_on_demand(
-                                st.session_state.current_pdf_hash,
-                                _pdf_bytes_r,
-                                res_data_item['page_index_in_original_doc'],
-                                _defs_hashable, _inst_hashable, _kw_hashable,
-                                res_data_item.get('pdf_width', 792),
-                                res_data_item.get('pdf_height', 612),
-                                res_data_item.get('highlight_fence_text_app_setting', True) and res_data_item.get('fence_found', False),
-                                dpi=DISPLAY_IMAGE_DPI,
-                            )
-                        disp_img_r = _hl_r or _orig_r
-                        if disp_img_r:
-                            st.image(disp_img_r, caption=f"Page {res_data_item['page_number']}")
-                        elif res_data_item.get('skipped_damaged'):
-                            st.warning("⚠ Page could not be rendered — PDF damage on this page.")
+                        # Lazy-load gate: Streamlit runs the expander body
+                        # on every script rerun regardless of whether the
+                        # user has visually opened it, so without an
+                        # explicit flag every "Load page image" click on
+                        # ONE page would fire a rerun and render images
+                        # for ALL pages. The flag is scoped per-page so
+                        # only pages the user has clicked actually render.
+                        _pidx_r = res_data_item.get('page_index_in_original_doc', 0)
+                        _img_flag_r = f'_res_img_loaded_{_pidx_r}'
+                        if not st.session_state.get(_img_flag_r):
+                            if st.button("🖼️ Load page image",
+                                         key=f'_btn_{_img_flag_r}',
+                                         use_container_width=True):
+                                st.session_state[_img_flag_r] = True
+                                st.rerun()
+                            st.caption("Click above to render this page from the PDF.")
+                        else:
+                            # Pass raw dict lists (NOT hash-flattened
+                            # tuples). highlight_page_image expects
+                            # dict.get('x0') etc. — tuples silently crash
+                            # inside its try/except and fall back to the
+                            # un-highlighted PNG. The LRU cache key is
+                            # computed from json.dumps inside
+                            # _img_cache_key, so raw structures are fine.
+                            _orig_r, _hl_r = None, None
+                            _pdf_bytes_r = _get_pdf_bytes()
+                            if _pdf_bytes_r and not res_data_item.get('skipped_damaged'):
+                                _kws_for_r = [
+                                    k for k in (keyword_matches or [])
+                                    if all(key in k for key in ['x0', 'y0', 'x1', 'y1'])
+                                ]
+                                _orig_r, _hl_r = get_page_image_on_demand(
+                                    st.session_state.current_pdf_hash,
+                                    _pdf_bytes_r,
+                                    _pidx_r,
+                                    definitions or [], instances or [], _kws_for_r,
+                                    res_data_item.get('pdf_width', 792),
+                                    res_data_item.get('pdf_height', 612),
+                                    res_data_item.get('highlight_fence_text_app_setting', True)
+                                        and res_data_item.get('fence_found', False),
+                                    dpi=DISPLAY_IMAGE_DPI,
+                                )
+                            disp_img_r = _hl_r or _orig_r
+                            if disp_img_r:
+                                st.image(disp_img_r, caption=f"Page {res_data_item['page_number']}")
+                            elif res_data_item.get('skipped_damaged'):
+                                st.warning("⚠ Page could not be rendered — PDF damage on this page.")
                         
                         dl_links_rerun = []
                         if _hl_r:
