@@ -3809,7 +3809,14 @@ if st.session_state.run_analysis_triggered and \
                 # FENCE PAGE: Use pre-computed ADE chunks from batch
                 # =====================================================================
                 if use_ade and ade_key:
+                    # In-memory dict was cleared after Phase 3 pre-compute
+                    # to free RAM. The chunks are still on disk in the
+                    # fence_cache — load them from there on miss.
                     _ade_chunks = _ade_chunks_by_page.get(page_idx)
+                    if _ade_chunks is None:
+                        _ade_chunks = _cache_get(
+                            "phase2", _pdf_sha, _cache_params, page_idx=page_idx,
+                        )
                     if _ade_chunks is None:
                         print(f"[APP] Page {page_num}: ADE failed for this page, using pre-filter fallback.")
                         fallback_result = prefilter_result
