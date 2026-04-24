@@ -134,14 +134,21 @@ FENCE_PHASE3_PREVIEW = _workers("FENCE_PHASE3_PREVIEW", 5, cap=40)
 
 
 # --- Cache housekeeping ---
-# Sweep aged cache entries at PROCESS startup. Guard with a module-level
-# flag because Streamlit re-executes this entire script on every widget
-# interaction, and without the guard the wipe below would nuke the
-# cache dir that the live session was actively reading from — manifests
-# as cache_hits=0 on every rerun, the analysis block re-entering from
-# Phase 1a, and the browser appearing to "freeze" because every UI
-# click silently restarts a 30+-minute analysis.
-if not globals().get("_FENCE_BOOT_CLEANUP_DONE"):
+# Sweep aged cache entries at PROCESS startup. Must ONLY run on actual
+# process boot, not on every Streamlit rerun — Streamlit re-executes the
+# whole script on every widget interaction, and a rerun-wide wipe would
+# nuke the cache dir the active session is reading from. Symptom was
+# cache_hits=0 after every click + the analysis block re-entering from
+# Phase 1a + the browser "freezing" on mid-run button clicks because
+# Phase 1-2-3 all re-ran from scratch with no cache.
+#
+# We use a per-PID sentinel file under /tmp instead of a module-level
+# variable because Streamlit's script runner re-executes this file in a
+# fresh namespace every rerun — module globals from the previous rerun
+# are NOT preserved. The PID is, though: same process → same sentinel
+# file → wipe skipped.
+_BOOT_SENTINEL = f"/tmp/.fence_ade_boot_done_{os.getpid()}"
+if not os.path.exists(_BOOT_SENTINEL):
     try:
         # Per-run cache policy: on process start, wipe EVERY session_*
         # dir under the cache root. They can only belong to dead prior
@@ -166,7 +173,11 @@ if not globals().get("_FENCE_BOOT_CLEANUP_DONE"):
             print(f"[fence_cache] Swept {_purged_dirs} expired PDF directories on startup.")
     except Exception as _e:
         print(f"[fence_cache] Startup sweep failed (non-fatal): {_e}")
-    _FENCE_BOOT_CLEANUP_DONE = True
+    try:
+        with open(_BOOT_SENTINEL, "w") as _f:
+            _f.write("ok")
+    except Exception:
+        pass
 
 st.set_page_config(page_title="ADE Fence Detector", layout="wide")
 
