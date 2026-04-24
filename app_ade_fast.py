@@ -1923,6 +1923,13 @@ if uploaded_pdf_file_obj:
        not st.session_state.analysis_halted_due_to_error:
         if st.button("▶ Start Analysis", type="primary", key="start_analysis_btn"):
             print(f"SESSION {current_session_id} LOG: Triggering analysis.")
+            # User explicitly started a new analysis — wipe any stale
+            # cache from prior runs of this same file in this same
+            # session so the run is truly fresh. Mid-analysis reruns
+            # (browser sleep, widget clicks) do NOT reach this branch;
+            # they skip straight through the gate or the post-complete
+            # display, so their caches are preserved.
+            _purge_session_cache()
             st.session_state.run_analysis_triggered = True
             st.rerun()
         else:
