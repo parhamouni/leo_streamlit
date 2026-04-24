@@ -4533,11 +4533,18 @@ if st.session_state.run_analysis_triggered and \
         )
         if _run_terminated:
             _purge_session_cache()
+            release_analysis_slot(current_session_id)
         else:
+            # Same reason we keep the cache: the slot also has to stay. If
+            # we release it here, a Streamlit rerun mid-analysis (browser
+            # sleep / widget re-render) drops the slot, and no other code
+            # path re-acquires it — the run is dead. Leaving the slot in
+            # place means the NEXT rerun hits acquire_analysis_slot's
+            # same-session dedup and silently takes back its own slot,
+            # then resumes phases from the disk cache.
             print(f"SESSION {current_session_id} LOG: analysis block exited "
                   "without terminal state (likely Streamlit rerun) — "
-                  "keeping session cache so next run can resume")
-        release_analysis_slot(current_session_id)
+                  "keeping session cache AND slot so next run can resume")
     
     # Final summary
     final_summary_text = (
