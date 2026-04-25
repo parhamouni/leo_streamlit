@@ -4113,7 +4113,14 @@ if st.session_state.run_analysis_triggered and \
                 # the LLM-guided result". Now we show both, relying on the
                 # user to pick/reject individual lines in the canvas.
                 measurement_method = measurement_result.get('measurement_method', 'none') if measurement_result else 'none'
-                _accept_methods = ('layer', 'llm_guided')
+                # 'skipped' means measure_fence_elements bailed because
+                # the page had too many fence-layer lines (default cap
+                # 5000). The all_fence_lines list is still populated —
+                # we just didn't build the per-indicator breakdown. We
+                # can still show the raw lines on the canvas so the
+                # user can pick/assign them. Treat 'skipped' the same
+                # as 'llm_guided' for display purposes.
+                _accept_methods = ('layer', 'llm_guided', 'skipped')
 
                 if measurement_result and measurement_result.get('all_fence_lines') and measurement_method in _accept_methods:
                     auto_lines = []
@@ -4126,8 +4133,14 @@ if st.session_state.run_analysis_triggered and \
                     # layers and layer_to_category is empty; in that case
                     # assign a single fallback category so the lines still
                     # appear on the canvas (user can re-categorize later).
-                    _is_llm_guided = (measurement_method == 'llm_guided')
-                    _fallback_cat = "🔍 Auto-detected (LLM-guided)" if _is_llm_guided else None
+                    # llm_guided pages have no layer → category mapping;
+                    # skipped pages bailed out of categorisation to
+                    # avoid a 5000-line stall. Both need a fallback
+                    # category so their lines render on the canvas.
+                    _needs_fallback = measurement_method in ('llm_guided', 'skipped')
+                    _fallback_cat = "🔍 Auto-detected (LLM-guided)" if measurement_method == 'llm_guided' else (
+                        "🔍 Auto-detected (high-density, layer-skipped)" if measurement_method == 'skipped' else None
+                    )
                     for line in all_fence_lines:
                         length_pts = line.length_pts
                         length_inches = length_pts / 72.0
@@ -5311,10 +5324,14 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                                       page_idx=page_idx)
             if _cached_meas and _cached_meas.get('all_fence_lines'):
                 _mm = _cached_meas.get('measurement_method', 'none')
-                if _mm in ('layer', 'llm_guided'):
+                if _mm in ('layer', 'llm_guided', 'skipped'):
                     _l2c = _cached_meas.get('layer_to_category', {}) or {}
                     _sf = _cached_meas.get('page_info', {}).get('scale_factor', 1.0)
-                    _fallback_cat = "🔍 Auto-detected (LLM-guided)" if _mm == 'llm_guided' else None
+                    _fallback_cat = (
+                        "🔍 Auto-detected (LLM-guided)" if _mm == 'llm_guided'
+                        else "🔍 Auto-detected (high-density, layer-skipped)" if _mm == 'skipped'
+                        else None
+                    )
                     _auto_now = []
                     for _ln in _cached_meas['all_fence_lines']:
                         _lyr = getattr(_ln, 'layer', None) or ''
