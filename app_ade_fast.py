@@ -3872,19 +3872,37 @@ if st.session_state.run_analysis_triggered and \
                 # pages) so memory stays bounded.
                 # =====================================================================
                 print(f"[APP] Page {page_num}: Not fence-related, skipping.")
+                # The classifier returns its full LLM rationale as
+                # prefilter_result['llm_result'] = {is_fence_related,
+                # confidence, signals, reason}. Earlier we only picked
+                # up the top-level 'reason' (which the prefilter never
+                # populates), so the UI fell back to a generic
+                # "context classified non-fence" sentence and the LLM's
+                # actual reasoning was hidden in the on-disk cache.
+                # Now promote llm_result to the page record so the UI
+                # can show the verbatim LLM verdict.
+                _llm_res = prefilter_result.get("llm_result") or {}
                 _nf_reason = (
-                    prefilter_result.get("reason")
+                    _llm_res.get("reason")
+                    or prefilter_result.get("reason")
                     or ("Keyword match found but context classified non-fence"
                         if prefilter_result.get("matched_keywords") else
                         "No fence-related keywords or content detected")
                 )
+                _nf_conf = (
+                    _llm_res.get("confidence")
+                    if _llm_res.get("confidence") is not None
+                    else prefilter_result.get("confidence")
+                )
+                _nf_signals = list(_llm_res.get("signals") or [])
                 st.session_state.non_fence_pages.append({
                     'page_number': page_num,
                     'page_index_in_original_doc': page_idx,
                     'fence_found': False,
                     'reason': _nf_reason,
                     'method': prefilter_result.get("method", ""),
-                    'confidence': prefilter_result.get("confidence"),
+                    'confidence': _nf_conf,
+                    'signals': _nf_signals,
                     'matched_keywords': prefilter_result.get("matched_keywords", []),
                     'pdf_width': pdf_width,
                     'pdf_height': pdf_height,
@@ -3897,15 +3915,22 @@ if st.session_state.run_analysis_triggered and \
                     # "the expander closed itself".
                     _nf_expanded = bool(st.session_state.get(f'_page_img_loaded_{page_idx}'))
                     with st.expander(f"Page {page_num}", expanded=_nf_expanded):
+                        # Pull confidence + signals from llm_result if the
+                        # LLM ran (keyword-only paths don't have these).
+                        _nf_llm = prefilter_result.get("llm_result") or {}
                         _bits = []
                         if prefilter_result.get("method"):
                             _bits.append(f"method `{prefilter_result['method']}`")
-                        _conf = prefilter_result.get("confidence")
-                        if _conf is not None:
+                        _conf_show = (
+                            _nf_llm.get("confidence")
+                            if _nf_llm.get("confidence") is not None
+                            else prefilter_result.get("confidence")
+                        )
+                        if _conf_show is not None:
                             try:
-                                _bits.append(f"confidence {float(_conf):.0%}")
+                                _bits.append(f"confidence {float(_conf_show):.0%}")
                             except Exception:
-                                _bits.append(f"confidence {_conf}")
+                                _bits.append(f"confidence {_conf_show}")
                         if _bits:
                             st.caption(" · ".join(_bits))
                         st.markdown(f"**Reasoning:** {_nf_reason}")
@@ -3913,6 +3938,11 @@ if st.session_state.run_analysis_triggered and \
                             st.caption(
                                 "Keywords present but rejected: "
                                 + ", ".join(prefilter_result["matched_keywords"][:6])
+                            )
+                        _nf_signals_live = list(_nf_llm.get("signals") or [])
+                        if _nf_signals_live:
+                            st.caption(
+                                "LLM signals: " + ", ".join(_nf_signals_live[:8])
                             )
                         # Lazy-load the actual page render. Button gate
                         # keeps memory flat when the user just scrolls past
@@ -5038,6 +5068,18 @@ elif st.session_state.processing_complete:
                                 st.caption(
                                     "keywords present but rejected: "
                                     + ", ".join(_kws[:6])
+                                )
+                            # LLM signals — what the model found IN the
+                            # page text that justified the verdict. Not
+                            # the same thing as matched_keywords (those
+                            # are pure prefilter matches). Showing both
+                            # gives the user an audit trail: "the
+                            # prefilter saw X, but the LLM looked at the
+                            # surrounding context and found Y instead".
+                            _signals = res_data_item.get('signals') or []
+                            if _signals:
+                                st.caption(
+                                    "LLM signals: " + ", ".join(_signals[:8])
                                 )
                         else:
                             # Detection method badge — same logic as the live
