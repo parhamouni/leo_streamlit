@@ -4866,33 +4866,69 @@ elif st.session_state.processing_complete:
                 _pidx_for_exp = res_data_item.get('page_index_in_original_doc', 0)
                 _flag_for_exp = f'_page_img_loaded_{_pidx_for_exp}'
                 _res_expanded = bool(st.session_state.get(_flag_for_exp))
-                with st.expander(exp_title_res, expanded=_res_expanded):
-                    # Full-body gate. Streamlit runs every expander's body
-                    # on every script rerun — 62 fence pages with pandas
-                    # DataFrames for definitions + instances + element
-                    # specs was rendering thousands of DOM rows on every
-                    # interaction, which made the fence column feel
-                    # "frozen" while the non-fence column looked fine (it
-                    # just renders a couple of text captions per page).
-                    # Gate the whole content behind the per-page loaded
-                    # flag so collapsed pages show only a single button.
-                    if not st.session_state.get(_flag_for_exp):
-                        # on_click runs before rerun → flag True next
-                        # run, body renders.
-                        def _on_load_details(flag=_flag_for_exp):
-                            st.session_state[flag] = True
+                # We're not using st.expander here — Streamlit expanders
+                # don't expose their open/closed state to Python, so we
+                # couldn't hook a "free this page's memory" callback into
+                # a close-click. Instead use a single full-width button
+                # that toggles between two states. When the user clicks
+                # to OPEN, on_click flips _flag_for_exp = True and the
+                # body renders below. When they click again to CLOSE,
+                # the callback flips it back to False AND evicts the
+                # rendered image bytes / unified_measurements lines for
+                # this page from session_state, so the memory actually
+                # comes back.
+                def _on_toggle_page(flag=_flag_for_exp,
+                                    pidx=_pidx_for_exp,
+                                    pkey=f"page_{res_data_item['page_number']}"):
+                    new = not bool(st.session_state.get(flag))
+                    st.session_state[flag] = new
+                    if not new:
+                        # Closing: free this page's heavy state.
+                        # 1) drop image bytes from the LRU
+                        try:
+                            from collections import OrderedDict as _OD
+                            _ic = st.session_state.get(_IMG_CACHE_KEY)
+                            if isinstance(_ic, _OD):
+                                _drop = [k for k in list(_ic.keys()) if k[1] == pidx]
+                                for _k in _drop:
+                                    _ic.pop(_k, None)
+                        except Exception:
+                            pass
+                        # 2) drop unified_measurements row for this page
+                        try:
+                            st.session_state.unified_measurements.pop(pkey, None)
+                        except Exception:
+                            pass
+                        # 3) drop UMT-side per-page state (line stats,
+                        #    resized base/drawn image WEBPs, etc.)
+                        try:
+                            for _k in list(st.session_state.keys()):
+                                if any(_k.startswith(p) for p in (
+                                    'base_img_', 'base_img_size_', 'drawn_img_',
+                                    'orig_img_size_', 'line_stats_', 'lines_',
+                                    'auto_synced_', 'auto_matched_indices_',
+                                    'click_key_',
+                                )):
+                                    if f"_{res_data_item['page_number']}_" in _k or _k.endswith(f"_{res_data_item['page_number']}"):
+                                        del st.session_state[_k]
+                        except Exception:
+                            pass
+                        try:
+                            import gc as _gc; _gc.collect()
+                            import ctypes as _ct
+                            _ct.CDLL("libc.so.6").malloc_trim(0)
+                        except Exception:
+                            pass
 
-                        st.button(
-                            "🖼️ Load page details",
-                            key=f'_btn_expand_{_pidx_for_exp}',
-                            use_container_width=True,
-                            on_click=_on_load_details,
-                        )
-                        st.caption(
-                            "Click to render the page image + definitions + "
-                            "instances + measurements from disk."
-                        )
-                        continue  # skip the heavy body for collapsed pages
+                _arrow = "▼" if _res_expanded else "▶"
+                st.button(
+                    f"{_arrow}  {exp_title_res}",
+                    key=f'_btn_expand_{_pidx_for_exp}',
+                    use_container_width=True,
+                    on_click=_on_toggle_page,
+                )
+
+                if _res_expanded:
 
                     img_col_r, det_col_r = st.columns([2, 1])
 
