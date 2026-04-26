@@ -6073,31 +6073,31 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             if not st.session_state.get(_umt_pg_flag):
                 _btn_col, _cap_col = st.columns([1, 3])
                 with _btn_col:
-                    if st.button(f"📏 Load page {_umt_pg_num}",
-                                 key=f"_umt_pg_btn_{_umt_pg_num}",
-                                 type="primary",
-                                 use_container_width=True):
-                        # Evict other pages' heavy state before loading
-                        # this one — at most ONE page's worth of images
-                        # + line stats is in memory at a time. Edits
-                        # persist across pages via session_state dicts.
-                        _evict_other_umt_pages(_umt_pg_num)
-                        # Also clear the other tabs' "loaded" flags so
-                        # they revert to showing their own Load button.
+                    # on_click callback runs BEFORE the script re-runs,
+                    # so by the time `if not st.session_state.get(flag)`
+                    # is evaluated again, the flag is already True and
+                    # we drop straight into render_page_fragment. That
+                    # avoids the previous double-click pattern (where
+                    # the body's branch was decided BEFORE the click
+                    # handler set the flag, so the click only "showed"
+                    # in the next interaction). And because we're still
+                    # using a button widget, Streamlit's natural rerun
+                    # preserves the active tab — no st.rerun() needed,
+                    # so we don't lose the tab the user just clicked
+                    # on like the explicit-rerun version did.
+                    def _on_load_page(active=_umt_pg_num,
+                                      flag=_umt_pg_flag):
+                        _evict_other_umt_pages(active)
                         for _k in list(st.session_state.keys()):
-                            if _k.startswith("_umt_pg_loaded_") and _k != _umt_pg_flag:
+                            if _k.startswith("_umt_pg_loaded_") and _k != flag:
                                 del st.session_state[_k]
-                        st.session_state[_umt_pg_flag] = True
-                        # NOTE: no st.rerun() here. An explicit rerun
-                        # was resetting Streamlit's active-tab state
-                        # (the st.tabs widget remembers the clicked tab
-                        # through a WIDGET interaction, but a
-                        # script-level st.rerun drops that link), so the
-                        # user would see Page 1's tab come back up
-                        # instead of the Page N they just clicked Load
-                        # on. Streamlit's automatic rerun from the
-                        # button click itself preserves the tab — it
-                        # carries the same widget-interaction context.
+                        st.session_state[flag] = True
+
+                    st.button(f"📏 Load page {_umt_pg_num}",
+                              key=f"_umt_pg_btn_{_umt_pg_num}",
+                              type="primary",
+                              use_container_width=True,
+                              on_click=_on_load_page)
                 with _cap_col:
                     st.caption(
                         "Click to detect vector lines + render the measurement "
