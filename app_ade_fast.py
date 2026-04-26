@@ -1197,6 +1197,116 @@ def get_page_image_on_demand(_pdf_bytes_hash, pdf_bytes, page_idx, definitions, 
     return result
 
 
+def generate_combined_highlighted_pdf_via_subprocess(
+    pdf_disk_path, fence_pages_results_list, uploaded_pdf_name_base, session_id
+):
+    """Subprocess-isolated version of generate_combined_highlighted_pdf.
+
+    Forks ops/highlight_pdf_worker.py so the fitz memory peak (~2-2.5 GB
+    on a 144 MB source PDF with ~50 fence pages) lives in a child process
+    that the OS reclaims when it exits. The parent only sees the final
+    output PDF bytes, never the working memory.
+
+    Returns (pdf_bytes, fname) on success, (None, err) on failure.
+    """
+    import subprocess as _sp, json as _json, tempfile
+    if not pdf_disk_path or not os.path.exists(pdf_disk_path):
+        return None, "no PDF on disk"
+    if not fence_pages_results_list:
+        return None, "no fence pages"
+
+    out_fd, out_path = tempfile.mkstemp(prefix=f"hl_{session_id[:8]}_", suffix=".pdf")
+    os.close(out_fd)
+
+    # Trim each page record to ONLY the rectangles the worker draws. The
+    # full fence_pages list carries UI metadata (text snippets, analysis
+    # logs, etc.) we don't need to serialize across stdin.
+    minimal_pages = []
+    for p in fence_pages_results_list:
+        idx = p.get('page_index_in_original_doc')
+        if idx is None:
+            continue
+        minimal_pages.append({
+            'page_index_in_original_doc': idx,
+            'definitions': [
+                {k: d[k] for k in ('x0', 'y0', 'x1', 'y1') if k in d}
+                for d in (p.get('definitions') or [])
+            ],
+            'instances': [
+                {k: i[k] for k in ('x0', 'y0', 'x1', 'y1') if k in i}
+                for i in (p.get('instances') or [])
+            ],
+            'keyword_matches': [
+                {k: kw[k] for k in ('x0', 'y0', 'x1', 'y1') if k in kw}
+                for kw in (p.get('keyword_matches') or [])
+                if all(k in kw for k in ('x0', 'y0', 'x1', 'y1'))
+            ],
+        })
+
+    task = {
+        'pdf_path':      pdf_disk_path,
+        'out_path':      out_path,
+        'uploaded_name': uploaded_pdf_name_base or 'document.pdf',
+        'fence_pages':   minimal_pages,
+    }
+    task_json = _json.dumps(task, default=str)
+    worker_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        'ops', 'highlight_pdf_worker.py',
+    )
+
+    _wallclock = int(os.environ.get('FENCE_HIGHLIGHT_PDF_TIMEOUT', '600'))
+    print(f"SESSION {session_id} LOG: spawning highlight_pdf_worker "
+          f"({len(minimal_pages)} fence pages, cap {_wallclock}s)")
+    proc = _sp.Popen(
+        [sys.executable, worker_script],
+        stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.PIPE, text=True,
+    )
+    try:
+        out, err = proc.communicate(task_json, timeout=_wallclock)
+        rc = proc.returncode
+    except _sp.TimeoutExpired:
+        try: proc.kill()
+        except Exception: pass
+        try: proc.communicate(timeout=5)
+        except Exception: pass
+        try: os.remove(out_path)
+        except Exception: pass
+        print(f"SESSION {session_id} ERROR: highlight_pdf_worker exceeded {_wallclock}s — SIGKILLed")
+        return None, "highlight subprocess timed out"
+
+    if rc != 0:
+        try:
+            last = (out.strip().splitlines() or [''])[-1]
+            rec = _json.loads(last) if last else {}
+            err_str = rec.get('error', f'exit={rc}')
+        except Exception:
+            err_str = f"exit={rc} stderr={(err or '')[:200]}"
+        try: os.remove(out_path)
+        except Exception: pass
+        print(f"SESSION {session_id} ERROR: highlight_pdf_worker failed: {err_str}")
+        return None, f"highlight subprocess failed: {err_str}"
+
+    try:
+        with open(out_path, 'rb') as f:
+            pdf_bytes = f.read()
+    except Exception as e:
+        print(f"SESSION {session_id} ERROR: cannot read highlight worker output: {e}")
+        try: os.remove(out_path)
+        except Exception: pass
+        return None, f"read failed: {e}"
+    try:
+        os.remove(out_path)
+    except Exception:
+        pass
+
+    base, ext = os.path.splitext(uploaded_pdf_name_base or 'document.pdf')
+    fname = f"{base}_fence_highlights{ext}"
+    print(f"SESSION {session_id} LOG: highlight subprocess produced "
+          f"{len(pdf_bytes) / 1024:.0f} KB ({fname})")
+    return pdf_bytes, fname
+
+
 def generate_combined_highlighted_pdf(original_pdf_bytes, fence_pages_results_list, uploaded_pdf_name_base, session_id):
     """Generate a combined PDF with only fence-related pages highlighted."""
     print(f"SESSION {session_id} LOG: Generating combined highlighted PDF.")
@@ -4742,15 +4852,33 @@ if st.session_state.run_analysis_triggered and \
             print(f"SESSION {current_session_id} LOG:   {_ph_label}: {_s:.1f}s ({_pct:.0f}%)")
         print(f"SESSION {current_session_id} LOG:   TOTAL: {_total_analysis_s:.1f}s")
         
-        # Generate combined PDF
-        _pdf_for_highlight = _get_pdf_bytes()
-        if st.session_state.fence_pages and _pdf_for_highlight:
-            pdf_b, pdf_n = generate_combined_highlighted_pdf(
-                _pdf_for_highlight,
-                st.session_state.fence_pages,
-                st.session_state.uploaded_pdf_name,
-                current_session_id
-            )
+        # Generate combined PDF — by default in a subprocess so the
+        # fitz peak (~2 GB on a 144 MB source) doesn't pin the parent's
+        # RSS for the rest of the session. Set
+        # FENCE_HIGHLIGHT_PDF_USE_SUBPROCESS=false to keep it inline.
+        _hl_use_subproc = os.environ.get(
+            'FENCE_HIGHLIGHT_PDF_USE_SUBPROCESS', 'true'
+        ).lower() == 'true'
+        _pdf_disk_path_for_hl = st.session_state.get('pdf_disk_path') or ''
+        if st.session_state.fence_pages:
+            pdf_b, pdf_n = (None, "no source PDF on disk")
+            if _hl_use_subproc and _pdf_disk_path_for_hl and os.path.exists(_pdf_disk_path_for_hl):
+                pdf_b, pdf_n = generate_combined_highlighted_pdf_via_subprocess(
+                    _pdf_disk_path_for_hl,
+                    st.session_state.fence_pages,
+                    st.session_state.uploaded_pdf_name,
+                    current_session_id,
+                )
+            else:
+                # Inline fallback (or env-disabled): same as before.
+                _pdf_for_highlight = _get_pdf_bytes()
+                if _pdf_for_highlight:
+                    pdf_b, pdf_n = generate_combined_highlighted_pdf(
+                        _pdf_for_highlight,
+                        st.session_state.fence_pages,
+                        st.session_state.uploaded_pdf_name,
+                        current_session_id,
+                    )
             if pdf_b:
                 st.session_state.highlighted_pdf_bytes_for_download = pdf_b
                 st.session_state.highlighted_pdf_filename_for_download = pdf_n
