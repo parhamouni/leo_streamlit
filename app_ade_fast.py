@@ -4115,27 +4115,18 @@ if st.session_state.run_analysis_triggered and \
                               "pre-compute didn't finalize; skipping LLM retry")
                         measurement_result = {}
                 
-                # Store auto-detected lines in unified measurement structure
-                # for BOTH layer-based and llm_guided detection. Layer-based
-                # is the reliable path (explicit fence layers in the PDF),
-                # llm_guided is the fallback for layerless site plans. We
-                # used to skip llm_guided entirely because it's noisier, but
-                # that meant Page 1 of a typical site-plan PDF showed zero
-                # auto-lines even when Phase 3 had actually completed — the
-                # user couldn't tell "no fence content" from "we dropped
-                # the LLM-guided result". Now we show both, relying on the
-                # user to pick/reject individual lines in the canvas.
+                # Store auto-detected lines in unified measurement structure.
+                # Match app_ade.py's gating: 'layer' is the reliable path
+                # (explicit fence layers in the PDF) and is ALWAYS shown.
+                # 'llm_guided' / 'skipped' are noisier fallbacks that only
+                # render when the user explicitly opts in via the
+                # "🔬 Non-layer suggestions" sidebar toggle.
                 measurement_method = measurement_result.get('measurement_method', 'none') if measurement_result else 'none'
-                # 'skipped' means measure_fence_elements bailed because
-                # the page had too many fence-layer lines (default cap
-                # 5000). The all_fence_lines list is still populated —
-                # we just didn't build the per-indicator breakdown. We
-                # can still show the raw lines on the canvas so the
-                # user can pick/assign them. Treat 'skipped' the same
-                # as 'llm_guided' for display purposes.
-                _accept_methods = ('layer', 'llm_guided', 'skipped')
+                _accept = (measurement_method == 'layer') or (
+                    enable_nonlayer_suggestions and measurement_method in ('llm_guided', 'skipped')
+                )
 
-                if measurement_result and measurement_result.get('all_fence_lines') and measurement_method in _accept_methods:
+                if measurement_result and measurement_result.get('all_fence_lines') and _accept:
                     auto_lines = []
                     all_fence_lines = measurement_result.get('all_fence_lines', [])
                     scale_factor = measurement_result.get('page_info', {}).get('scale_factor', 1.0)
@@ -5337,7 +5328,13 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
                                       page_idx=page_idx)
             if _cached_meas and _cached_meas.get('all_fence_lines'):
                 _mm = _cached_meas.get('measurement_method', 'none')
-                if _mm in ('layer', 'llm_guided', 'skipped'):
+                # Same gating as the render loop: 'layer' always renders,
+                # 'llm_guided' / 'skipped' only when the user has flipped
+                # the Non-layer suggestions sidebar toggle on.
+                _sync_accept = (_mm == 'layer') or (
+                    enable_nonlayer_suggestions and _mm in ('llm_guided', 'skipped')
+                )
+                if _sync_accept:
                     _l2c = _cached_meas.get('layer_to_category', {}) or {}
                     _sf = _cached_meas.get('page_info', {}).get('scale_factor', 1.0)
                     _fallback_cat = (
