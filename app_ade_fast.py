@@ -327,7 +327,20 @@ def initialize_session_state(session_id_val):
         'current_pdf_hash': None,
         'highlighted_pdf_bytes_for_download': None,
         'last_uploaded_file_id': None,
-        'selected_model_for_analysis': os.environ.get("FENCE_ANALYSIS_MODEL", "gpt-5-mini"),
+        # Default to gpt-5.1 (same as app_ade.py). Earlier I'd set this
+        # to gpt-5-mini to save tokens, but mini is too weak to pick
+        # the specific fence layers out of a site-plan PDF's many
+        # drawing layers in measure_fence_elements →
+        # llm_identify_fence_layers. When LLM returns nothing the code
+        # falls back to a keyword match like 'WALL'/'FENC'/'BARRIER'/
+        # 'GATE' that on a typical site plan over-matches every wall
+        # in the building, grabs >5000 lines, and triggers
+        # measurement_method="skipped" — no per-indicator
+        # categorisation, blank UMT canvas. gpt-5.1 picks the correct
+        # specific layer (e.g. "FENCE-EXISTING") and the page lands
+        # under the 5000-line cap with a proper "layer" result.
+        # FENCE_ANALYSIS_MODEL env var still wins if set.
+        'selected_model_for_analysis': os.environ.get("FENCE_ANALYSIS_MODEL", "gpt-5.1"),
         # Unified measurement storage
         'unified_measurements': {},  # {page_key: {'auto_lines': [...], 'manual_lines': [...], 'drawn_lines': [...]}}
         'per_page_scale_info': {},
