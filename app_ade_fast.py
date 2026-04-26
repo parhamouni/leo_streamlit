@@ -3920,20 +3920,18 @@ if st.session_state.run_analysis_triggered and \
                         # 36x24 engineering sheet is ~2-5 MB per page.
                         _nf_img_flag = f'_page_img_loaded_{page_idx}'
                         if not st.session_state.get(_nf_img_flag):
-                            # st.rerun() is REQUIRED here — the button's
-                            # returned-True is visible in the SAME run,
-                            # but Python is already inside the `if not
-                            # flag:` branch (the check was evaluated at
-                            # the top of this run), so setting the flag
-                            # doesn't retroactively jump us to the else
-                            # branch that renders the image. Without an
-                            # explicit rerun, the image wouldn't show
-                            # until the user's next action.
-                            if st.button("🖼️ Load page image",
-                                         key=f'_btn_{_nf_img_flag}',
-                                         use_container_width=True):
-                                st.session_state[_nf_img_flag] = True
-                                st.rerun()
+                            # on_click pattern: the callback runs BEFORE
+                            # the script reruns, so the flag is True by
+                            # the time the if/else here re-evaluates and
+                            # we drop into the else branch that renders
+                            # the image. No explicit st.rerun() needed.
+                            def _on_load_nf(flag=_nf_img_flag):
+                                st.session_state[flag] = True
+
+                            st.button("🖼️ Load page image",
+                                      key=f'_btn_{_nf_img_flag}',
+                                      use_container_width=True,
+                                      on_click=_on_load_nf)
                             st.caption("Click to render this page from the PDF.")
                         else:
                             _pdf_bytes_nf = _get_pdf_bytes()
@@ -4373,19 +4371,16 @@ if st.session_state.run_analysis_triggered and \
                         # every rerun of this expander.
                         _img_flag = f'_page_img_loaded_{page_idx}'
                         if not st.session_state.get(_img_flag):
-                            # See note in the non-fence lazy-load: we
-                            # need st.rerun() here. The flag check that
-                            # put us in this branch was evaluated at
-                            # the top of the current run; setting the
-                            # flag now only takes effect on the NEXT
-                            # run, so we force that rerun immediately
-                            # instead of making the user click a second
-                            # widget to trigger one.
-                            if st.button("🖼️ Load page image",
-                                         key=f'_btn_{_img_flag}',
-                                         use_container_width=True):
-                                st.session_state[_img_flag] = True
-                                st.rerun()
+                            # on_click pattern: callback runs before the
+                            # rerun so the flag is True when the if/else
+                            # re-evaluates next run.
+                            def _on_load_fence(flag=_img_flag):
+                                st.session_state[flag] = True
+
+                            st.button("🖼️ Load page image",
+                                      key=f'_btn_{_img_flag}',
+                                      use_container_width=True,
+                                      on_click=_on_load_fence)
                             st.caption("Image not rendered yet (saves memory). "
                                        "Click above to read from disk.")
                         else:
@@ -4882,13 +4877,17 @@ elif st.session_state.processing_complete:
                     # Gate the whole content behind the per-page loaded
                     # flag so collapsed pages show only a single button.
                     if not st.session_state.get(_flag_for_exp):
-                        if st.button(
+                        # on_click runs before rerun → flag True next
+                        # run, body renders.
+                        def _on_load_details(flag=_flag_for_exp):
+                            st.session_state[flag] = True
+
+                        st.button(
                             "🖼️ Load page details",
                             key=f'_btn_expand_{_pidx_for_exp}',
                             use_container_width=True,
-                        ):
-                            st.session_state[_flag_for_exp] = True
-                            st.rerun()
+                            on_click=_on_load_details,
+                        )
                         st.caption(
                             "Click to render the page image + definitions + "
                             "instances + measurements from disk."
@@ -4916,19 +4915,20 @@ elif st.session_state.processing_complete:
                         _pidx_r = res_data_item.get('page_index_in_original_doc', 0)
                         _img_flag_r = f'_page_img_loaded_{_pidx_r}'
                         if not st.session_state.get(_img_flag_r):
-                            # st.rerun() is necessary: the flag check
-                            # that routed us into this branch was
-                            # evaluated at the top of the current
-                            # script run, so setting the flag here only
-                            # takes effect on the NEXT run. Triggering
-                            # it immediately makes the image appear on
-                            # the very first click instead of waiting
-                            # for the user's next widget interaction.
-                            if st.button("🖼️ Load page image",
-                                         key=f'_btn_{_img_flag_r}',
-                                         use_container_width=True):
-                                st.session_state[_img_flag_r] = True
-                                st.rerun()
+                            # on_click pattern — same as the other Load
+                            # buttons. Note: this inner image button
+                            # uses the SAME _page_img_loaded_<idx> flag
+                            # as the outer Load-page-details button, so
+                            # in practice it's only seen when the user
+                            # took some other path; either click flips
+                            # the same flag.
+                            def _on_load_inner(flag=_img_flag_r):
+                                st.session_state[flag] = True
+
+                            st.button("🖼️ Load page image",
+                                      key=f'_btn_{_img_flag_r}',
+                                      use_container_width=True,
+                                      on_click=_on_load_inner)
                             st.caption("Click above to render this page from the PDF.")
                         else:
                             # Pass raw dict lists (NOT hash-flattened
@@ -5197,12 +5197,15 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
     if not st.session_state.get(_UMT_LOADED_KEY):
         _umt_col1, _umt_col2 = st.columns([1, 3])
         with _umt_col1:
-            if st.button("📏 Open Measurement Tool",
-                         key="_umt_open_btn",
-                         type="primary",
-                         use_container_width=True):
+            # on_click pattern — same as the analysis-side Load buttons.
+            def _on_open_umt():
                 st.session_state[_UMT_LOADED_KEY] = True
-                st.rerun()
+
+            st.button("📏 Open Measurement Tool",
+                      key="_umt_open_btn",
+                      type="primary",
+                      use_container_width=True,
+                      on_click=_on_open_umt)
         with _umt_col2:
             st.caption(
                 "Interactive canvas for auto-detected + manually drawn fence lines. "
