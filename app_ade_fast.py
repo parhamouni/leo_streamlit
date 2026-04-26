@@ -4732,7 +4732,63 @@ if st.session_state.run_analysis_triggered and \
         _single_page_pdfs.clear()
         gc.collect()
         print(f"SESSION {current_session_id} LOG: Freed processing caches, gc.collect() done")
-        
+
+        # =====================================================================
+        # COMBINED-HIGHLIGHTED-PDF GENERATION
+        # Runs IMMEDIATELY after the render loop ends — BEFORE the slow
+        # cross-page element-detail LLM (which can take minutes), and
+        # BEFORE any Streamlit widget call (status_txt_area.text,
+        # prog_bar.empty, etc.) that could raise RerunException.
+        #
+        # Why the early position matters
+        # ------------------------------
+        # processing_complete is flipped True up at line 4728 (the moment
+        # fence_pages is fully populated) so that mid-analysis widget
+        # clicks — e.g. a "Load page image" button on an already-rendered
+        # result expander — re-enter the post-analysis branch on the next
+        # rerun instead of restarting Phase 1. The trade-off: any rerun
+        # queued AFTER the early flag flips will raise RerunException at
+        # the very next st.* call. Element extraction is a long pure-
+        # Python LLM call that doesn't touch Streamlit, so it runs to
+        # completion — but the next st.* call after it (`prog_bar.empty()`
+        # / `status_txt_area.success()` further down) used to be where
+        # the abort actually triggered, blocking the subprocess that came
+        # after them. By moving the subprocess here — between two
+        # non-widget print statements — we guarantee it always fires,
+        # even when the user clicks during the slow LLM extract.
+        # =====================================================================
+        _hl_use_subproc = os.environ.get(
+            'FENCE_HIGHLIGHT_PDF_USE_SUBPROCESS', 'true'
+        ).lower() == 'true'
+        _pdf_disk_path_for_hl = st.session_state.get('pdf_disk_path') or ''
+        if st.session_state.fence_pages:
+            pdf_b, pdf_n = (None, "no source PDF on disk")
+            if _hl_use_subproc and _pdf_disk_path_for_hl and os.path.exists(_pdf_disk_path_for_hl):
+                pdf_b, pdf_n = generate_combined_highlighted_pdf_via_subprocess(
+                    _pdf_disk_path_for_hl,
+                    st.session_state.fence_pages,
+                    st.session_state.uploaded_pdf_name,
+                    current_session_id,
+                )
+            else:
+                # Inline fallback (or env-disabled): same as before.
+                _pdf_for_highlight = _get_pdf_bytes()
+                if _pdf_for_highlight:
+                    pdf_b, pdf_n = generate_combined_highlighted_pdf(
+                        _pdf_for_highlight,
+                        st.session_state.fence_pages,
+                        st.session_state.uploaded_pdf_name,
+                        current_session_id,
+                    )
+            if pdf_b:
+                st.session_state.highlighted_pdf_bytes_for_download = pdf_b
+                st.session_state.highlighted_pdf_filename_for_download = pdf_n
+            else:
+                # NOTE: deliberately a print, NOT st.warning — we are still
+                # in the no-widget zone; raising a Streamlit warning here
+                # would create exactly the abort point we just dodged.
+                print(f"SESSION {current_session_id} LOG: highlight pdf skipped: {pdf_n}")
+
         # =====================================================================
         # CROSS-PAGE DETAIL EXTRACTION
         # After all pages processed, extract detailed specs for each element
@@ -4852,39 +4908,11 @@ if st.session_state.run_analysis_triggered and \
             print(f"SESSION {current_session_id} LOG:   {_ph_label}: {_s:.1f}s ({_pct:.0f}%)")
         print(f"SESSION {current_session_id} LOG:   TOTAL: {_total_analysis_s:.1f}s")
         
-        # Generate combined PDF — by default in a subprocess so the
-        # fitz peak (~2 GB on a 144 MB source) doesn't pin the parent's
-        # RSS for the rest of the session. Set
-        # FENCE_HIGHLIGHT_PDF_USE_SUBPROCESS=false to keep it inline.
-        _hl_use_subproc = os.environ.get(
-            'FENCE_HIGHLIGHT_PDF_USE_SUBPROCESS', 'true'
-        ).lower() == 'true'
-        _pdf_disk_path_for_hl = st.session_state.get('pdf_disk_path') or ''
-        if st.session_state.fence_pages:
-            pdf_b, pdf_n = (None, "no source PDF on disk")
-            if _hl_use_subproc and _pdf_disk_path_for_hl and os.path.exists(_pdf_disk_path_for_hl):
-                pdf_b, pdf_n = generate_combined_highlighted_pdf_via_subprocess(
-                    _pdf_disk_path_for_hl,
-                    st.session_state.fence_pages,
-                    st.session_state.uploaded_pdf_name,
-                    current_session_id,
-                )
-            else:
-                # Inline fallback (or env-disabled): same as before.
-                _pdf_for_highlight = _get_pdf_bytes()
-                if _pdf_for_highlight:
-                    pdf_b, pdf_n = generate_combined_highlighted_pdf(
-                        _pdf_for_highlight,
-                        st.session_state.fence_pages,
-                        st.session_state.uploaded_pdf_name,
-                        current_session_id,
-                    )
-            if pdf_b:
-                st.session_state.highlighted_pdf_bytes_for_download = pdf_b
-                st.session_state.highlighted_pdf_filename_for_download = pdf_n
-            else:
-                st.warning(f"Could not generate PDF: {pdf_n}")
-        
+        # NOTE: combined-highlighted-PDF generation moved earlier — runs
+        # right after the render loop ends, BEFORE the slow element-
+        # detail extract and BEFORE any Streamlit widget call. See the
+        # block immediately after the "Free Phase 1/2 caches" gc.collect.
+
     except Exception as e:
         st.error(f"Processing error: {e}")
         st.session_state.analysis_halted_due_to_error = True
