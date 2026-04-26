@@ -4811,8 +4811,30 @@ if st.session_state.run_analysis_triggered and \
             if all_element_names:
                 print(f"[APP] Extracting details for {len(all_element_names)} elements: {all_element_names}")
                 try:
+                    # extract_element_details fires a SINGLE big LLM call:
+                    # ~20 KB input prompt + asks for a JSON array of N
+                    # entries × 13 fields each. On a 50+ fence-page deck
+                    # with 200+ elements, the model output alone runs 90-
+                    # 180 s. The shared llm_analysis_instance has
+                    # timeout=60 / max_retries=1 (worst case ~120 s) —
+                    # tight enough that this call was timing out every
+                    # run and silently returning {} (logged as
+                    # "[DETAILS] ⚠️ LLM call failed: Request timed out").
+                    # Build a dedicated long-timeout client just for
+                    # this one call so the rest of Phase 3's tight per-
+                    # call cap stays in place.
+                    _details_timeout = int(os.environ.get(
+                        'FENCE_DETAILS_TIMEOUT', '300'
+                    ))
+                    details_llm_instance = ChatOpenAI(
+                        model=st.session_state.selected_model_for_analysis,
+                        temperature=0,
+                        openai_api_key=openai_key,
+                        timeout=_details_timeout,
+                        max_retries=1,
+                    )
                     element_details = ade.extract_element_details(
-                        llm=llm_analysis_instance,
+                        llm=details_llm_instance,
                         element_names=all_element_names,
                         page_texts=st.session_state.fence_page_texts,
                     )
