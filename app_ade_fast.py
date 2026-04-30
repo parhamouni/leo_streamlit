@@ -2496,7 +2496,22 @@ if st.session_state.run_analysis_triggered and \
         # --- Step 1a: Extract native PDF text + prepare OCR inputs (fast, sequential) ---
         _pdf_lines_by_page = {}
         _page_dims = {}
-        _single_page_pdfs = {}  # Cache for reuse in Phase 2 fallback
+        # Estimated single-page-PDF size in bytes, keyed by page_idx. Populated
+        # in the Phase 1a page-dims pass by summing each page's image and content
+        # stream lengths (no rasterization). Used to pack OCR batches so each
+        # batch's combined size stays under DocAI's ~35 MB request cap, which
+        # in turn means safe_multi_page_pdf_from_path doesn't have to downsample
+        # heavy pages to make a fixed-size batch fit.
+        _page_byte_estimates = {}
+        # Lazy cache, keyed by page_idx -> raw single-page PDF bytes. Populated
+        # on demand by _get_single_page_pdf() during Phase 1b OCR fallback paths.
+        # Was previously eagerly built for ALL pages right after Phase 1a, which
+        # silently allocated ~500 MB+ for large PDFs and pushed the process past
+        # MemoryHigh, causing pdf_write_document to thrash on memcg reclaim.
+        _single_page_pdfs = {}
+        # One-element list so the closure below can mutate it without `nonlocal`
+        # (this is module-level Streamlit script scope, not a function).
+        _single_page_pdf_misses = [0]
         
         _broken = st.session_state.get('broken_pages', set())
         status_txt_area.text(f"extracting native text from {total_pages} pages…")
@@ -2641,15 +2656,49 @@ if st.session_state.run_analysis_triggered and \
             if page_idx in _broken:
                 _page_dims[page_idx] = (0, 0)
                 _pdf_lines_by_page[page_idx] = []
+                _page_byte_estimates[page_idx] = 0
                 continue
             try:
                 page = doc_proc[page_idx]
                 _page_dims[page_idx] = (page.rect.width, page.rect.height)
+                # Cheap byte-size estimate: sum of embedded image streams +
+                # content streams for this page in their RAW (still-compressed)
+                # form — that's what actually contributes to the on-disk PDF
+                # size. Using xref_stream() (decompressed) wildly overcounts
+                # for JPEG/CCITT-compressed scan pages: the decoded pixel
+                # buffer is 10-50× larger than the JPEG bytes the page
+                # actually stores. xref_stream_raw() returns the encoded
+                # stream as-stored, so estimates land within ~5-15% of the
+                # actual single-page-PDF size. We add a fixed ~50 KB
+                # structural overhead per page when packing.
+                _est = 0
+                try:
+                    for _img in page.get_images(full=True):
+                        _xref = _img[0]
+                        try:
+                            _stream = doc_proc.xref_stream_raw(_xref)
+                            if _stream:
+                                _est += len(_stream)
+                        except Exception:
+                            pass
+                    _contents = page.get_contents()
+                    if _contents:
+                        for _cx in _contents:
+                            try:
+                                _cs = doc_proc.xref_stream_raw(_cx)
+                                if _cs:
+                                    _est += len(_cs)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                _page_byte_estimates[page_idx] = _est
             except Exception as _e:
                 print(f"SESSION {current_session_id} WARNING: Phase 1a page {page_idx + 1} open failed: {_e} — skipping")
                 _broken.add(page_idx)
                 _page_dims[page_idx] = (0, 0)
                 _pdf_lines_by_page[page_idx] = []
+                _page_byte_estimates[page_idx] = 0
                 continue
 
             _cached_1a = _cache_get("phase1a", _pdf_sha, _cache_params, page_idx=page_idx)
@@ -2726,6 +2775,7 @@ if st.session_state.run_analysis_triggered and \
                                    wall_s=round(_phase_timings['1a'], 3),
                                    cache_hits=_phase1a_cache_hits,
                                    total_pages=total_pages - len(_broken))
+        _mem_snapshot("after phase 1a")
         _check_memory_pressure("after phase1a")
         # Make sure the total-ETA line reflects Phase 1a completion even
         # when everything was cache-hit (the extraction pool may never
@@ -2733,21 +2783,46 @@ if st.session_state.run_analysis_triggered and \
         _update_total_eta(_phase_overall('1a', 1.0))
         _phase_t0 = time.perf_counter()
 
-        # Batch-create single-page PDFs for OCR (reused in Phase 2 fallback)
-        # Uses one fitz.open() instead of N separate open/close cycles
-        if google_cloud_config:
-            for page_idx in range(total_pages):
-                if page_idx in _broken:
-                    continue
+        # Lazy single-page PDF builder. Replaces a previous eager loop that built
+        # all N pages right here — that loop pushed the process past MemoryHigh on
+        # large PDFs (267 pages × ~2 MB each = ~500 MB live, on top of ~9 GB of
+        # other Phase-1a state) and then thrashed in fitz.tobytes() under memcg
+        # reclaim. Building lazily means we only pay the cost for pages whose OCR
+        # batch path-stitching actually fell back, which is rare in practice.
+        # Re-opens the PDF from disk per call because doc_proc is closed before
+        # Phase 1b runs.
+        _mem_snapshot("before single-page-PDF lazy setup")
+
+        def _get_single_page_pdf(page_idx):
+            """Return raw bytes of page `page_idx` as its own PDF. Memoised in
+            `_single_page_pdfs`. Returns None on failure (caller treats as
+            damaged/skip)."""
+            cached = _single_page_pdfs.get(page_idx)
+            if cached is not None:
+                return cached
+            if not _pdf_disk_path_for_extract or not os.path.exists(_pdf_disk_path_for_extract):
+                print(f"SESSION {current_session_id} WARNING: lazy single-page PDF: "
+                      f"disk path missing for page {page_idx + 1}")
+                return None
+            _single_page_pdf_misses[0] += 1
+            try:
+                _src = fitz.open(_pdf_disk_path_for_extract)
                 try:
                     _tmp = fitz.open()
-                    _tmp.insert_pdf(doc_proc, from_page=page_idx, to_page=page_idx)
-                    _single_page_pdfs[page_idx] = _tmp.tobytes()
+                    _tmp.insert_pdf(_src, from_page=page_idx, to_page=page_idx)
+                    data = _tmp.tobytes()
                     _tmp.close()
-                except Exception as _e:
-                    print(f"SESSION {current_session_id} WARNING: single-page PDF prep failed for page {page_idx + 1}: {_e} — skipping")
-                    _broken.add(page_idx)
+                finally:
+                    _src.close()
+                _single_page_pdfs[page_idx] = data
+                return data
+            except Exception as _e:
+                print(f"SESSION {current_session_id} WARNING: lazy single-page PDF "
+                      f"build failed for page {page_idx + 1}: {_e}")
+                return None
+
         st.session_state.broken_pages = _broken
+        _mem_snapshot("after single-page-PDF lazy setup")
 
         # doc_proc is no longer needed on the main thread:
         #  - Phase 1a populated _page_dims for every page
@@ -2792,11 +2867,74 @@ if st.session_state.run_analysis_triggered and \
             _track_phase('1b', 0, max(1, len(locals().get('_ocr_page_indices', []) or [])),
                          _phase1b_t0)
             _update_total_eta()
-            _ocr_batches = [
-                _ocr_page_indices[i:i + FENCE_OCR_BATCH_SIZE]
-                for i in range(0, len(_ocr_page_indices), FENCE_OCR_BATCH_SIZE)
-            ]
             _pdf_path_for_ocr = st.session_state.get('pdf_disk_path')
+
+            # Size-aware OCR batching.
+            #
+            # DocAI's per-request cap is ~35 MB. We pack pages greedily into
+            # batches, summing per-page byte estimates collected in Phase 1a,
+            # so each batch's combined size stays under a target ceiling
+            # (default 30 MB, leaving 5 MB headroom). Page count per batch is
+            # also capped at FENCE_OCR_BATCH_SIZE so pathologically light PDFs
+            # don't pile too many pages into one request.
+            #
+            # Why this matters: previously every batch had a fixed page count
+            # (15) and each page got a 2.3 MB budget. Heavy raster pages
+            # (10-14 MB native) couldn't fit, so safe_multi_page_pdf_from_path
+            # was forced to walk the dpi ladder (250→200→175→150) for every
+            # heavy page in every batch — multiple seconds per page wasted on
+            # re-rasterizing just to satisfy the per-page cap.
+            # By packing by actual size, heavy pages naturally end up in
+            # smaller batches (sometimes alone). Each page gets its native
+            # bytes through, no downsample needed unless the SINGLE page is
+            # natively over the cap.
+            _OCR_BATCH_TARGET_BYTES = int(os.environ.get(
+                "FENCE_OCR_BATCH_TARGET_BYTES", str(30 * 1024 * 1024)
+            ))
+            _OCR_PER_PAGE_OVERHEAD = 50 * 1024  # ~50 KB structural overhead per page
+
+            _ocr_batches = []
+            _current_batch = []
+            _current_size = 0
+            for _pi in _ocr_page_indices:
+                _est = _page_byte_estimates.get(_pi, 0) + _OCR_PER_PAGE_OVERHEAD
+                # Flush when the next page would push us over the size target
+                # OR over the page-count cap. A page that alone exceeds the
+                # target still goes into its own batch — it'll be downsampled
+                # by safe_multi_page_pdf_from_path inside the worker.
+                if _current_batch and (
+                    _current_size + _est > _OCR_BATCH_TARGET_BYTES
+                    or len(_current_batch) >= FENCE_OCR_BATCH_SIZE
+                ):
+                    _ocr_batches.append(_current_batch)
+                    _current_batch = []
+                    _current_size = 0
+                _current_batch.append(_pi)
+                _current_size += _est
+            if _current_batch:
+                _ocr_batches.append(_current_batch)
+
+            # Diagnostic: distribution of batch sizes (pages and estimated MB).
+            _batch_page_counts = [len(b) for b in _ocr_batches]
+            _batch_size_mb = [
+                sum(_page_byte_estimates.get(_p, 0) + _OCR_PER_PAGE_OVERHEAD for _p in b)
+                / (1024 * 1024) for b in _ocr_batches
+            ]
+            _solo_oversized = sum(1 for b, mb in zip(_ocr_batches, _batch_size_mb)
+                                  if len(b) == 1 and mb > _OCR_BATCH_TARGET_BYTES / (1024 * 1024))
+            print(
+                f"SESSION {current_session_id} LOG: OCR size-aware batching: "
+                f"{len(_ocr_batches)} batches from {len(_ocr_page_indices)} pages "
+                f"(target ≤{_OCR_BATCH_TARGET_BYTES/1024/1024:.0f} MB/batch, "
+                f"page-cap {FENCE_OCR_BATCH_SIZE}). "
+                f"Batch pages: min={min(_batch_page_counts) if _batch_page_counts else 0} "
+                f"max={max(_batch_page_counts) if _batch_page_counts else 0} "
+                f"avg={sum(_batch_page_counts)/max(len(_batch_page_counts), 1):.1f}. "
+                f"Batch MB: min={min(_batch_size_mb) if _batch_size_mb else 0:.1f} "
+                f"max={max(_batch_size_mb) if _batch_size_mb else 0:.1f} "
+                f"avg={sum(_batch_size_mb)/max(len(_batch_size_mb), 1):.1f}. "
+                f"Solo-oversized pages (will downsample): {_solo_oversized}"
+            )
 
             # DocAI hard limit is 40 MB per request. Leave margin for PDF
             # structure overhead and a small safety factor.
@@ -2813,11 +2951,17 @@ if st.session_state.run_analysis_triggered and \
                 rebuilds with a stricter per-page cap so everything fits.
                 """
                 try:
-                    # Build a multi-page PDF containing only this batch
+                    # Build a multi-page PDF containing only this batch.
+                    # per_page_max_bytes is set to the full DocAI request cap
+                    # so safe_multi_page_pdf_from_path only downsamples a page
+                    # if that ONE page is natively over the cap. Batches were
+                    # already packed by estimated size so the combined batch
+                    # stays under _OCR_BATCH_TARGET_BYTES; the per-page cap
+                    # here is just the per-page hard limit, not a budget.
                     if _pdf_path_for_ocr and os.path.exists(_pdf_path_for_ocr):
                         batch_pdf = ade.safe_multi_page_pdf_from_path(
                             _pdf_path_for_ocr, batch_indices,
-                            per_page_max_bytes=10 * 1024 * 1024,
+                            per_page_max_bytes=_OCR_TOTAL_MAX_BYTES,
                         )
                         # Total-size safety: if combined size still over
                         # DocAI's cap, rebuild with a tighter per-page
@@ -2837,13 +2981,15 @@ if st.session_state.run_analysis_triggered and \
                                 per_page_max_bytes=tight_cap,
                             )
                     else:
-                        # Fallback: stitch from single-page cache
+                        # Fallback: stitch lazily via the per-page builder.
                         _tmpdoc = fitz.open()
                         for _pi in batch_indices:
-                            if _pi in _single_page_pdfs:
-                                _sp = fitz.open(stream=_single_page_pdfs[_pi], filetype="pdf")
-                                _tmpdoc.insert_pdf(_sp, from_page=0, to_page=0)
-                                _sp.close()
+                            _data = _get_single_page_pdf(_pi)
+                            if _data is None:
+                                continue
+                            _sp = fitz.open(stream=_data, filetype="pdf")
+                            _tmpdoc.insert_pdf(_sp, from_page=0, to_page=0)
+                            _sp.close()
                         batch_pdf = _tmpdoc.tobytes()
                         _tmpdoc.close()
                     page_dims_by_local = {
@@ -2863,8 +3009,12 @@ if st.session_state.run_analysis_triggered and \
                     for pi in batch_indices:
                         try:
                             pdf_w, pdf_h = _page_dims[pi]
+                            _spd = _get_single_page_pdf(pi)
+                            if _spd is None:
+                                out[pi] = []
+                                continue
                             out[pi] = ade.run_google_ocr_blocks(
-                                _single_page_pdfs[pi], google_cloud_config, pdf_w, pdf_h
+                                _spd, google_cloud_config, pdf_w, pdf_h
                             )
                         except Exception as _pe:
                             print(f"SESSION {current_session_id} WARNING: OCR fallback page {pi + 1} failed: {_pe}")
@@ -2897,21 +3047,27 @@ if st.session_state.run_analysis_triggered and \
             _phase_timings['1b'] = time.perf_counter() - _phase_t0
             print(f"SESSION {current_session_id} LOG: Phase 1b done in {_phase_timings['1b']:.1f}s "
                   f"— {len(_ocr_batches)} batches, "
-                  f"{len(_ocr_page_indices)} pages, cache hits: {_phase1b_cache_hits}/{total_pages - len(_broken)}")
+                  f"{len(_ocr_page_indices)} pages, cache hits: {_phase1b_cache_hits}/{total_pages - len(_broken)}, "
+                  f"lazy single-page PDF builds: {_single_page_pdf_misses[0]}, "
+                  f"cached: {len(_single_page_pdfs)}")
             telemetry.phase_checkpoint("phase1b_end",
                                        session_id=current_session_id,
                                        pdf_sha8=_pdf_sha[:8],
                                        wall_s=round(_phase_timings['1b'], 3),
                                        cache_hits=_phase1b_cache_hits,
                                        batches=len(_ocr_batches),
-                                       pages=len(_ocr_page_indices))
+                                       pages=len(_ocr_page_indices),
+                                       lazy_singlepage_builds=_single_page_pdf_misses[0])
+            _mem_snapshot("after phase 1b")
             _check_memory_pressure("after phase1b")
             _phase_t0 = time.perf_counter()
-            
-            # Free single-page PDFs after OCR — they can be recreated on-demand for ADE fallback
+
+            # Free any single-page PDFs lazily built during OCR fallbacks.
             _single_page_pdfs.clear()
             gc.collect()
-            print(f"SESSION {current_session_id} LOG: Freed single-page PDF cache after OCR")
+            print(f"SESSION {current_session_id} LOG: Freed single-page PDF cache after OCR "
+                  f"(was {_single_page_pdf_misses[0]} lazy builds)")
+            _mem_snapshot("after freeing single-page PDF cache")
         else:
             # OCR disabled entirely — still mark timing bracket closed.
             _phase_timings['1b'] = time.perf_counter() - _phase_t0
@@ -3109,6 +3265,7 @@ if st.session_state.run_analysis_triggered and \
                                    cache_hits=_phase1c_cache_hits,
                                    fence_pages=len(_fence_page_indices),
                                    total_pages=total_pages)
+        _mem_snapshot("after phase 1c")
         _check_memory_pressure("after phase1c")
 
         # Compact non-fence pages: Phase 3 only reads the pdf_lines/ocr_lines
@@ -3179,10 +3336,34 @@ if st.session_state.run_analysis_triggered and \
             # regions in a crowded multi-page batch.
             _ADE_BATCH_PAGES = int(os.environ.get("FENCE_ADE_BATCH_PAGES", "10"))
 
+            # PDF path for the per-page-aware batcher below
+            # (create_page_batches_from_path measures every page individually
+            # via measure_page_bytes and packs greedily, so heavy pages end
+            # up alone and light pages get grouped — that's the per-page
+            # adaptive logic. We don't need to bias caps based on a
+            # PDF-wide average; the packer already responds to per-page size).
+            _pdf_path_for_phase2 = st.session_state.get('pdf_disk_path') or ''
+            _ade_workers = FENCE_WORKERS_PHASE2
+
+            # --- Timeout-degrade state ------------------------------------
+            # Track consecutive timeout-induced batch failures across all
+            # parallel workers. Once we hit the threshold, future batches
+            # skip the multi-page request entirely and go straight to
+            # per-page mode (which empirically succeeds where multi-page
+            # times out — likely because LandingAI has a faster internal
+            # path for single-page requests).
+            #
+            # Both flags are 1-element lists so closures can mutate without
+            # `nonlocal` (Streamlit script scope is module-level).
+            _ade_consecutive_timeouts = [0]
+            _ade_degraded = [False]
+            _ADE_DEGRADE_THRESHOLD = int(os.environ.get(
+                "FENCE_ADE_DEGRADE_THRESHOLD", "3"
+            ))
+
             # Path-based batching: avoids keeping the whole PDF in RAM for
             # size-estimation / batch-PDF construction. Workers read from
             # disk on demand (fitz demand-loads pages from path).
-            _pdf_path_for_phase2 = st.session_state.get('pdf_disk_path') or ''
             if _pdf_path_for_phase2 and os.path.exists(_pdf_path_for_phase2):
                 _batches = ade.create_page_batches_from_path(
                     _pdf_path_for_phase2, _fence_pages_to_fetch,
@@ -3209,30 +3390,19 @@ if st.session_state.run_analysis_triggered and \
                 any oversized page gets raster-downsampled BEFORE hitting
                 LandingAI, avoiding the 147 MB → 422 failure we used to
                 see on drawings with embedded high-res imagery.
+
+                If the cross-worker timeout-degrade flag is set (≥
+                _ADE_DEGRADE_THRESHOLD consecutive multi-page batches have
+                timed out), we skip the multi-page path entirely and go
+                straight to per-page mode for this batch — which empirically
+                succeeds where multi-page times out.
                 """
                 result = {}
-                try:
-                    if _pdf_path_for_phase2 and os.path.exists(_pdf_path_for_phase2):
-                        batch_pdf = ade.safe_multi_page_pdf_from_path(
-                            _pdf_path_for_phase2, batch,
-                            per_page_max_bytes=_ADE_PAGE_MAX_BYTES,
-                        )
-                    else:
-                        # Byte-path fallback. No downsampling here (no path
-                        # to reopen per page); oversized pages will still
-                        # fail and fall through to individual retry below.
-                        batch_pdf = ade.create_multi_page_pdf(file_bytes, batch)
-                except Exception as _e:
-                    print(f"[APP] ADE batch {batch_idx + 1} PDF-build failed ({_e}); marking all pages for fallback")
-                    for _orig_idx in batch:
-                        result[_orig_idx] = None
-                    return result
-                print(f"SESSION {current_session_id} LOG: ADE batch {batch_idx + 1}: "
-                      f"{len(batch)} pages, {len(batch_pdf) / 1024:.0f}KB")
 
                 # Helper — re-run ADE on ONE page and store its result.
                 # Used both for whole-batch failures and for single-page
-                # "zero chunks returned in a multi-page batch" recovery.
+                # "zero chunks returned in a multi-page batch" recovery,
+                # plus the degraded-mode short-circuit below.
                 # Returns True if the single-page call produced a non-empty
                 # chunk list (caller can use that to count retries).
                 def _retry_single(orig_idx):
@@ -3261,9 +3431,42 @@ if st.session_state.run_analysis_triggered and \
                         print(f"[APP] Page {orig_idx + 1}: individual ADE error: {_e}")
                         return False
 
+                # Degraded-mode short-circuit. Workers running in parallel
+                # all see the same flag, so a batch about to start that
+                # missed the timeout storm still skips multi-page if the
+                # queue ahead of it pushed us past the threshold.
+                if _ade_degraded[0] and len(batch) > 1:
+                    print(f"[APP] ADE batch {batch_idx + 1}: degraded mode "
+                          f"({_ade_consecutive_timeouts[0]} consecutive timeouts) "
+                          f"— skipping multi-page, going per-page for {len(batch)} pages")
+                    for orig_idx in batch:
+                        _retry_single(orig_idx)
+                    return result
+
+                try:
+                    if _pdf_path_for_phase2 and os.path.exists(_pdf_path_for_phase2):
+                        batch_pdf = ade.safe_multi_page_pdf_from_path(
+                            _pdf_path_for_phase2, batch,
+                            per_page_max_bytes=_ADE_PAGE_MAX_BYTES,
+                        )
+                    else:
+                        # Byte-path fallback. No downsampling here (no path
+                        # to reopen per page); oversized pages will still
+                        # fail and fall through to individual retry below.
+                        batch_pdf = ade.create_multi_page_pdf(file_bytes, batch)
+                except Exception as _e:
+                    print(f"[APP] ADE batch {batch_idx + 1} PDF-build failed ({_e}); marking all pages for fallback")
+                    for _orig_idx in batch:
+                        result[_orig_idx] = None
+                    return result
+                print(f"SESSION {current_session_id} LOG: ADE batch {batch_idx + 1}: "
+                      f"{len(batch)} pages, {len(batch_pdf) / 1024:.0f}KB")
+
                 resp = ade.ade_parse_document(batch_pdf, ade_key)
                 del batch_pdf  # release the transient batch-PDF bytes ASAP
                 if resp["success"]:
+                    # Multi-page success → reset the timeout streak counter.
+                    _ade_consecutive_timeouts[0] = 0
                     # Track pages that came back with zero chunks so we can
                     # retry them individually. ADE's per-document context
                     # occasionally merges/drops small regions when many
@@ -3293,18 +3496,32 @@ if st.session_state.run_analysis_triggered and \
                         for orig_idx in _zero_chunk_retries:
                             _retry_single(orig_idx)
                 else:
-                    # Batch failed — retry every page individually
-                    # (sequential within this worker; other batches keep
-                    # running in parallel).
+                    # Multi-page batch failed. Detect timeout-class errors
+                    # so we can flip into degraded mode for queued batches.
+                    _err_str = str(resp.get('error') or '').lower()
+                    _is_timeout = ('timed out' in _err_str
+                                   or 'timeout' in _err_str
+                                   or 'read timeout' in _err_str)
+                    if _is_timeout and len(batch) > 1:
+                        _ade_consecutive_timeouts[0] += 1
+                        if (_ade_consecutive_timeouts[0] >= _ADE_DEGRADE_THRESHOLD
+                                and not _ade_degraded[0]):
+                            _ade_degraded[0] = True
+                            print(f"[APP] ADE: {_ade_consecutive_timeouts[0]} consecutive "
+                                  f"multi-page timeouts (threshold "
+                                  f"{_ADE_DEGRADE_THRESHOLD}) — degrading remaining "
+                                  f"queued batches to per-page mode")
+                    # Retry every page individually (sequential within this
+                    # worker; other batches keep running in parallel).
                     print(f"[APP] ADE batch {batch_idx + 1} failed: {resp.get('error')} — retrying individually")
                     for orig_idx in batch:
                         _retry_single(orig_idx)
                 return result
 
             status_txt_area.text(
-                f"{len(_batches)} ADE batch(es) across {FENCE_WORKERS_PHASE2} workers…"
+                f"{len(_batches)} ADE batch(es) across {_ade_workers} workers…"
             )
-            with ThreadPoolExecutor(max_workers=FENCE_WORKERS_PHASE2) as _ade_pool:
+            with ThreadPoolExecutor(max_workers=_ade_workers) as _ade_pool:
                 _ade_futs = {
                     _ade_pool.submit(_run_phase2_batch, bi, b): bi
                     for bi, b in enumerate(_batches)
@@ -3341,6 +3558,7 @@ if st.session_state.run_analysis_triggered and \
                                        cache_hits=_phase2_cache_hits,
                                        ade_ok=_ok,
                                        fence_pages=len(_fence_page_indices))
+            _mem_snapshot("after phase 2")
             _check_memory_pressure("after phase2")
             _phase_t0 = time.perf_counter()
 
