@@ -1485,12 +1485,22 @@ def create_multi_page_pdf_from_path(pdf_path: str, page_indices: List[int]) -> b
 
 def measure_page_bytes(pdf_path: str, page_index: int) -> int:
     """Return the serialized byte length of a one-page PDF containing
-    just `page_index`. Used by size-aware batching."""
+    just `page_index`. Used by size-aware batching.
+
+    Uses garbage=4 + clean=True so the returned size reflects only the
+    page's own contribution. Without garbage cleanup, fitz's `insert_pdf`
+    keeps cross-references to ALL source-doc resources for any page that
+    references a shared global resource dictionary — and `tobytes()`
+    materialises them, making a single-page PDF report the FULL source
+    PDF size (e.g. one page reading as 378 MB on a 378 MB source). That
+    bogus reading made the batch packer think the page exceeded the
+    per-page hard cap and put it alone in a batch unnecessarily.
+    """
     try:
         doc = fitz.open(pdf_path)
         new_doc = fitz.open()
         new_doc.insert_pdf(doc, from_page=page_index, to_page=page_index)
-        n = len(new_doc.tobytes())
+        n = len(new_doc.tobytes(garbage=4, deflate=True, clean=True))
         doc.close()
         new_doc.close()
         return n
@@ -1582,7 +1592,15 @@ def _safe_single_page_pdf_from_doc(
     handle (avoids re-opening the PDF for every page in a batch)."""
     new_doc = fitz.open()
     new_doc.insert_pdf(doc, from_page=page_index, to_page=page_index)
-    native = new_doc.tobytes()
+    # garbage=4 + clean=True prunes resources `insert_pdf` dragged in by
+    # xref but the page itself doesn't reference. Without this, pages
+    # that participate in a shared global resource dict (common in
+    # CAD-exported PDFs) extract as a single-page document that still
+    # carries the FULL source PDF size — e.g. one page reporting
+    # native=378.2MB even though the page itself is only a few MB.
+    # That bogus size triggered spurious downsampling. With garbage
+    # collection the reported size matches the actual page contribution.
+    native = new_doc.tobytes(garbage=4, deflate=True, clean=True)
     new_doc.close()
     if len(native) <= max_bytes:
         return native
