@@ -90,7 +90,7 @@ AUTH_MODE = os.environ.get("FENCE_AUTH_MODE", "none").lower().strip()
 #
 # --- Production tuning presets ---
 # Env var                            2 vCPU / 8 GB    8 vCPU / 32 GB
-# FENCE_MAX_CONCURRENT               1                3
+# FENCE_MAX_CONCURRENT               1 (or unset)     2–3
 # FENCE_MAX_CONCURRENT_PER_USER      1                1
 # FENCE_RSS_REJECT_GB                6.0              24.0
 # FENCE_MAX_USER_BYTES               1073741824 (1G)  5368709120 (5G)
@@ -98,39 +98,54 @@ AUTH_MODE = os.environ.get("FENCE_AUTH_MODE", "none").lower().strip()
 # FENCE_WORKERS_PHASE1B              3                8
 # FENCE_WORKERS_PHASE1C              8                16
 # FENCE_WORKERS_PHASE2               3                5
-# FENCE_WORKERS_PHASE3               6                14
+# FENCE_WORKERS_PHASE3               1                2
 # FENCE_CLASSIFY_BATCH_SIZE          10               15
 # FENCE_OCR_BATCH_SIZE               15               15
 # FENCE_CACHE_TTL_DAYS               7                30
+# FENCE_LOW_MEMORY                   true (small VM)  false (default)
+# FENCE_PHASE3_USE_SUBPROCESS        true (default)   false (threads; dev)
 # FENCE_PHASE3_EAGER                 false            false
 # FENCE_PHASE3_PREVIEW               5                5
+# FENCE_MAX_CONCURRENT (unset)       1 if host <24GiB else 2; set env to override
 def _workers(name, default, cap=16):
     try:
         return max(1, min(cap, int(os.environ.get(name, default))))
     except (TypeError, ValueError):
         return default
 
+
+def _env_bool(name: str, default: str) -> bool:
+    return os.environ.get(name, default).lower() == "true"
+
+
+# Set FENCE_LOW_MEMORY=true on small instances: lazy Phase 3 precompute
+# and lower Phase 3 parallelism. Phase 3 subprocess isolation defaults
+# on for all hosts; see FENCE_PHASE3_USE_SUBPROCESS below.
+FENCE_LOW_MEMORY = _env_bool("FENCE_LOW_MEMORY", "false")
+
 # Defaults bumped after first-round profiling: gpt-5.1-mini + batching
 # keeps tier-2 OpenAI accounts well under the rate ceiling at these
-# widths. Dial DOWN via env if you see 429s.
+# widths. Dial DOWN via env if you see 429s. OCR uses DocAI multipage
+# batches (page cap via FENCE_OCR_BATCH_SIZE); ADE stays per-page.
 FENCE_WORKERS_PHASE1A = _workers("FENCE_WORKERS_PHASE1A", 4, cap=8)   # subprocess pool (new in this round)
 FENCE_WORKERS_PHASE1B = _workers("FENCE_WORKERS_PHASE1B", 6)          # was 4
 FENCE_WORKERS_PHASE1C = _workers("FENCE_WORKERS_PHASE1C", 16)         # was 8
 FENCE_WORKERS_PHASE2  = _workers("FENCE_WORKERS_PHASE2",  5, cap=8)   # was 3
-FENCE_WORKERS_PHASE3  = _workers("FENCE_WORKERS_PHASE3",  12)         # was 6
+# Subprocess Phase 3: each worker is a separate Python; dense vector pages
+# can reach multiple GB RSS, so keep defaults conservative on 16–32 GiB hosts.
+_default_phase3_workers = 1 if FENCE_LOW_MEMORY else 2
+FENCE_WORKERS_PHASE3 = _workers("FENCE_WORKERS_PHASE3", _default_phase3_workers, cap=12)
 FENCE_CLASSIFY_BATCH_SIZE = _workers("FENCE_CLASSIFY_BATCH_SIZE", 10, cap=25)
-FENCE_OCR_BATCH_SIZE = _workers("FENCE_OCR_BATCH_SIZE", 15, cap=15)  # DocAI sync cap
+FENCE_OCR_BATCH_SIZE = _workers("FENCE_OCR_BATCH_SIZE", 15, cap=15)  # DocAI sync page cap per request
 
-# Phase 3 eagerness. Default TRUE preserves current throughput (all
-# fence pages pre-computed in parallel before the sequential render
-# loop turns them into cards). Flip to false in ops config only if
-# telemetry (see Stage A) shows the pre-compute is dominating wall
-# time AND users rarely review all pages. The sequential render loop
-# runs regardless and populates session_state.fence_pages for every
-# fence page, so exports are never partial in either mode — lazy
-# mode just pushes the work from the pool to the serial loop.
-FENCE_PHASE3_EAGER = os.environ.get("FENCE_PHASE3_EAGER", "true").lower() == "true"
+# Phase 3 eagerness: default lazy when FENCE_LOW_MEMORY=true.
+_phase3_eager_default = "false" if FENCE_LOW_MEMORY else "true"
+FENCE_PHASE3_EAGER = _env_bool("FENCE_PHASE3_EAGER", _phase3_eager_default)
 FENCE_PHASE3_PREVIEW = _workers("FENCE_PHASE3_PREVIEW", 5, cap=40)
+
+# Phase 3: child-process workers by default (RSS returned on exit).
+# Set FENCE_PHASE3_USE_SUBPROCESS=false for in-process threads (large-RAM dev only).
+FENCE_PHASE3_USE_SUBPROCESS_DEFAULT = "true"
 
 
 # --- Cache housekeeping ---
@@ -433,7 +448,22 @@ def release_analysis_lock(session_id: str):
 
 ANALYSIS_SLOTS_PATH = "/tmp/fence_analysis.slots"
 ANALYSIS_WAITERS_PATH = "/tmp/fence_analysis.waiters"
-FENCE_MAX_CONCURRENT = _workers("FENCE_MAX_CONCURRENT", 2, cap=6)
+
+
+def _default_fence_max_concurrent() -> int:
+    """Default slot count when FENCE_MAX_CONCURRENT is unset: 1 on <24 GiB hosts."""
+    try:
+        total_gb = psutil.virtual_memory().total / (1024 ** 3)
+    except Exception:
+        total_gb = 64.0
+    return 1 if total_gb < 24.0 else 2
+
+
+FENCE_MAX_CONCURRENT = _workers(
+    "FENCE_MAX_CONCURRENT",
+    _default_fence_max_concurrent(),
+    cap=6,
+)
 # One user running one analysis at a time is the norm; cap=3 lets ops
 # bump it for power users without opening the door to a single user
 # hogging every slot.
@@ -714,10 +744,145 @@ def _cache_probe(phase, pdf_sha, params, page_indices=None, user_scope=None):
     return fence_cache.probe(phase, pdf_sha, params, page_indices=page_indices,
                              user_scope=user_scope or _cache_scope())
 
-def _reset_analysis_state(purge_cache: bool = True, preserve_uploader: bool = False):
+# Per-page JSON in fence_cache: heavy rectangles + fallback blobs so
+# `st.session_state.fence_pages` stays small (see `_lazy_ui` rows).
+_UI_PAGE_PHASE = "ui_page"
+
+
+def _put_ui_page_bundle(pdf_sha: str, params, page_idx: int, bundle: dict):
+    try:
+        _cache_put(_UI_PAGE_PHASE, pdf_sha, params, bundle, page_idx=page_idx)
+    except Exception:
+        pass
+
+
+def _hydrate_fence_page_row(row: dict) -> dict:
+    """Merge ui_page disk cache into a fence page dict (non-lazy rows unchanged)."""
+    if not row or not row.get('fence_found'):
+        return row
+    if not row.get('_lazy_ui'):
+        return row
+    pdf_sha = st.session_state.get('_pdf_sha_cached')
+    params = st.session_state.get('_cache_params_cached')
+    if not pdf_sha or params is None:
+        return row
+    pi = row.get('page_index_in_original_doc')
+    if pi is None:
+        return row
+    blob = _cache_get(_UI_PAGE_PHASE, pdf_sha, params, page_idx=pi)
+    if not isinstance(blob, dict):
+        return row
+    out = {**row}
+    for k in ('definitions', 'instances', 'keyword_matches', 'fallback_result', 'text_response'):
+        if k in blob and blob[k] is not None:
+            out[k] = blob[k]
+    return out
+
+
+def _hydrate_fence_pages_list(pages: list | None) -> list:
+    if not pages:
+        return pages or []
+    if not any(isinstance(p, dict) and p.get('_lazy_ui') for p in pages):
+        return pages
+    return [_hydrate_fence_page_row(p) if isinstance(p, dict) else p for p in pages]
+
+
+def _restart_process_for_memory_reset(delay_s: float = 0.25):
+    """Exit this Streamlit process after the response has a moment to flush.
+
+    systemd runs fence-fast.service with Restart=always, so a process exit is
+    the only reliable way to return Python/native-library RSS to the OS after
+    a large analysis. Session-state cleanup runs before this helper is called.
+    """
+    try:
+        import threading as _threading
+
+        def _exit_now():
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(0)
+
+        _threading.Timer(delay_s, _exit_now).start()
+        print(f"SESSION {current_session_id} LOG: scheduled process restart for memory reset")
+    except Exception:
+        os._exit(0)
+
+
+def _cleanup_phase3_child_workers(timeout_s: float = 2.0) -> dict:
+    """Best-effort soft cleanup for subprocess Phase 3 workers.
+
+    This only targets direct children of the current Streamlit process whose
+    command line is ops/phase3_worker.py. It does not signal systemd, other app
+    processes, Cursor, or unrelated Python commands.
+    """
+    summary = {"terminated": 0, "still_running": 0, "killed": 0, "errors": 0}
+    try:
+        parent = psutil.Process(os.getpid())
+        children = parent.children(recursive=True)
+    except Exception:
+        return summary
+
+    phase3_children = []
+    for child in children:
+        try:
+            cmdline = " ".join(child.cmdline())
+        except Exception:
+            continue
+        if "ops/phase3_worker.py" in cmdline or "phase3_worker.py" in cmdline:
+            phase3_children.append(child)
+
+    for child in phase3_children:
+        try:
+            child.terminate()
+            summary["terminated"] += 1
+        except psutil.NoSuchProcess:
+            pass
+        except Exception:
+            summary["errors"] += 1
+
+    if phase3_children:
+        try:
+            gone, alive = psutil.wait_procs(phase3_children, timeout=timeout_s)
+        except Exception:
+            gone, alive = [], phase3_children
+        summary["still_running"] = len(alive)
+
+        # Keep reset soft by default. SIGKILL is restricted to this process's
+        # own Phase 3 children and is opt-in for ops if a deployment prefers
+        # aggressive cleanup over waiting for uninterruptible native work.
+        force_kill = os.environ.get("FENCE_RESET_KILL_STUBBORN_WORKERS", "false").lower() == "true"
+        if force_kill:
+            for child in alive:
+                try:
+                    child.kill()
+                    summary["killed"] += 1
+                except psutil.NoSuchProcess:
+                    pass
+                except Exception:
+                    summary["errors"] += 1
+
+    if phase3_children:
+        print(
+            f"SESSION {current_session_id} LOG: Phase 3 child cleanup "
+            f"terminated={summary['terminated']} "
+            f"still_running={summary['still_running']} "
+            f"killed={summary['killed']} errors={summary['errors']}"
+        )
+    return summary
+
+
+def _reset_analysis_state(
+    purge_cache: bool = True,
+    preserve_uploader: bool = False,
+    hard_restart: bool = False,
+):
     """Tear down all state related to the current analysis so the user
     can upload/start fresh. Called by the "New Analysis" / "Cancel" buttons.
 
+    - Stops this process's Phase 3 child workers (soft SIGTERM by default)
     - Releases the analysis slot (so another user isn't blocked)
     - Clears the uploaded PDF from disk
     - Resets analysis-related session_state keys (fence/non_fence_pages,
@@ -725,8 +890,14 @@ def _reset_analysis_state(purge_cache: bool = True, preserve_uploader: bool = Fa
       (classifier choice, keyword list, fence keywords)
     - Optionally purges the per-session cache dir
 
-    Does NOT kill the Python process. Next script rerun starts clean.
+    With hard_restart=True, exits the Python process after cleanup so systemd
+    restarts it and fully releases process RSS. Normal Cancel/New Analysis uses
+    the soft path so the browser connection stays up.
     """
+    try:
+        _cleanup_phase3_child_workers()
+    except Exception:
+        pass
     try:
         release_analysis_slot(current_session_id)
     except Exception:
@@ -807,6 +978,8 @@ def _reset_analysis_state(purge_cache: bool = True, preserve_uploader: bool = Fa
         pass
     print(f"SESSION {current_session_id} LOG: _reset_analysis_state done "
           "(slot released, state cleared)")
+    if hard_restart:
+        _restart_process_for_memory_reset()
 
 
 def _purge_session_cache():
@@ -899,11 +1072,21 @@ def _save_pdf_to_disk(pdf_bytes: bytes, session_id: str, pdf_hash: str) -> str:
     print(f"SESSION {session_id} LOG: PDF saved to disk ({len(pdf_bytes)/(1024*1024):.1f} MB) -> {path}")
     return path
 
+def _get_pdf_disk_path() -> str | None:
+    """Resolved path to the session PDF on disk, or None. Prefer this over
+    `_get_pdf_bytes()` on rerenders to avoid loading the whole file into RAM."""
+    path = st.session_state.get('pdf_disk_path')
+    return path if path and os.path.exists(path) else None
+
+
 def _get_pdf_bytes() -> bytes | None:
     """Read PDF bytes from disk (.pdf or .done). Returns None if missing.
-    Touches the file to signal the session is still active."""
-    path = st.session_state.get('pdf_disk_path')
-    if not path or not os.path.exists(path):
+    Touches the file to signal the session is still active.
+
+    Prefer `_get_pdf_disk_path()` + `fitz.open(path)` for image/vector work;
+    keep byte reads for subprocess payloads and legacy paths that require bytes."""
+    path = _get_pdf_disk_path()
+    if not path:
         return None
     try:
         os.utime(path)  # bump mtime → prevents stale cleanup
@@ -1094,7 +1277,10 @@ def _get_shared_fitz_doc(pdf_bytes_hash):
 @telemetry.timed("get_page_image_render")
 def _render_page_image(_pdf_bytes_hash, pdf_bytes, page_idx, definitions, instances, keyword_matches,
                        pdf_width, pdf_height, highlight, measurement_lines=None, dpi=None):
-    """Raw renderer — no caching. Call through get_page_image_on_demand."""
+    """Raw renderer — no caching. Call through get_page_image_on_demand.
+
+    `pdf_bytes` may be None when the PDF is only on disk; opens via
+    `st.session_state.pdf_disk_path` before allocating a full byte copy."""
     effective_dpi = dpi if dpi is not None else 150
     try:
         # Prefer the shared doc (opened once per session) to avoid the
@@ -1112,11 +1298,25 @@ def _render_page_image(_pdf_bytes_hash, pdf_bytes, page_idx, definitions, instan
                 print(f"[img] shared-doc read failed for page {page_idx}: {_de}; falling back")
                 doc = None
         if doc is None:
-            with fitz.open(stream=BytesIO(pdf_bytes), filetype="pdf") as _d:
-                page = _d.load_page(page_idx)
-                pix = page.get_pixmap(dpi=effective_dpi)
-                original_bytes = pix.tobytes("png")
-                del pix
+            _disk = None
+            try:
+                _disk = st.session_state.get('pdf_disk_path')
+            except Exception:
+                _disk = None
+            if _disk and os.path.exists(_disk) and not pdf_bytes:
+                with fitz.open(_disk) as _d:
+                    page = _d.load_page(page_idx)
+                    pix = page.get_pixmap(dpi=effective_dpi)
+                    original_bytes = pix.tobytes("png")
+                    del pix
+            elif pdf_bytes:
+                with fitz.open(stream=BytesIO(pdf_bytes), filetype="pdf") as _d:
+                    page = _d.load_page(page_idx)
+                    pix = page.get_pixmap(dpi=effective_dpi)
+                    original_bytes = pix.tobytes("png")
+                    del pix
+            else:
+                return None, None
 
         highlighted_bytes = None
         if highlight:
@@ -1163,6 +1363,9 @@ def get_page_image_on_demand(_pdf_bytes_hash, pdf_bytes, page_idx, definitions, 
                               pdf_width, pdf_height, highlight, measurement_lines=None, dpi=None):
     """Session-scoped LRU wrapper around _render_page_image. Caches up to
     FENCE_IMG_CACHE_MAX=10 entries per session; oldest evicted on insert.
+
+    Pass `pdf_bytes=None` when `pdf_disk_path` is set — avoids reading the
+    whole PDF into memory on every cache miss.
 
     Rationale: previous @st.cache_data(max_entries=32) was GLOBAL across
     Streamlit sessions, which both bloated RAM under multi-user load and
@@ -1214,6 +1417,8 @@ def generate_combined_highlighted_pdf_via_subprocess(
         return None, "no PDF on disk"
     if not fence_pages_results_list:
         return None, "no fence pages"
+
+    fence_pages_results_list = _hydrate_fence_pages_list(list(fence_pages_results_list))
 
     out_fd, out_path = tempfile.mkstemp(prefix=f"hl_{session_id[:8]}_", suffix=".pdf")
     os.close(out_fd)
@@ -1307,17 +1512,30 @@ def generate_combined_highlighted_pdf_via_subprocess(
     return pdf_bytes, fname
 
 
-def generate_combined_highlighted_pdf(original_pdf_bytes, fence_pages_results_list, uploaded_pdf_name_base, session_id):
+def generate_combined_highlighted_pdf(original_pdf_bytes, fence_pages_results_list, uploaded_pdf_name_base, session_id,
+                                      pdf_disk_path=None):
     """Generate a combined PDF with only fence-related pages highlighted."""
     print(f"SESSION {session_id} LOG: Generating combined highlighted PDF.")
-    if not fence_pages_results_list or not original_pdf_bytes:
+    fence_pages_results_list = _hydrate_fence_pages_list(list(fence_pages_results_list or []))
+    _path_ok = bool(pdf_disk_path and os.path.exists(pdf_disk_path))
+    if not fence_pages_results_list or (not original_pdf_bytes and not _path_ok):
         return None, "No data for PDF."
     
     output_doc = fitz.open()
     input_doc = None
     
     try:
-        input_doc = fitz.open(stream=BytesIO(original_pdf_bytes), filetype="pdf")
+        if _path_ok:
+            try:
+                input_doc = fitz.open(pdf_disk_path)
+            except Exception:
+                input_doc = None
+        if input_doc is None and original_pdf_bytes:
+            input_doc = fitz.open(stream=BytesIO(original_pdf_bytes), filetype="pdf")
+        if input_doc is None:
+            if output_doc:
+                output_doc.close()
+            return None, "Error opening original PDF: no readable path or bytes"
     except Exception as e:
         print(f"SESSION {session_id} ERROR: Opening original PDF for combined: {e}")
         if output_doc:
@@ -1406,16 +1624,29 @@ def generate_combined_highlighted_pdf(original_pdf_bytes, fence_pages_results_li
 
 
 def generate_measurement_pdf(original_pdf_bytes, fence_pages_results_list, line_assignments, user_drawn_lines, 
-                             page_categories, session_state, min_line_pts, uploaded_pdf_name_base):
+                             page_categories, session_state, min_line_pts, uploaded_pdf_name_base,
+                             pdf_disk_path=None):
     """Generate PDF with measurement lines highlighted by category."""
-    if not fence_pages_results_list or not original_pdf_bytes:
+    fence_pages_results_list = _hydrate_fence_pages_list(list(fence_pages_results_list or []))
+    _path_ok = bool(pdf_disk_path and os.path.exists(pdf_disk_path))
+    if not fence_pages_results_list or (not original_pdf_bytes and not _path_ok):
         return None, "No data for PDF."
     
     output_doc = fitz.open()
     input_doc = None
     
     try:
-        input_doc = fitz.open(stream=BytesIO(original_pdf_bytes), filetype="pdf")
+        if _path_ok:
+            try:
+                input_doc = fitz.open(pdf_disk_path)
+            except Exception:
+                input_doc = None
+        if input_doc is None and original_pdf_bytes:
+            input_doc = fitz.open(stream=BytesIO(original_pdf_bytes), filetype="pdf")
+        if input_doc is None:
+            if output_doc:
+                output_doc.close()
+            return None, "Error opening original PDF: no readable path or bytes"
     except Exception as e:
         if output_doc:
             output_doc.close()
@@ -1943,11 +2174,10 @@ if openai_key and llm_analysis_instance is not None:
 # Main App Flow
 # ==============================================================================
 
-# Sidebar: always-visible "reset" control. When an analysis is running,
-# this doubles as a Cancel button (Streamlit re-runs the script on button
-# click, which our _reset_analysis_state() handles by releasing the slot
-# and clearing session state before the analysis block re-evaluates its
-# re-entry condition).
+# Sidebar: always-visible reset control. When an analysis is running, this
+# doubles as a Cancel button. It softly cleans app state and this process's
+# Phase 3 child workers without restarting Streamlit, so the browser stays
+# connected.
 with st.sidebar:
     _reset_label = "🛑 Cancel / Reset"
     _has_active = (
@@ -1957,9 +2187,10 @@ with st.sidebar:
     )
     if _has_active:
         if st.button(_reset_label, key="sidebar_reset_btn"):
-            _reset_analysis_state(purge_cache=True)
-            st.rerun()
-        st.caption("Frees the analysis slot and clears uploaded PDF + results.")
+            _reset_analysis_state(purge_cache=True, hard_restart=False)
+            st.info("Reset complete. Cleared analysis state and stopped Phase 3 workers.")
+            st.stop()
+        st.caption("Frees the analysis slot, clears uploaded PDF + results, and keeps the app process running.")
 
 st.markdown("<div class='section-header'><h2>📄 Upload Engineering Drawings</h2></div>", unsafe_allow_html=True)
 uploaded_pdf_file_obj = st.file_uploader("Upload PDF Document", type=["pdf"], key="pdf_uploader_main")
@@ -2498,10 +2729,8 @@ if st.session_state.run_analysis_triggered and \
         _page_dims = {}
         # Estimated single-page-PDF size in bytes, keyed by page_idx. Populated
         # in the Phase 1a page-dims pass by summing each page's image and content
-        # stream lengths (no rasterization). Used to pack OCR batches so each
-        # batch's combined size stays under DocAI's ~35 MB request cap, which
-        # in turn means safe_multi_page_pdf_from_path doesn't have to downsample
-        # heavy pages to make a fixed-size batch fit.
+        # stream lengths (no rasterization). Kept for diagnostics and future
+        # safeguards; Phase 1b packs pages into DocAI batches from these estimates.
         _page_byte_estimates = {}
         # Lazy cache, keyed by page_idx -> raw single-page PDF bytes. Populated
         # on demand by _get_single_page_pdf() during Phase 1b OCR fallback paths.
@@ -3291,7 +3520,7 @@ if st.session_state.run_analysis_triggered and \
         _phase_t0 = time.perf_counter()
         
         # =================================================================
-        # PHASE 2: Batch ADE for fence pages (smart batching by size)
+        # PHASE 2: ADE for fence pages (single-page requests)
         # =================================================================
         _ade_chunks_by_page = {}
 
@@ -3322,36 +3551,22 @@ if st.session_state.run_analysis_triggered and \
                   f"{_phase2_cache_hits}/{len(_fence_page_indices)}; "
                   f"{len(_fence_pages_to_fetch)} pages need ADE")
 
-            # LandingAI documented sync-endpoint caps: 50 MB / 50 pages
-            # per request. Our defaults are conservative (15 MB / 10 pages)
-            # because empirically ADE starts rejecting with 422 well
-            # before the 50 MB cap. All three knobs env-configurable.
+            # LandingAI receives exactly one source page per request. Keep
+            # byte limits for single-page downsampling, but do not pack
+            # multiple pages together.
             _ADE_BATCH_MAX_BYTES = int(os.environ.get("FENCE_ADE_BATCH_MAX_BYTES", str(15 * 1024 * 1024)))
             _ADE_PAGE_MAX_BYTES  = int(os.environ.get("FENCE_ADE_PAGE_MAX_BYTES",  str(12 * 1024 * 1024)))
-            # Set FENCE_ADE_BATCH_PAGES=1 to disable multi-page batching
-            # — each fence page gets its own ADE request. Slower overall
-            # (50 round-trips instead of 5-6) but sometimes yields
-            # different chunking on dense engineering detail sheets
-            # where ADE's per-document context may merge or drop small
-            # regions in a crowded multi-page batch.
-            _ADE_BATCH_PAGES = int(os.environ.get("FENCE_ADE_BATCH_PAGES", "10"))
+            _ADE_BATCH_PAGES = 1
 
-            # PDF path for the per-page-aware batcher below
-            # (create_page_batches_from_path measures every page individually
-            # via measure_page_bytes and packs greedily, so heavy pages end
-            # up alone and light pages get grouped — that's the per-page
-            # adaptive logic. We don't need to bias caps based on a
-            # PDF-wide average; the packer already responds to per-page size).
+            # PDF path for per-page work-unit construction below.
+            # max_pages_per_batch=1 keeps every ADE request isolated to one page.
             _pdf_path_for_phase2 = st.session_state.get('pdf_disk_path') or ''
             _ade_workers = FENCE_WORKERS_PHASE2
 
             # --- Timeout-degrade state ------------------------------------
-            # Track consecutive timeout-induced batch failures across all
-            # parallel workers. Once we hit the threshold, future batches
-            # skip the multi-page request entirely and go straight to
-            # per-page mode (which empirically succeeds where multi-page
-            # times out — likely because LandingAI has a faster internal
-            # path for single-page requests).
+            # Kept for defensive compatibility if a future change ever
+            # reintroduces multi-page work units; normal ADE work below is
+            # single-page only.
             #
             # Both flags are 1-element lists so closures can mutate without
             # `nonlocal` (Streamlit script scope is module-level).
@@ -3361,9 +3576,7 @@ if st.session_state.run_analysis_triggered and \
                 "FENCE_ADE_DEGRADE_THRESHOLD", "3"
             ))
 
-            # Path-based batching: avoids keeping the whole PDF in RAM for
-            # size-estimation / batch-PDF construction. Workers read from
-            # disk on demand (fitz demand-loads pages from path).
+            # Build one-item work units so workers process pages independently.
             if _pdf_path_for_phase2 and os.path.exists(_pdf_path_for_phase2):
                 _batches = ade.create_page_batches_from_path(
                     _pdf_path_for_phase2, _fence_pages_to_fetch,
@@ -3377,32 +3590,29 @@ if st.session_state.run_analysis_triggered and \
                     max_pages_per_batch=_ADE_BATCH_PAGES,
                 ) if _fence_pages_to_fetch else []
 
-            # Parallelize batches across FENCE_WORKERS_PHASE2 workers. Each
-            # worker is self-contained (builds its own single/multi-page PDF,
+            # Parallelize page requests across FENCE_WORKERS_PHASE2 workers.
+            # Each worker is self-contained (builds its own single-page PDF,
             # hits the ADE endpoint, aligns chunks). doc_proc is NOT thread-
             # safe, so we use _page_dims (populated in Phase 1a) for page
             # dimensions instead of reaching into doc_proc from workers.
 
             def _run_phase2_batch(batch_idx, batch):
-                """Worker: process one batch. Returns {page_idx: chunks_or_None}.
+                """Worker: process one single-page work unit.
 
-                Builds the batch PDF via safe_multi_page_pdf_from_path so
-                any oversized page gets raster-downsampled BEFORE hitting
-                LandingAI, avoiding the 147 MB → 422 failure we used to
-                see on drawings with embedded high-res imagery.
+                Normal callers pass a one-item list. The multi-page fallback
+                below is retained defensively, but the Phase 2 setup above
+                pins max_pages_per_batch to 1.
 
-                If the cross-worker timeout-degrade flag is set (≥
-                _ADE_DEGRADE_THRESHOLD consecutive multi-page batches have
-                timed out), we skip the multi-page path entirely and go
-                straight to per-page mode for this batch — which empirically
+                If the cross-worker timeout-degrade flag is set, we skip
+                the multi-page path entirely and go straight to per-page
+                mode for this work unit, which empirically
                 succeeds where multi-page times out.
                 """
                 result = {}
 
                 # Helper — re-run ADE on ONE page and store its result.
-                # Used both for whole-batch failures and for single-page
-                # "zero chunks returned in a multi-page batch" recovery,
-                # plus the degraded-mode short-circuit below.
+                # Used for the normal single-page path, defensive multi-page
+                # failure handling, and the degraded-mode short-circuit below.
                 # Returns True if the single-page call produced a non-empty
                 # chunk list (caller can use that to count retries).
                 def _retry_single(orig_idx):
@@ -3431,16 +3641,18 @@ if st.session_state.run_analysis_triggered and \
                         print(f"[APP] Page {orig_idx + 1}: individual ADE error: {_e}")
                         return False
 
-                # Degraded-mode short-circuit. Workers running in parallel
-                # all see the same flag, so a batch about to start that
-                # missed the timeout storm still skips multi-page if the
-                # queue ahead of it pushed us past the threshold.
+                # Degraded-mode short-circuit for defensive multi-page input.
+                # Normal work units have len(batch) == 1 and return below.
                 if _ade_degraded[0] and len(batch) > 1:
-                    print(f"[APP] ADE batch {batch_idx + 1}: degraded mode "
+                    print(f"[APP] ADE work unit {batch_idx + 1}: degraded mode "
                           f"({_ade_consecutive_timeouts[0]} consecutive timeouts) "
                           f"— skipping multi-page, going per-page for {len(batch)} pages")
                     for orig_idx in batch:
                         _retry_single(orig_idx)
+                    return result
+
+                if len(batch) == 1:
+                    _retry_single(batch[0])
                     return result
 
                 try:
@@ -3455,11 +3667,11 @@ if st.session_state.run_analysis_triggered and \
                         # fail and fall through to individual retry below.
                         batch_pdf = ade.create_multi_page_pdf(file_bytes, batch)
                 except Exception as _e:
-                    print(f"[APP] ADE batch {batch_idx + 1} PDF-build failed ({_e}); marking all pages for fallback")
+                    print(f"[APP] ADE work unit {batch_idx + 1} PDF-build failed ({_e}); marking all pages for fallback")
                     for _orig_idx in batch:
                         result[_orig_idx] = None
                     return result
-                print(f"SESSION {current_session_id} LOG: ADE batch {batch_idx + 1}: "
+                print(f"SESSION {current_session_id} LOG: ADE work unit {batch_idx + 1}: "
                       f"{len(batch)} pages, {len(batch_pdf) / 1024:.0f}KB")
 
                 resp = ade.ade_parse_document(batch_pdf, ade_key)
@@ -3489,7 +3701,7 @@ if st.session_state.run_analysis_triggered and \
                             result[orig_idx] = None
                             print(f"[APP] Page {orig_idx + 1}: align failed ({_e}) — marking as no ADE")
                     if _zero_chunk_retries:
-                        print(f"[APP] ADE batch {batch_idx + 1}: "
+                        print(f"[APP] ADE work unit {batch_idx + 1}: "
                               f"{len(_zero_chunk_retries)} page(s) returned 0 chunks "
                               "— retrying individually: "
                               + ", ".join(str(i + 1) for i in _zero_chunk_retries))
@@ -3512,14 +3724,14 @@ if st.session_state.run_analysis_triggered and \
                                   f"{_ADE_DEGRADE_THRESHOLD}) — degrading remaining "
                                   f"queued batches to per-page mode")
                     # Retry every page individually (sequential within this
-                    # worker; other batches keep running in parallel).
-                    print(f"[APP] ADE batch {batch_idx + 1} failed: {resp.get('error')} — retrying individually")
+                    # worker; other work units keep running in parallel).
+                    print(f"[APP] ADE work unit {batch_idx + 1} failed: {resp.get('error')} — retrying individually")
                     for orig_idx in batch:
                         _retry_single(orig_idx)
                 return result
 
             status_txt_area.text(
-                f"{len(_batches)} ADE batch(es) across {_ade_workers} workers…"
+                f"{len(_batches)} ADE page request(s) across {_ade_workers} workers…"
             )
             with ThreadPoolExecutor(max_workers=_ade_workers) as _ade_pool:
                 _ade_futs = {
@@ -3893,7 +4105,8 @@ if st.session_state.run_analysis_triggered and \
             # calls are actually killable (SIGKILL on timeout, which
             # Python threads don't support).
             FENCE_PHASE3_USE_SUBPROCESS = os.environ.get(
-                "FENCE_PHASE3_USE_SUBPROCESS", "false"
+                "FENCE_PHASE3_USE_SUBPROCESS",
+                FENCE_PHASE3_USE_SUBPROCESS_DEFAULT,
             ).lower() == "true"
             _phase3_worker_script = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)), "ops", "phase3_worker.py"
@@ -4292,9 +4505,10 @@ if st.session_state.run_analysis_triggered and \
                                       on_click=_on_load_nf)
                             st.caption("Click to render this page from the PDF.")
                         else:
-                            _pdf_bytes_nf = _get_pdf_bytes()
+                            _disk_nf = _get_pdf_disk_path()
+                            _pdf_bytes_nf = None if _disk_nf else _get_pdf_bytes()
                             _nf_orig, _nf_hl = None, None
-                            if _pdf_bytes_nf:
+                            if _disk_nf or _pdf_bytes_nf:
                                 try:
                                     _kw_for_nf = [
                                         k for k in (prefilter_result.get("matched_lines") or [])
@@ -4323,7 +4537,7 @@ if st.session_state.run_analysis_triggered and \
                 continue
             else:
                 # =====================================================================
-                # FENCE PAGE: Use pre-computed ADE chunks from batch
+                # FENCE PAGE: Use pre-computed ADE chunks from Phase 2
                 # =====================================================================
                 if use_ade and ade_key:
                     # In-memory dict was cleared after Phase 3 pre-compute
@@ -4659,22 +4873,27 @@ if st.session_state.run_analysis_triggered and \
                     if k != 'all_fence_lines'
                 }
             
+            text_response_str = json.dumps({
+                "answer": "yes" if fence_found else "no",
+                "confidence": 0.9 if definitions else (llm_result["confidence"] if llm_result else 0.6),
+                "signals": [d.get('keyword', '') for d in definitions[:5]] if definitions else (fallback_result.get("matched_keywords", []) if fallback_result else []),
+                "reason": f"Found {len(definitions)} definitions, {len(instances)} instances" if definitions else (llm_result["reason"] if llm_result else f"Keyword match: {fallback_result.get('matched_keywords', [])}" if fallback_result else "No fence content")
+            })
+            # Heavy rectangles + fallback blobs live in fence_cache; session_state
+            # keeps a slim row so reruns / multi-tab users don't pin 10–100 MB of dicts.
+            _put_ui_page_bundle(_pdf_sha, _cache_params, page_idx, {
+                "definitions": definitions,
+                "instances": instances,
+                "keyword_matches": keyword_matches,
+                "fallback_result": fallback_result,
+                "text_response": text_response_str,
+            })
             analysis_result = {
                 'page_number': page_num,
                 'page_index_in_original_doc': page_idx,
                 'fence_found': fence_found,
                 'text_found': fence_found,
-                'text_response': json.dumps({
-                    "answer": "yes" if fence_found else "no",
-                    "confidence": 0.9 if definitions else (llm_result["confidence"] if llm_result else 0.6),
-                    "signals": [d.get('keyword', '') for d in definitions[:5]] if definitions else (fallback_result.get("matched_keywords", []) if fallback_result else []),
-                    "reason": f"Found {len(definitions)} definitions, {len(instances)} instances" if definitions else (llm_result["reason"] if llm_result else f"Keyword match: {fallback_result.get('matched_keywords', [])}" if fallback_result else "No fence content")
-                }),
                 'text_snippet': text_snippet,
-                'definitions': definitions,
-                'instances': instances,
-                'keyword_matches': keyword_matches,
-                'fallback_result': fallback_result,
                 'measurements': measurement_result_light,
                 'detection_method': detection_method,
                 'highlight_fence_text_app_setting': highlight_fence_text_app,
@@ -4685,6 +4904,7 @@ if st.session_state.run_analysis_triggered and \
                 'chunk_count': len(chunks),
                 'legend_count': len(legend_chunks),
                 'figure_count': len(figure_chunks),
+                '_lazy_ui': True,
             }
             
             # Add to fence pages list (non-fence pages handled via early continue above)
@@ -4742,9 +4962,10 @@ if st.session_state.run_analysis_triggered and \
                             st.caption("Image not rendered yet (saves memory). "
                                        "Click above to read from disk.")
                         else:
-                            _pdf_bytes_live = _get_pdf_bytes()
+                            _disk_live = _get_pdf_disk_path()
+                            _pdf_bytes_live = None if _disk_live else _get_pdf_bytes()
                             _orig_live, _hl_live = None, None
-                            if _pdf_bytes_live:
+                            if _disk_live or _pdf_bytes_live:
                                 try:
                                     _kw_filtered = [
                                         k for k in (keyword_matches or [])
@@ -4798,10 +5019,10 @@ if st.session_state.run_analysis_triggered and \
                         with col_fig:
                             st.metric("Figure", len(figure_chunks))
                         
-                        # Text response popover
-                        if analysis_result.get('text_response'):
+                        # Text response popover (stored on disk for slim fence_pages rows)
+                        if text_response_str:
                             with st.popover("Analysis Log"):
-                                st.markdown(f"_{analysis_result['text_response']}_")
+                                st.markdown(f"_{text_response_str}_")
                     
                     # Found Items Section (below the image/details row)
                     st.subheader("Found Items")
@@ -4989,14 +5210,16 @@ if st.session_state.run_analysis_triggered and \
                     current_session_id,
                 )
             else:
-                # Inline fallback (or env-disabled): same as before.
-                _pdf_for_highlight = _get_pdf_bytes()
-                if _pdf_for_highlight:
+                # Inline fallback: open from disk path when available (no full-file read).
+                _pth = _pdf_disk_path_for_hl if (_pdf_disk_path_for_hl and os.path.exists(_pdf_disk_path_for_hl)) else None
+                _pdf_for_highlight = None if _pth else _get_pdf_bytes()
+                if _pth or _pdf_for_highlight:
                     pdf_b, pdf_n = generate_combined_highlighted_pdf(
                         _pdf_for_highlight,
                         st.session_state.fence_pages,
                         st.session_state.uploaded_pdf_name,
                         current_session_id,
+                        pdf_disk_path=_pth,
                     )
             if pdf_b:
                 st.session_state.highlighted_pdf_bytes_for_download = pdf_b
@@ -5016,7 +5239,7 @@ if st.session_state.run_analysis_triggered and \
             # Collect unique element names from all definitions
             all_element_names = []
             seen_elements = set()
-            for fp in st.session_state.fence_pages:
+            for fp in _hydrate_fence_pages_list(st.session_state.fence_pages):
                 for d in fp.get('definitions', []):
                     kw = d.get('keyword', '').strip()
                     desc_val = d.get('description', '').strip()
@@ -5209,17 +5432,18 @@ if st.session_state.run_analysis_triggered and \
             key="dl_combined_pdf_main"
         )
 
-    # "New Analysis" button — wipes state + frees the slot so the
-    # next user (or this user with a different file) can proceed
-    # immediately without refreshing the browser.
+    # "New Analysis" button — soft reset by default so the browser connection
+    # stays up. The reset still clears app state/cache and stops Phase 3
+    # children owned by this Streamlit process.
     st.markdown("---")
     _nac1, _nac2 = st.columns([1, 3])
     with _nac1:
         if st.button("🆕 New Analysis", type="primary", key="new_analysis_btn_main"):
-            _reset_analysis_state(purge_cache=True)
-            st.rerun()
+            _reset_analysis_state(purge_cache=True, hard_restart=False)
+            st.info("Reset complete. Cleared analysis state and stopped Phase 3 workers.")
+            st.stop()
     with _nac2:
-        st.caption("Starts fresh — clears cached results, releases the analysis slot, lets you upload a new file.")
+        st.caption("Starts fresh — clears cached results and releases the slot without restarting the app.")
 
 
 # ==============================================================================
@@ -5254,10 +5478,11 @@ elif st.session_state.processing_complete:
     _nrc1, _nrc2 = st.columns([1, 3])
     with _nrc1:
         if st.button("🆕 New Analysis", type="primary", key="new_analysis_btn_rerun"):
-            _reset_analysis_state(purge_cache=True)
-            st.rerun()
+            _reset_analysis_state(purge_cache=True, hard_restart=False)
+            st.info("Reset complete. Cleared analysis state and stopped Phase 3 workers.")
+            st.stop()
     with _nrc2:
-        st.caption("Clears these results and frees the analysis slot.")
+        st.caption("Clears these results and frees the analysis slot without restarting the app.")
 
     col_f_res, col_nf_res = st.columns(2)
     with col_f_res:
@@ -5268,6 +5493,7 @@ elif st.session_state.processing_complete:
     def display_page_result_expander(res_data_list, target_column_res):
         for res_data_item in res_data_list:
             with target_column_res:
+                res_data_item = _hydrate_fence_page_row(res_data_item) if isinstance(res_data_item, dict) else res_data_item
                 exp_title_res = f"Page {res_data_item['page_number']}"
                 definitions = res_data_item.get('definitions', [])
                 instances = res_data_item.get('instances', [])
@@ -5400,8 +5626,9 @@ elif st.session_state.processing_complete:
                             # un-highlighted PNG. The LRU cache key is
                             # computed from json.dumps inside
                             # _img_cache_key, so raw structures are fine.
-                            _pdf_bytes_r = _get_pdf_bytes()
-                            if _pdf_bytes_r and not res_data_item.get('skipped_damaged'):
+                            _disk_r = _get_pdf_disk_path()
+                            _pdf_bytes_r = None if _disk_r else _get_pdf_bytes()
+                            if (_disk_r or _pdf_bytes_r) and not res_data_item.get('skipped_damaged'):
                                 _kws_for_r = [
                                     k for k in (keyword_matches or [])
                                     if all(key in k for key in ['x0', 'y0', 'x1', 'y1'])
@@ -5683,47 +5910,75 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         with _umt_col2:
             st.caption(
                 "Interactive canvas for auto-detected + manually drawn fence lines. "
-                "Heavy (scale-detect LLM + vector line detection per page) — "
-                "only loads when requested. Your assignments are saved."
+                "Vector line detection runs per loaded page; scale reuses analysis cache when available. "
+                "Only loads when requested. Your assignments are saved."
             )
         st.stop()  # skip the rest of the tool this run
 
-    # Auto-detect and verify scale PER PAGE using LLM
+    # Per-page scale: prefer Phase 3 disk cache + analysis-time session_state;
+    # only run verify_scale_with_bar LLM when neither is present (legacy sessions).
     from utils_vector import verify_scale_with_bar
-    
-    # Detect scale for each fence page (cached in session_state)
+
     if 'per_page_scale_info' not in st.session_state:
         st.session_state.per_page_scale_info = {}
-    
+
     # User-drawn lines storage: {page_key: [{'start': (x,y), 'end': (x,y), 'category': cat}, ...]}
     if 'user_drawn_lines' not in st.session_state:
         st.session_state.user_drawn_lines = {}
-    
+
     # Drawing mode per page
     if 'drawing_mode' not in st.session_state:
         st.session_state.drawing_mode = {}
-    
+
     # Pending point for line drawing (first click of a two-click line)
     if 'pending_line_start' not in st.session_state:
         st.session_state.pending_line_start = {}
-    
-    # Detect scales for all pages if not already done
-    _pdf_bytes_for_scale = _get_pdf_bytes()
-    with fitz.open(stream=BytesIO(_pdf_bytes_for_scale), filetype="pdf") as doc:
+
+    _um_pdf_sha = st.session_state.get('_pdf_sha_cached')
+    _um_params = st.session_state.get('_cache_params_cached')
+    _doc_for_verify = None
+    try:
         for fence_page in st.session_state.fence_pages:
             page_num = fence_page['page_number']
             cache_key = f"page_{page_num}"
-            if cache_key not in st.session_state.per_page_scale_info:
-                try:
-                    page_idx = fence_page['page_index_in_original_doc']
-                    pdf_page = doc[page_idx]
-                    # Use LLM for intelligent scale detection
-                    scale_info = verify_scale_with_bar(pdf_page, llm=scale_llm_instance or llm_analysis_instance)
-                    st.session_state.per_page_scale_info[cache_key] = scale_info
-                except Exception as e:
-                    st.session_state.per_page_scale_info[cache_key] = {
-                        'success': False, 'verified_scale': None, 'message': str(e)
-                    }
+            if cache_key in st.session_state.per_page_scale_info:
+                continue
+            page_idx = fence_page.get('page_index_in_original_doc', 0)
+            if _um_pdf_sha and _um_params is not None:
+                _cached_sc = _cache_get("phase3_scale", _um_pdf_sha, _um_params, page_idx=page_idx)
+                if _cached_sc is not None:
+                    st.session_state.per_page_scale_info[cache_key] = _cached_sc
+                    continue
+            if _doc_for_verify is None:
+                _sp = _get_pdf_disk_path()
+                if _sp:
+                    _doc_for_verify = fitz.open(_sp)
+                else:
+                    _bs = _get_pdf_bytes()
+                    if not _bs:
+                        st.session_state.per_page_scale_info[cache_key] = {
+                            'success': False,
+                            'verified_scale': None,
+                            'message': 'PDF unavailable',
+                        }
+                        continue
+                    _doc_for_verify = fitz.open(stream=BytesIO(_bs), filetype="pdf")
+            try:
+                scale_info = verify_scale_with_bar(
+                    _doc_for_verify[page_idx],
+                    llm=scale_llm_instance or llm_analysis_instance,
+                )
+                st.session_state.per_page_scale_info[cache_key] = scale_info
+            except Exception as e:
+                st.session_state.per_page_scale_info[cache_key] = {
+                    'success': False, 'verified_scale': None, 'message': str(e),
+                }
+    finally:
+        if _doc_for_verify is not None:
+            try:
+                _doc_for_verify.close()
+            except Exception:
+                pass
     
     # Global settings (min line length only - scale is now per-page)
     col_g1, col_g2 = st.columns([1, 2])
@@ -5778,6 +6033,7 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
     @st.fragment
     def render_page_fragment(page_data, zoom_level, min_line_pts):
         """Fragment function for each page - only this reruns on interaction"""
+        page_data = _hydrate_fence_page_row(dict(page_data))
         page_num = page_data['page_number']
         page_key = f"page_{page_num}"
         page_idx = page_data['page_index_in_original_doc']
@@ -5861,18 +6117,34 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
             for k in [k for k in list(st.session_state.keys())
                       if k.startswith(f"lines_{page_num}_") and k != lines_cache_key]:
                 del st.session_state[k]
-            with fitz.open(stream=BytesIO(_get_pdf_bytes()), filetype="pdf") as doc:
-                pdf_page = doc[page_idx]
-                all_lines = extract_vector_lines(pdf_page)
-                filtered_lines = [l for l in all_lines if l.length_pts >= min_line_pts]
-                filtered_lines.sort(key=lambda l: l.length_pts, reverse=True)
-                # Store only compact, serializable fields instead of full VectorLine objects.
-                st.session_state[lines_cache_key] = [{
-                    'start': (float(l.start[0]), float(l.start[1])),
-                    'end': (float(l.end[0]), float(l.end[1])),
-                    'length_pts': float(l.length_pts),
-                    'layer': l.layer or 'default',
-                } for l in filtered_lines]
+            all_lines = []
+            try:
+                _hvec = st.session_state.get('current_pdf_hash')
+                _sdoc = _get_shared_fitz_doc(_hvec) if _hvec else None
+                if _sdoc is not None:
+                    all_lines = extract_vector_lines(_sdoc[page_idx])
+                else:
+                    _pvec = _get_pdf_disk_path()
+                    if _pvec:
+                        with fitz.open(_pvec) as _d:
+                            all_lines = extract_vector_lines(_d[page_idx])
+                    else:
+                        _bvec = _get_pdf_bytes()
+                        if _bvec:
+                            with fitz.open(stream=BytesIO(_bvec), filetype="pdf") as _d:
+                                all_lines = extract_vector_lines(_d[page_idx])
+            except Exception as _vex:
+                print(f"[UMT] vector lines page {page_num}: {_vex}")
+                all_lines = []
+            filtered_lines = [l for l in all_lines if l.length_pts >= min_line_pts]
+            filtered_lines.sort(key=lambda l: l.length_pts, reverse=True)
+            # Store only compact, serializable fields instead of full VectorLine objects.
+            st.session_state[lines_cache_key] = [{
+                'start': (float(l.start[0]), float(l.start[1])),
+                'end': (float(l.end[0]), float(l.end[1])),
+                'length_pts': float(l.length_pts),
+                'layer': l.layer or 'default',
+            } for l in filtered_lines]
         
         lines = st.session_state.get(lines_cache_key, [])
         
@@ -6172,8 +6444,11 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
         
         # Get base image on demand (regenerate instead of reading from session_state)
         base_img_bytes = page_data.get('highlighted_image_bytes') or page_data.get('original_image_bytes')
-        _pdf_bytes_img = _get_pdf_bytes() if not base_img_bytes else None
-        if not base_img_bytes and _pdf_bytes_img:
+        _disk_img = _get_pdf_disk_path()
+        _pdf_bytes_img = (
+            None if (_disk_img and not base_img_bytes) else (_get_pdf_bytes() if not base_img_bytes else None)
+        )
+        if not base_img_bytes and (_pdf_bytes_img or _disk_img):
             # Regenerate on demand. Pass raw dict lists — NOT the
             # hash-flattened tuples the earlier version built. The hash
             # is computed inside _img_cache_key; the renderer needs
@@ -6726,14 +7001,15 @@ if st.session_state.processing_complete and st.session_state.fence_pages and ena
     with dl_col1:
         # Generate measurement PDF
         pdf_bytes, pdf_name = generate_measurement_pdf(
-            _get_pdf_bytes(),
+            None,
             st.session_state.fence_pages,
             st.session_state.line_assignments,
             st.session_state.user_drawn_lines,
             st.session_state.page_categories,
             st.session_state,
             min_line_pts,
-            st.session_state.uploaded_pdf_name
+            st.session_state.uploaded_pdf_name,
+            pdf_disk_path=_get_pdf_disk_path(),
         )
         if pdf_bytes:
             st.download_button(

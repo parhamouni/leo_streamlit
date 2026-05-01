@@ -4,6 +4,7 @@ utils_ade.py - Unified ADE Utility (Native Lines + Robust Overlap + DEBUG LOGGIN
 
 import re
 import json
+import os
 import time
 import requests
 from typing import List, Dict, Optional, Tuple
@@ -2715,6 +2716,44 @@ def measure_fence_elements(
     page_width = page.rect.width
     page_height = page.rect.height
     rotation = page.rotation
+
+    def _env_int(name: str, default: int) -> int:
+        try:
+            return max(0, int(os.environ.get(name, default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _skip_measurement(reason: str, *, layer_to_category: Optional[Dict] = None) -> Dict:
+        print(f"[DEBUG] Skipping measurement: {reason}")
+        return {
+            "measurements": {},
+            "all_fence_lines": [],
+            "layer_measurements": {},
+            "layer_to_category": layer_to_category or {},
+            "measurement_method": "skipped",
+            "page_info": {
+                "width_pts": page_width,
+                "height_pts": page_height,
+                "rotation": rotation,
+                "scale_factor": scale_factor,
+            },
+            "skip_reason": reason,
+        }
+
+    # Measurement is optional enrichment. If ADE found definitions but no
+    # figure instances, broad vector-layer scans are both less useful and the
+    # most common source of Phase 3 timeouts on dense plan sheets.
+    require_instances = os.environ.get("FENCE_MEASURE_REQUIRE_INSTANCES", "true").lower() == "true"
+    if require_instances and fence_definitions and not fence_instances:
+        return _skip_measurement(
+            "No detected figure instances; skipping automatic vector measurement"
+        )
+
+    max_figure_chunks = _env_int("FENCE_MEASURE_MAX_FIGURE_CHUNKS", 12)
+    if figure_chunks and max_figure_chunks and len(figure_chunks) > max_figure_chunks:
+        return _skip_measurement(
+            f"Page has {len(figure_chunks)} figure chunks (limit: {max_figure_chunks})"
+        )
     
     # Auto-infer scale if not provided
     if scale_factor is None:
@@ -2739,6 +2778,12 @@ def measure_fence_elements(
             print("[DEBUG] Could not detect scale, using 1.0")
     layer_names = extract_layer_names(page)
     print(f"[DEBUG] Found {len(layer_names)} layers on page")
+
+    max_layers = _env_int("FENCE_MEASURE_MAX_LAYERS", 200)
+    if max_layers and len(layer_names) > max_layers:
+        return _skip_measurement(
+            f"Page has {len(layer_names)} PDF layers (limit: {max_layers})"
+        )
     
     # Use LLM to identify fence-related layers. These are simple
     # "does this layer name sound like fencing?" tasks — route them to
@@ -2913,6 +2958,11 @@ def measure_fence_elements(
         print(f"[DEBUG] No fence layers found - using LLM-guided filtering")
         
         all_page_lines = extract_vector_lines(page)
+        max_all_page_lines = _env_int("FENCE_MEASURE_MAX_ALL_PAGE_LINES", 15000)
+        if max_all_page_lines and len(all_page_lines) > max_all_page_lines:
+            return _skip_measurement(
+                f"Page has {len(all_page_lines)} vector lines (limit: {max_all_page_lines})"
+            )
         
         # Compute line statistics for LLM
         total_lines = len(all_page_lines)

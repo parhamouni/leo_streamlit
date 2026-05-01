@@ -43,6 +43,7 @@ _PER_PAGE_PHASES = {
     "phase3_scale",
     "phase3_legend",
     "phase3_measure",
+    "ui_page",  # session-scoped JSON: definitions/instances for slim session_state
 }
 _WHOLE_DOC_PHASES = {"phase1a"}
 

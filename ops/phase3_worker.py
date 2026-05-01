@@ -263,7 +263,10 @@ def main() -> int:
                         scale_factor=detected_scale or 1.0,
                         ocr_text=ocr_full_text,
                     )
-                    _step("measure: done")
+                    if measurement_result and measurement_result.get("measurement_method") == "skipped":
+                        _step(f"measure: skipped ({measurement_result.get('skip_reason', 'complexity guard')})")
+                    else:
+                        _step("measure: done")
                     if measurement_result:
                         fence_cache.put("phase3_measure", pdf_sha, cache_params,
                                         measurement_result, page_idx=page_idx,
