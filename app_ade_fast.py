@@ -903,6 +903,10 @@ def _reset_analysis_state(
     except Exception:
         pass
     try:
+        dequeue_waiter(current_session_id)
+    except Exception:
+        pass
+    try:
         _cleanup_pdf_on_disk(current_session_id)
     except Exception:
         pass
@@ -2342,7 +2346,11 @@ if st.session_state.run_analysis_triggered and \
             if st.button("🔓 Force clear stale slots (≥15 min)", key="force_clear_slots"):
                 for s in stale:
                     release_analysis_slot(s.get("session_id", ""))
-                st.success(f"Cleared {len(stale)} stale slot(s). Click **Start Analysis** again.")
+                try:
+                    _write_waiters([])
+                except Exception:
+                    pass
+                st.success(f"Cleared {len(stale)} stale slot(s) and waiter queue. Click **Start Analysis** again.")
                 st.rerun()
         st.stop()
     # We got a slot — drop out of the waiter queue if we were in it.
