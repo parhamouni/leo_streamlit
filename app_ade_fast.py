@@ -342,6 +342,7 @@ def initialize_session_state(session_id_val):
         'current_pdf_hash': None,
         'highlighted_pdf_bytes_for_download': None,
         'last_uploaded_file_id': None,
+        'uploader_reset_counter': 0,
         # Default to gpt-5.1 (same as app_ade.py). Earlier I'd set this
         # to gpt-5-mini to save tokens, but mini is too weak to pick
         # the specific fence layers out of a site-plan PDF's many
@@ -625,6 +626,19 @@ def release_analysis_slot(session_id: str):
                         caller=_caller)
 
 
+def _session_holds_slot(session_id: str):
+    """Return the slot record for this session, or None."""
+    for s in _read_slots():
+        if s.get("session_id") == session_id:
+            return s
+    return None
+
+
+def _user_holds_slot(user_id: str) -> list:
+    """Return all slot records held by this user."""
+    return [s for s in _read_slots() if s.get("user_id") == user_id]
+
+
 # --- FIFO waiter queue (Stage E11) ---
 # Persistent JSON list of sessions waiting for a slot. Rejected
 # acquisitions enqueue; the UI polls queue_position() on rerun and
@@ -715,6 +729,24 @@ current_session_id = get_session_id()
 require_auth()
 _render_auth_widget()
 initialize_session_state(current_session_id)
+
+# --- Proactive orphan-slot cleanup ---
+# A hard browser refresh creates a new session_id, but the OLD session's
+# analysis slot persists in the file (same PID, same user). If the current
+# session is NOT running analysis, any slot this user holds under a
+# different session_id is orphaned — release it so the user isn't stuck.
+if not st.session_state.get('run_analysis_triggered'):
+    _my_slots = _user_holds_slot(get_user_id())
+    for _orphan in _my_slots:
+        if _orphan.get("session_id") != current_session_id:
+            print(f"SESSION {current_session_id} LOG: releasing orphan slot "
+                  f"from prior session {_orphan.get('session_id', '?')[:8]}")
+            release_analysis_slot(_orphan["session_id"])
+            dequeue_waiter(_orphan["session_id"])
+            telemetry.event("orphan_slot_released",
+                            session_id=current_session_id,
+                            orphan_session=_orphan.get("session_id"),
+                            orphan_age=int(time.time()) - int(_orphan.get("started_at", 0)))
 
 
 # --- fence_cache wrappers (per-session ephemeral) ---
@@ -915,6 +947,16 @@ def _reset_analysis_state(
         'session_id': st.session_state.get('session_id'),
         'selected_model_for_analysis': st.session_state.get('selected_model_for_analysis'),
         'fence_keywords_app': st.session_state.get('fence_keywords_app'),
+        # Increment on explicit reset to force the file uploader to render
+        # as a brand-new widget (key counter pattern). Without this, Streamlit
+        # re-sends the browser-cached file on the next rerun, re-populating
+        # the uploader and requiring a second Cancel click to fully clear.
+        # preserve_uploader=True keeps the same counter so the just-uploaded
+        # file stays visible during a mid-upload reset.
+        'uploader_reset_counter': (
+            st.session_state.get('uploader_reset_counter', 0)
+            + (0 if preserve_uploader else 1)
+        ),
     }
     # Clear all analysis / measurement / per-page state. Wholesale wipe
     # of st.session_state keys we control; user interaction widgets keep
@@ -937,15 +979,16 @@ def _reset_analysis_state(
         'user_drawn_lines', 'line_assignments', 'drawing_mode',
         'pending_line_start', 'pdf_disk_path', 'broken_pages',
         'highlighted_pdf_filename_for_download', 'last_run_timings',
-        'pdf_uploader_main',
     }
-    if preserve_uploader:
-        # When _reset_analysis_state is invoked from the new-file
-        # upload path, the file widget is the one that triggered us —
-        # deleting 'pdf_uploader_main' from session_state would drop
-        # the just-uploaded file, and the script's next rerun would
-        # see file_uploader return None. Keep it in that case.
-        _clear_exact.discard('pdf_uploader_main')
+    # The uploader widget uses a dynamic key (pdf_uploader_main_<counter>).
+    # Clear the CURRENT key so the browser doesn't re-send its cached file
+    # on the next rerun. preserve_uploader=True keeps it so the just-
+    # uploaded file stays visible during a mid-upload reset.
+    _current_uploader_key = (
+        f"pdf_uploader_main_{st.session_state.get('uploader_reset_counter', 0)}"
+    )
+    if not preserve_uploader:
+        _clear_exact.add(_current_uploader_key)
     for k in list(st.session_state.keys()):
         if k in _clear_exact or any(k.startswith(p) for p in _clear_prefixes):
             try:
@@ -2192,12 +2235,12 @@ with st.sidebar:
     if _has_active:
         if st.button(_reset_label, key="sidebar_reset_btn"):
             _reset_analysis_state(purge_cache=True, hard_restart=False)
-            st.info("Reset complete. Cleared analysis state and stopped Phase 3 workers.")
-            st.stop()
+            st.rerun()
         st.caption("Frees the analysis slot, clears uploaded PDF + results, and keeps the app process running.")
 
 st.markdown("<div class='section-header'><h2>📄 Upload Engineering Drawings</h2></div>", unsafe_allow_html=True)
-uploaded_pdf_file_obj = st.file_uploader("Upload PDF Document", type=["pdf"], key="pdf_uploader_main")
+_uploader_key = f"pdf_uploader_main_{st.session_state.get('uploader_reset_counter', 0)}"
+uploaded_pdf_file_obj = st.file_uploader("Upload PDF Document", type=["pdf"], key=_uploader_key)
 
 if uploaded_pdf_file_obj:
     print(f"SESSION {current_session_id} LOG: PDF uploaded: {uploaded_pdf_file_obj.name}")
@@ -2317,9 +2360,14 @@ if st.session_state.run_analysis_triggered and \
                 f"{len(active)} analysis(es) already running — please try again in a minute."
             )
         elif reason == "user_busy":
+            _stale_own = [s for s in slot_info.get("active_for_user", [])
+                          if s.get("session_id") != current_session_id]
+            _hint = (" Use the **Release my stuck slot** button below to clear it."
+                     if _stale_own
+                     else " Wait for it to finish (or cancel it in the other tab) before starting another.")
             st.warning(
-                f"You already have {slot_info.get('limit_per_user', 1)} analysis running. "
-                "Wait for it to finish (or cancel it in the other tab) before starting another."
+                f"You already have {slot_info.get('limit_per_user', 1)} analysis running."
+                + _hint
             )
         elif reason == "busy":
             holders = ", ".join(s.get("session_id", "?")[:8] for s in active[:3])
@@ -2339,11 +2387,27 @@ if st.session_state.run_analysis_triggered and \
         else:
             st.warning(f"Could not start analysis: {reason}")
 
-        # Stale-slot recovery: show a force-clear for any slot ≥ 15 min old
+        # Self-recovery: if the blocking slot belongs to this same user
+        # under a different session_id (common after a browser refresh),
+        # offer an immediate release with no age threshold.
+        _my_blocking = [s for s in active
+                        if s.get("user_id") == get_user_id()
+                        and s.get("session_id") != current_session_id]
+        if _my_blocking:
+            _lbl = (f"🔓 Release my stuck slot"
+                    f" (session {_my_blocking[0].get('session_id', '?')[:8]})")
+            if st.button(_lbl, key="release_own_stuck_slot"):
+                for s in _my_blocking:
+                    release_analysis_slot(s.get("session_id", ""))
+                dequeue_waiter(current_session_id)
+                st.success("Released your stuck slot. Click **Start Analysis** again.")
+                st.rerun()
+
+        # Stale-slot recovery: show a force-clear for any slot >= 5 min old
         stale = [s for s in active
-                 if (int(time.time()) - int(s.get("started_at", 0))) > 900]
+                 if (int(time.time()) - int(s.get("started_at", 0))) > 300]
         if stale:
-            if st.button("🔓 Force clear stale slots (≥15 min)", key="force_clear_slots"):
+            if st.button("🔓 Force clear stale slots (≥5 min)", key="force_clear_slots"):
                 for s in stale:
                     release_analysis_slot(s.get("session_id", ""))
                 try:
@@ -5448,8 +5512,7 @@ if st.session_state.run_analysis_triggered and \
     with _nac1:
         if st.button("🆕 New Analysis", type="primary", key="new_analysis_btn_main"):
             _reset_analysis_state(purge_cache=True, hard_restart=False)
-            st.info("Reset complete. Cleared analysis state and stopped Phase 3 workers.")
-            st.stop()
+            st.rerun()
     with _nac2:
         st.caption("Starts fresh — clears cached results and releases the slot without restarting the app.")
 
@@ -5487,8 +5550,7 @@ elif st.session_state.processing_complete:
     with _nrc1:
         if st.button("🆕 New Analysis", type="primary", key="new_analysis_btn_rerun"):
             _reset_analysis_state(purge_cache=True, hard_restart=False)
-            st.info("Reset complete. Cleared analysis state and stopped Phase 3 workers.")
-            st.stop()
+            st.rerun()
     with _nrc2:
         st.caption("Clears these results and frees the analysis slot without restarting the app.")
 
