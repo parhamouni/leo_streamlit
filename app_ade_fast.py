@@ -38,6 +38,9 @@ import telemetry
 # Per-user spend tracking stub. Records are written but not enforced in v1.
 import spend_tracker
 
+# Persistent SQLite job registry — tracks analysis jobs across sessions.
+import job_registry
+
 # Register faulthandler so `kill -USR1 <pid>` dumps all thread stacks to
 # stderr. Saves us ~11 min of guessing next time Phase 3 hangs. Writes to
 # fast.err, which is already being tailed by our ops tooling.
@@ -79,7 +82,7 @@ ANALYSIS_LOCK_TTL_SECONDS = 4 * 60 * 60  # 4 hour safety ceiling
 #   "streamlit_oidc" — Streamlit ≥1.42 native st.user (Google/Okta OIDC).
 #                      Configure .streamlit/secrets.toml provider block.
 #   "streamlit_password" — shared password in .streamlit/secrets.toml (weak).
-AUTH_MODE = os.environ.get("FENCE_AUTH_MODE", "none").lower().strip()
+AUTH_MODE = os.environ.get("FENCE_AUTH_MODE", "streamlit_oidc").lower().strip()
 
 
 # --- Concurrency (env-var configurable) ---
@@ -296,7 +299,19 @@ def require_auth():
     if AUTH_MODE == "streamlit_password":
         _streamlit_password_gate()
         return
-    # proxy_header / streamlit_oidc — just assert identity is present.
+    if AUTH_MODE == "streamlit_oidc":
+        # Streamlit ≥1.42 native OIDC — st.user.is_logged_in is the canonical check.
+        try:
+            if not st.user.is_logged_in:
+                st.title("🔒 Leo Fence Detection")
+                st.markdown("Sign in with your Google account to continue.")
+                st.login("google")
+                st.stop()
+        except AttributeError:
+            # Fallback: st.user not available (old Streamlit build or no [auth] configured).
+            pass
+        return
+    # proxy_header — just assert identity is present.
     if get_user_id().startswith("dev_"):
         st.error("Authentication required. Please sign in and retry.")
         st.stop()
@@ -311,11 +326,114 @@ def _render_auth_widget():
         return
     with st.sidebar:
         st.markdown(f"**Signed in:** `{email}`")
-        if AUTH_MODE == "streamlit_password":
+        if AUTH_MODE == "streamlit_oidc":
+            if st.button("Log out", key="_auth_logout"):
+                st.logout()
+        elif AUTH_MODE == "streamlit_password":
             if st.button("Log out", key="_auth_logout"):
                 for k in ("_auth_ok", "_auth_email"):
                     st.session_state.pop(k, None)
                 st.rerun()
+
+
+def _render_my_jobs_sidebar():
+    """Sidebar panel showing the user's recent analysis jobs from the registry."""
+    if AUTH_MODE == "none":
+        return
+    user_id = get_user_id()
+    if user_id.startswith("dev_"):
+        return
+
+    try:
+        jobs = job_registry.get_user_jobs(user_id)
+    except Exception:
+        return
+
+    if not jobs:
+        return
+
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("#### 📋 My Jobs")
+
+        _any_running = False
+        for job in jobs[:6]:
+            status = job.get("status", "?")
+            fname = (job.get("filename") or "unknown.pdf")
+            if len(fname) > 22:
+                fname = fname[:19] + "…"
+            created = job.get("created_at", 0)
+            age_s = max(0, int(time.time()) - created)
+            if age_s < 3600:
+                age_str = f"{age_s // 60}m ago"
+            elif age_s < 86400:
+                age_str = f"{age_s // 3600}h ago"
+            else:
+                age_str = f"{age_s // 86400}d ago"
+
+            _icon = {"queued": "⏳", "running": "🔄", "completed": "✅",
+                     "failed": "❌", "cancelled": "🚫", "phases_ready": "🔄"}.get(status, "❓")
+
+            # Progress suffix for running jobs
+            _prog_suffix = ""
+            if status in ("running", "phases_ready"):
+                _any_running = True
+                try:
+                    _prog = job_registry.read_progress(job["job_id"])
+                    if _prog:
+                        _pct = _prog.get("pct", 0)
+                        _msg = _prog.get("message", "")[:30]
+                        _prog_suffix = f" {_pct}%"
+                except Exception:
+                    pass
+
+            # Pages / fence count
+            _pages_str = ""
+            if job.get("total_pages"):
+                _pages_str = f" · {job['total_pages']}p"
+                if job.get("fence_count") is not None:
+                    _pages_str += f", {job['fence_count']} fence"
+
+            st.markdown(
+                f"{_icon} **{fname}**{_pages_str}  \n"
+                f"<small>{status}{_prog_suffix} · {age_str}</small>",
+                unsafe_allow_html=True,
+            )
+
+            _jid = job["job_id"]
+            _c1, _c2 = st.columns([1, 1])
+
+            # Download button for completed jobs that have a highlighted PDF on disk
+            if status == "completed" and job.get("results_dir"):
+                _hl_path = Path(job["results_dir"]) / "highlighted.pdf"
+                if _hl_path.exists():
+                    with _c1:
+                        try:
+                            with open(_hl_path, "rb") as _f:
+                                _hl_bytes = _f.read()
+                            st.download_button(
+                                "⬇️",
+                                _hl_bytes,
+                                file_name=f"fence_{fname}",
+                                mime="application/pdf",
+                                key=f"dl_job_{_jid[:8]}",
+                                help="Download highlighted PDF",
+                            )
+                        except Exception:
+                            pass
+
+            with _c2:
+                if st.button("🗑️", key=f"clr_job_{_jid[:8]}", help="Remove from list"):
+                    try:
+                        job_registry.update_job(_jid, status="cancelled")
+                    except Exception:
+                        pass
+                    st.rerun()
+
+        if _any_running and not st.session_state.get("run_analysis_triggered"):
+            st.caption("_Refreshing in 10s…_")
+            time.sleep(10)
+            st.rerun()
 
 
 def initialize_session_state(session_id_val):
@@ -337,6 +455,7 @@ def initialize_session_state(session_id_val):
             'buy america', 'american', 'dug out',
         ],
         'run_analysis_triggered': False,
+        'current_job_id': None,
         'uploaded_pdf_name': None,
         'original_pdf_bytes': None,
         'current_pdf_hash': None,
@@ -729,6 +848,13 @@ current_session_id = get_session_id()
 require_auth()
 _render_auth_widget()
 initialize_session_state(current_session_id)
+
+# --- Job registry: TTL cleanup + My Jobs panel ---
+try:
+    job_registry.cleanup_expired_jobs()
+except Exception as _jr_err:
+    print(f"[job_registry] cleanup failed (non-fatal): {_jr_err}")
+_render_my_jobs_sidebar()
 
 # --- Proactive orphan-slot cleanup ---
 # A hard browser refresh creates a new session_id, but the OLD session's
@@ -2332,6 +2458,19 @@ if uploaded_pdf_file_obj:
             # they skip straight through the gate or the post-complete
             # display, so their caches are preserved.
             _purge_session_cache()
+            # Register job in the persistent registry so it shows in My Jobs
+            # and survives browser disconnects.
+            try:
+                _new_job_id = job_registry.create_job(
+                    user_id=get_user_id(),
+                    filename=st.session_state.get('uploaded_pdf_name', 'unknown.pdf'),
+                    pdf_hash=st.session_state.get('current_pdf_hash'),
+                    pdf_path=st.session_state.get('pdf_disk_path'),
+                )
+                st.session_state.current_job_id = _new_job_id
+                print(f"SESSION {current_session_id} LOG: created job {_new_job_id[:8]}")
+            except Exception as _je:
+                print(f"SESSION {current_session_id} WARNING: job_registry.create_job failed: {_je}")
             st.session_state.run_analysis_triggered = True
             st.rerun()
         else:
@@ -2419,6 +2558,17 @@ if st.session_state.run_analysis_triggered and \
         st.stop()
     # We got a slot — drop out of the waiter queue if we were in it.
     dequeue_waiter(current_session_id)
+
+    # Mark job as running in the registry.
+    try:
+        _job_id_for_run = st.session_state.get('current_job_id')
+        if _job_id_for_run:
+            job_registry.update_job(_job_id_for_run,
+                                    status="running",
+                                    started_at=int(time.time()))
+            job_registry.write_progress(_job_id_for_run, "start", 0, "Analysis starting…")
+    except Exception as _je:
+        print(f"SESSION {current_session_id} WARNING: job_registry update failed: {_je}")
 
     print(f"SESSION {current_session_id} LOG: Starting ADE-based PDF processing "
           f"(slot acquired; {_current_rss_gb():.1f} GB RSS).")
@@ -5453,6 +5603,16 @@ if st.session_state.run_analysis_triggered and \
         st.session_state.analysis_halted_due_to_error = True
         _mark_session_done()
         print(f"SESSION {current_session_id} ERROR: {e}")
+        # Mark job as failed in registry
+        try:
+            _jid_err = st.session_state.get('current_job_id')
+            if _jid_err:
+                job_registry.update_job(_jid_err,
+                                        status="failed",
+                                        completed_at=int(time.time()),
+                                        error_msg=str(e)[:500])
+        except Exception as _jre:
+            print(f"SESSION {current_session_id} WARNING: job_registry error update failed: {_jre}")
     finally:
         if doc_proc:
             doc_proc.close()
@@ -5473,6 +5633,38 @@ if st.session_state.run_analysis_triggered and \
         if _run_terminated:
             _purge_session_cache()
             release_analysis_slot(current_session_id)
+            # Update job registry with final status
+            try:
+                _jid_fin = st.session_state.get('current_job_id')
+                if _jid_fin:
+                    _completed_ok = (st.session_state.get('processing_complete')
+                                     and not st.session_state.get('analysis_halted_due_to_error'))
+                    _final_status = "completed" if _completed_ok else "failed"
+                    _update_kw: dict = dict(
+                        status=_final_status,
+                        completed_at=int(time.time()),
+                        total_pages=st.session_state.get('doc_total_pages', 0),
+                        fence_count=len(st.session_state.get('fence_pages', [])),
+                        non_fence_count=len(st.session_state.get('non_fence_pages', [])),
+                    )
+                    # Save highlighted PDF to results dir for download
+                    if _completed_ok:
+                        _hl_bytes = st.session_state.get('highlighted_pdf_bytes_for_download')
+                        _job_row = job_registry.get_job(_jid_fin)
+                        if _hl_bytes and _job_row and _job_row.get('results_dir'):
+                            try:
+                                _hl_path = Path(_job_row['results_dir']) / "highlighted.pdf"
+                                _hl_path.write_bytes(_hl_bytes)
+                            except Exception as _hp_err:
+                                print(f"SESSION {current_session_id} WARNING: "
+                                      f"could not save highlighted PDF: {_hp_err}")
+                    job_registry.update_job(_jid_fin, **_update_kw)
+                    job_registry.write_progress(
+                        _jid_fin, "done", 100,
+                        "Completed" if _completed_ok else "Failed",
+                    )
+            except Exception as _jrf:
+                print(f"SESSION {current_session_id} WARNING: job_registry final update failed: {_jrf}")
         else:
             # Same reason we keep the cache: the slot also has to stay. If
             # we release it here, a Streamlit rerun mid-analysis (browser
