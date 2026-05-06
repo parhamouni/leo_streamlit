@@ -435,30 +435,48 @@ with st.sidebar:
 # Main Area
 # ==============================================================================
 
-# PDF Upload
+# PDF Upload (multi-file)
 st.markdown("---")
-uploaded_file = st.file_uploader(
-    "Upload an Engineering PDF",
+uploaded_files = st.file_uploader(
+    "Upload one or more Engineering PDFs",
     type=["pdf"],
+    accept_multiple_files=True,
     key=f"pdf_upload_{st.session_state.get('uploader_counter', 0)}",
+    help="Drag in multiple files; each will queue as a separate job and process in order.",
 )
 
-if uploaded_file is not None:
-    pdf_bytes = uploaded_file.read()
-    pdf_name = uploaded_file.name
-    size_mb = len(pdf_bytes) / 1024 / 1024
+if uploaded_files:
+    # Validate sizes; collect (name, bytes, size_mb) for the submit step
+    valid_files = []
+    oversize_files = []
+    for f in uploaded_files:
+        b = f.read()
+        smb = len(b) / 1024 / 1024
+        if smb > cfg.MAX_PDF_MB:
+            oversize_files.append((f.name, smb))
+        else:
+            valid_files.append((f.name, b, smb))
 
-    if size_mb > cfg.MAX_PDF_MB:
+    for name, smb in oversize_files:
         st.error(
-            f"File too large ({size_mb:.0f} MB). Maximum is {cfg.MAX_PDF_MB} MB. "
-            "Please split the document by page range and re-upload."
+            f"`{name}` is too large ({smb:.0f} MB). Max is {cfg.MAX_PDF_MB} MB. Skipped."
         )
-        st.stop()
 
-    st.success(f"Uploaded: **{pdf_name}** ({size_mb:.1f} MB)")
+    if valid_files:
+        total_mb = sum(s for _, _, s in valid_files)
+        st.success(
+            f"Ready to analyze **{len(valid_files)}** file(s) "
+            f"({total_mb:.1f} MB total)"
+        )
+        with st.expander("Files to submit", expanded=(len(valid_files) <= 5)):
+            for name, _b, smb in valid_files:
+                st.markdown(f"- 📄 `{name}` — {smb:.1f} MB")
 
-    if st.button("Analyze PDF", type="primary", key="analyze_btn"):
-        with st.spinner("Submitting job..."):
+        btn_label = (
+            "Analyze PDF" if len(valid_files) == 1
+            else f"Analyze {len(valid_files)} PDFs"
+        )
+        if st.button(btn_label, type="primary", key="analyze_btn"):
             config_payload = {
                 "analysis_model": cfg.ANALYSIS_MODEL,
                 "classifier_model": cfg.CLASSIFIER_MODEL,
@@ -468,17 +486,39 @@ if uploaded_file is not None:
                 "enable_unified_measurement": st.session_state.get("unified_measurement_toggle", True),
                 "enable_nonlayer_suggestions": st.session_state.get("nonlayer_suggestions_toggle", False),
             }
-            result = _api_post_file("/api/jobs", pdf_bytes, pdf_name, config_payload)
-            if result and result.get("job_id"):
-                st.session_state._selected_job_id = result["job_id"]
-                st.session_state.uploader_counter = st.session_state.get("uploader_counter", 0) + 1
-                st.success(f"Job submitted! ID: `{result['job_id'][:8]}`")
+            submitted_ids = []
+            failed_files = []
+            progress_bar = st.progress(0.0, text="Submitting jobs...")
+            for i, (name, pdf_bytes, _smb) in enumerate(valid_files):
+                progress_bar.progress(
+                    (i + 1) / len(valid_files),
+                    text=f"Submitting {i + 1}/{len(valid_files)}: {name}",
+                )
+                result = _api_post_file("/api/jobs", pdf_bytes, name, config_payload)
+                if result and result.get("job_id"):
+                    submitted_ids.append(result["job_id"])
+                else:
+                    err = (result or {}).get("error") or "unknown error"
+                    failed_files.append((name, err))
+            progress_bar.empty()
+
+            for name, err in failed_files:
+                st.error(f"`{name}`: {err}")
+
+            if submitted_ids:
+                # Auto-open the first submitted job so user sees its progress
+                st.session_state._selected_job_id = submitted_ids[0]
+                st.session_state.uploader_counter = (
+                    st.session_state.get("uploader_counter", 0) + 1
+                )
+                st.success(
+                    f"Submitted **{len(submitted_ids)}** job(s). "
+                    f"Opening the first one — others are queued and visible in the sidebar."
+                )
                 time.sleep(1)
                 st.rerun()
-            elif result and result.get("error"):
-                st.error(f"Failed to submit: {result['error']}")
-            else:
-                st.error("Failed to submit job. Is the API server running?")
+            elif not failed_files:
+                st.error("Failed to submit. Is the API server running?")
 
 
 # ==============================================================================
