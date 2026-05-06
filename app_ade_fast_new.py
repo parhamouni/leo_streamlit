@@ -1,4 +1,4 @@
-"""ADE Fence Detector — Thin Streamlit Frontend.
+"""ADE Fence Detector — Streamlit Frontend.
 
 Submits analysis jobs to the FastAPI backend (api_server.py) and renders
 results. All heavy processing happens in background workers.
@@ -10,11 +10,14 @@ import time
 from io import BytesIO
 from pathlib import Path
 
+import fitz
+import pandas as pd
 import requests
 import streamlit as st
 
 from auth import get_session_id, get_user_id, get_user_email, require_auth, render_auth_widget
 from config import cfg
+from exports import generate_measurement_pdf, generate_measurement_spreadsheet
 from state import init_session_state, get_view, set_view, load_job_results, ViewState
 import job_registry
 
@@ -41,6 +44,7 @@ user_id = get_user_id()
 init_session_state()
 
 API_URL = cfg.API_SERVER_URL
+DISPLAY_IMAGE_DPI = 150
 
 
 def _api_headers() -> dict:
@@ -73,6 +77,20 @@ def _api_post_file(path: str, pdf_bytes: bytes, filename: str, config: dict) -> 
     return None
 
 
+def _render_page_image(pdf_path: str, page_idx: int, dpi: int = 150) -> bytes | None:
+    """Render a page from the PDF as a PNG image."""
+    try:
+        doc = fitz.open(pdf_path)
+        page = doc[page_idx]
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img_bytes = pix.tobytes("png")
+        doc.close()
+        return img_bytes
+    except Exception:
+        return None
+
+
 # ==============================================================================
 # Sidebar
 # ==============================================================================
@@ -81,27 +99,19 @@ with st.sidebar:
     render_auth_widget()
     st.markdown("---")
 
-    # Configuration
-    st.header("Configuration")
-
-    # Model selection
-    model_options = ["gpt-5.1", "gpt-5-mini", "gpt-4.1", "gpt-4.1-mini"]
-    selected_model = st.selectbox(
-        "Analysis Model",
-        model_options,
-        index=model_options.index(st.session_state.selected_model_for_analysis)
-        if st.session_state.selected_model_for_analysis in model_options else 0,
-        key="model_select",
-    )
-    st.session_state.selected_model_for_analysis = selected_model
-
-    # Toggles
-    st.markdown("---")
+    # Toggles — matching original monolith sidebar exactly
     use_ade = st.toggle("Use ADE (LandingAI)", value=True, key="use_ade_toggle")
+    enable_measurement = st.toggle("Unified Measurements", value=True, key="unified_measurement_toggle",
+                                   help="Auto-detect fence lines and interactively select/draw additional lines")
     highlight_text = st.toggle("Highlight text & indicators", value=True, key="highlight_toggle")
-    enable_measurement = st.toggle("Unified Measurements", value=True, key="measurement_toggle")
+    enable_nonlayer = st.toggle("Non-layer suggestions", value=False, key="nonlayer_suggestions_toggle",
+                                help="Show auto-detected suggestions even when no fence layers found (less reliable)")
+    low_dpi_mode = st.toggle("Low-DPI preview (faster)", value=False, key="low_dpi_toggle",
+                             help="Render page previews at 110 dpi instead of 150. Exported PDFs unaffected.")
+    if low_dpi_mode:
+        DISPLAY_IMAGE_DPI = 110
 
-    # Keywords
+    # Fence Keywords
     st.markdown("---")
     st.subheader("Fence Keywords")
     kw_str = st.text_area(
@@ -182,7 +192,15 @@ with st.sidebar:
                         )
                     except Exception:
                         pass
-            elif status in ("queued", "cancelled"):
+            elif status in ("queued", "running"):
+                if st.button("Cancel", key=f"cancel_{job['job_id'][:8]}"):
+                    try:
+                        requests.delete(f"{API_URL}/api/jobs/{job['job_id']}",
+                                       headers=_api_headers(), timeout=5)
+                    except Exception:
+                        pass
+                    st.rerun()
+            elif status == "cancelled":
                 if st.button("X", key=f"del_{job['job_id'][:8]}"):
                     try:
                         requests.delete(f"{API_URL}/api/jobs/{job['job_id']}",
@@ -218,12 +236,12 @@ if uploaded_file is not None:
     if st.button("Analyze PDF", type="primary", key="analyze_btn"):
         with st.spinner("Submitting job..."):
             config_payload = {
-                "analysis_model": st.session_state.selected_model_for_analysis,
+                "analysis_model": cfg.ANALYSIS_MODEL,
                 "classifier_model": cfg.CLASSIFIER_MODEL,
                 "fence_keywords": st.session_state.fence_keywords_app,
                 "use_ade": st.session_state.get("use_ade_toggle", True),
                 "highlight_fence_text": st.session_state.get("highlight_toggle", True),
-                "enable_unified_measurement": st.session_state.get("measurement_toggle", True),
+                "enable_unified_measurement": st.session_state.get("unified_measurement_toggle", True),
             }
             result = _api_post_file("/api/jobs", pdf_bytes, pdf_name, config_payload)
             if result and result.get("job_id"):
@@ -235,17 +253,32 @@ if uploaded_file is not None:
             else:
                 st.error("Failed to submit job. Is the API server running?")
 
+
 # ==============================================================================
 # Results rendering
 # ==============================================================================
 
 def _show_results(results: dict, job: dict):
-    """Render analysis results for a completed job."""
+    """Render full analysis results for a completed job."""
     fence_pages = results.get("fence_pages", [])
     non_fence_pages = results.get("non_fence_pages", [])
     element_details = results.get("element_details", {})
     total_pages = results.get("total_pages", 0)
     timings = results.get("timings", {})
+    per_page_scale = results.get("per_page_scale_info", {})
+    per_page_measurements = results.get("unified_measurements", {})
+    page_categories = results.get("page_categories", {})
+    pdf_path = job.get("pdf_path")
+    job_id = job.get("job_id", "")
+
+    # Summary header
+    summary_text = (
+        f"### Final Summary (Completed)\n"
+        f"- Processed: {total_pages}/{total_pages}\n"
+        f"- Fence: {len(fence_pages)}\n"
+        f"- Non-Fence: {len(non_fence_pages)}"
+    )
+    st.markdown(summary_text)
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Pages", total_pages)
@@ -254,79 +287,227 @@ def _show_results(results: dict, job: dict):
     if timings.get("total"):
         col4.metric("Analysis Time", f"{timings['total']:.0f}s")
 
-    dcol1, dcol2 = st.columns(2)
-    with dcol1:
-        hl_path = job_registry.get_highlighted_pdf_path(job["job_id"])
-        if hl_path:
-            st.download_button(
-                "Download Highlighted PDF",
-                hl_path.read_bytes(),
-                file_name=f"fence_{job.get('filename', 'document')}.pdf",
-                mime="application/pdf",
-                key="dl_highlighted",
-                type="primary",
-            )
+    # Highlighted PDF download
+    hl_path = job_registry.get_highlighted_pdf_path(job_id)
+    if hl_path:
+        st.download_button(
+            "Download Highlighted Fence Pages (PDF)",
+            hl_path.read_bytes(),
+            file_name=f"fence_{job.get('filename', 'document')}.pdf",
+            mime="application/pdf",
+            key="dl_highlighted_main",
+            type="primary",
+        )
 
-    if element_details:
-        with st.expander("Element Specifications", expanded=False):
-            for name, details in element_details.items():
-                st.markdown(f"**{name}**")
-                for k, v in details.items():
-                    if v:
-                        st.markdown(f"  - {k}: {v}")
+    # New Analysis button
+    st.markdown("---")
+    if st.button("New Analysis", type="primary", key="new_analysis_btn"):
+        st.session_state._selected_job_id = None
+        st.session_state.uploader_counter = st.session_state.get("uploader_counter", 0) + 1
+        st.rerun()
 
+    # Fence pages with tabs
     if fence_pages:
-        st.markdown("### Fence Pages")
-        for page_data in sorted(fence_pages, key=lambda x: x.get("page_idx", 0)):
-            page_num = page_data.get("page_num", page_data.get("page_number", "?"))
+        sorted_pages = sorted(fence_pages, key=lambda x: x.get("page_idx", 0))
+        page_labels = [f"Page {p.get('page_num', p.get('page_number', '?'))}" for p in sorted_pages]
 
-            with st.expander(f"Page {page_num}", expanded=False):
-                defns = page_data.get("definitions", [])
-                insts = page_data.get("instances", [])
-                kw_matches = page_data.get("keyword_matches", [])
-                legend = page_data.get("legend_entries", [])
-                scale = page_data.get("scale_info", {})
-                measurements = page_data.get("measurements", {})
+        if len(sorted_pages) == 1:
+            _render_fence_page(sorted_pages[0], pdf_path, per_page_scale, element_details, job_id)
+        else:
+            tabs = st.tabs(page_labels)
+            for tab, page_data in zip(tabs, sorted_pages):
+                with tab:
+                    _render_fence_page(page_data, pdf_path, per_page_scale, element_details, job_id)
 
-                mc1, mc2, mc3 = st.columns(3)
-                mc1.metric("Definitions", len(defns))
-                mc2.metric("Instances", len(insts))
-                mc3.metric("Keyword Matches", len(kw_matches))
+    # Element Specifications
+    if element_details:
+        st.markdown("---")
+        st.markdown("#### Element Specifications (Cross-Page Details)")
+        spec_rows = []
+        for elem_name, details in element_details.items():
+            if any(v for v in details.values() if v):
+                spec_rows.append({
+                    "Element": elem_name,
+                    "Height": details.get("height", ""),
+                    "Post Type": details.get("post_type", ""),
+                    "Post Spacing": details.get("post_spacing", ""),
+                    "Material": details.get("material", ""),
+                    "Gauge": details.get("gauge", ""),
+                    "Mesh Size": details.get("mesh_size", ""),
+                    "Foundation": details.get("foundation", ""),
+                    "Gate Info": details.get("gate_info", ""),
+                    "Detail Page": details.get("detail_page", ""),
+                })
+        if spec_rows:
+            st.dataframe(pd.DataFrame(spec_rows), hide_index=True, use_container_width=True)
+            with st.expander("Full Detail Text per Element", expanded=False):
+                for elem_name, details in element_details.items():
+                    full = details.get("full_details", "")
+                    notes = details.get("notes", "")
+                    if full or notes:
+                        st.markdown(f"**{elem_name}:**")
+                        if full:
+                            st.markdown(f"  {full}")
+                        if notes:
+                            st.markdown(f"  *Notes: {notes}*")
 
-                if scale:
-                    scale_val = scale.get("verified_scale") or scale.get("text_scale")
-                    if scale_val:
-                        st.caption(f"Scale: 1\" = {72 / scale_val:.1f}' ({scale_val:.1f} pts/ft)")
-
-                if legend:
-                    st.markdown("**Legend Entries:**")
-                    for entry in legend:
-                        st.markdown(f"- {entry.get('name', '?')}: {entry.get('description', '')}")
-
-                if defns:
-                    with st.popover("View Definitions"):
-                        for d in defns:
-                            st.json(d)
-
-                if measurements:
-                    st.markdown("**Measurements:**")
-                    st.json(measurements)
-
-                text_preview = page_data.get("fence_text", "")
-                if text_preview:
-                    with st.popover("Page Text Preview"):
-                        st.text(text_preview[:2000])
-
+    # Non-fence pages
     if non_fence_pages:
         with st.expander(f"Non-Fence Pages ({len(non_fence_pages)})", expanded=False):
             page_nums = [p.get("page_num", p.get("page_number", "?")) for p in non_fence_pages]
             st.write(f"Pages: {', '.join(str(p) for p in page_nums)}")
 
+    # Downloads section
+    st.markdown("---")
+    st.markdown("#### Downloads")
+    dl_col1, dl_col2 = st.columns(2)
+
+    with dl_col1:
+        if pdf_path and os.path.exists(pdf_path) and fence_pages:
+            try:
+                m_pdf_bytes, m_pdf_name = generate_measurement_pdf(
+                    pdf_path, fence_pages,
+                    st.session_state.get("line_assignments", {}),
+                    st.session_state.get("user_drawn_lines", {}),
+                    page_categories,
+                    uploaded_pdf_name=job.get("filename", "document.pdf"),
+                )
+                if m_pdf_bytes:
+                    st.download_button(
+                        "Download PDF with Measurements",
+                        m_pdf_bytes, m_pdf_name,
+                        "application/pdf",
+                        key="dl_measurement_pdf",
+                    )
+            except Exception:
+                pass
+
+    with dl_col2:
+        if fence_pages:
+            try:
+                xlsx_data = generate_measurement_spreadsheet(
+                    fence_pages,
+                    st.session_state.get("line_assignments", {}),
+                    st.session_state.get("user_drawn_lines", {}),
+                    page_categories,
+                    per_page_scale,
+                    element_details,
+                )
+                if xlsx_data:
+                    base_name = os.path.splitext(job.get("filename", "document"))[0]
+                    st.download_button(
+                        "Download Measurements Excel",
+                        xlsx_data,
+                        f"{base_name}_measurements.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_measurement_xlsx",
+                    )
+            except Exception:
+                pass
+
+    # Timings
     if timings:
         with st.expander("Analysis Timings", expanded=False):
             for phase, secs in timings.items():
                 if isinstance(secs, (int, float)):
                     st.markdown(f"- **{phase}**: {secs:.1f}s")
+
+
+def _render_fence_page(page_data: dict, pdf_path: str | None,
+                       per_page_scale: dict, element_details: dict, job_id: str):
+    """Render a single fence page with image, details, and measurements."""
+    page_idx = page_data.get("page_idx", 0)
+    page_num = page_data.get("page_num", page_data.get("page_number", page_idx + 1))
+
+    defns = page_data.get("definitions", [])
+    insts = page_data.get("instances", [])
+    kw_matches = page_data.get("keyword_matches", [])
+    legend = page_data.get("legend_entries", [])
+    scale = page_data.get("scale_info", {})
+    measurements = page_data.get("measurements", {})
+
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric("Definitions", len(defns))
+    mc2.metric("Instances", len(insts))
+    mc3.metric("Keyword Matches", len(kw_matches))
+
+    # Scale info
+    if scale:
+        scale_val = scale.get("verified_scale") or scale.get("text_scale")
+        scale_text = scale.get("scale_text", "")
+        confidence = scale.get("confidence", "")
+        if scale_val:
+            st.caption(f"Scale: {scale_text} ({scale_val:.1f} pts/ft, confidence: {confidence})")
+
+        with st.expander("Scale Detection Details", expanded=False):
+            st.json(scale)
+
+    # Page image
+    if pdf_path and os.path.exists(pdf_path):
+        zoom_key = f"zoom_{job_id[:8]}_{page_num}"
+        zoom_level = st.slider("Zoom", 50, 200, 100, 10, key=zoom_key)
+        dpi = int(DISPLAY_IMAGE_DPI * zoom_level / 100)
+        img_bytes = _render_page_image(pdf_path, page_idx, dpi=dpi)
+        if img_bytes:
+            st.image(img_bytes, use_container_width=True)
+
+    # Legend entries
+    if legend:
+        st.markdown("**Legend Entries:**")
+        for entry in legend:
+            name = entry.get("name", "?")
+            desc = entry.get("description", "")
+            st.markdown(f"- **{name}**: {desc}")
+
+    # Definitions detail
+    if defns:
+        with st.expander(f"Definitions ({len(defns)})", expanded=False):
+            for i, d in enumerate(defns):
+                text = d.get("text", d.get("markdown", ""))[:200]
+                bbox = d.get("bbox", "")
+                st.markdown(f"**[{i+1}]** {text}")
+                if bbox:
+                    st.caption(f"bbox: {bbox}")
+
+    # Instances detail
+    if insts:
+        with st.expander(f"Instances ({len(insts)})", expanded=False):
+            for i, inst in enumerate(insts):
+                text = inst.get("text", inst.get("markdown", ""))[:200]
+                bbox = inst.get("bbox", "")
+                st.markdown(f"**[{i+1}]** {text}")
+                if bbox:
+                    st.caption(f"bbox: {bbox}")
+
+    # Keyword matches
+    if kw_matches:
+        with st.expander(f"Keyword Matches ({len(kw_matches)})", expanded=False):
+            for m in kw_matches:
+                st.markdown(f"- **{m.get('keyword', '?')}**: \"{m.get('text', '')}\"")
+
+    # Measurements
+    if measurements:
+        m_info = measurements.get("page_info", {})
+        m_lines = measurements.get("lines", [])
+        m_total = measurements.get("total_length_ft", 0)
+
+        with st.expander(f"Measurements ({len(m_lines)} lines, {m_total:.1f} ft)", expanded=False):
+            if m_info.get("scale_factor"):
+                st.caption(f"Scale: {m_info['scale_factor']:.1f} pts/ft")
+            if m_lines:
+                for ml in m_lines[:50]:
+                    st.markdown(
+                        f"- {ml.get('category', '?')}: {ml.get('length_ft', 0):.1f} ft "
+                        f"({ml.get('length_pts', 0):.0f} pts)"
+                    )
+            if not m_lines:
+                st.json(measurements)
+
+    # Text preview
+    text_preview = page_data.get("fence_text", "")
+    if text_preview:
+        with st.expander("Page Text Preview", expanded=False):
+            st.text(text_preview[:3000])
 
 
 # ==============================================================================
@@ -350,19 +531,33 @@ if selected_job_id:
         if status == "queued":
             qp = job_data.get("queue_position", "?")
             st.info(f"Queued (position #{qp}). Waiting for worker...")
+            if st.button("Cancel Job", key="cancel_queued"):
+                requests.delete(f"{API_URL}/api/jobs/{selected_job_id}",
+                               headers=_api_headers(), timeout=5)
+                st.session_state._selected_job_id = None
+                st.rerun()
             time.sleep(3)
             st.rerun()
 
         elif status == "running":
             prog = job_data.get("progress", {})
             pct = prog.get("pct", 0) if prog else 0
+            phase = prog.get("phase", "") if prog else ""
             msg = prog.get("message", "Processing...") if prog else "Processing..."
-            st.progress(pct / 100, text=msg)
+            st.progress(pct / 100, text=f"[{phase}] {msg}")
+            if st.button("Cancel Job", key="cancel_running"):
+                requests.delete(f"{API_URL}/api/jobs/{selected_job_id}",
+                               headers=_api_headers(), timeout=5)
+                st.session_state._selected_job_id = None
+                st.rerun()
             time.sleep(3)
             st.rerun()
 
         elif status == "failed":
             st.error(f"Analysis failed: {job_data.get('error_msg', 'Unknown error')}")
+            if st.button("New Analysis", key="new_after_fail"):
+                st.session_state._selected_job_id = None
+                st.rerun()
 
         elif status == "completed":
             results = _api_get(f"/api/jobs/{selected_job_id}/results")
@@ -373,6 +568,12 @@ if selected_job_id:
 
         elif status == "cancelled":
             st.warning("This job was cancelled.")
+            if st.button("New Analysis", key="new_after_cancel"):
+                st.session_state._selected_job_id = None
+                st.rerun()
+
+elif not st.session_state.get("_selected_job_id"):
+    st.info("Upload a PDF to begin analysis, or select a job from the sidebar.")
 
 
 # Job registry cleanup
