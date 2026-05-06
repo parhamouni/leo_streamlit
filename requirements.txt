@@ -16,3 +16,7 @@ openpyxl>=3.1.0
 rich>=13.0.0
 toml>=0.10.2
 psutil>=5.9.0
+fastapi>=0.100.0
+uvicorn>=0.20.0
+python-multipart>=0.0.5
+requests>=2.28.0

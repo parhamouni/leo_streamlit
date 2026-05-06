@@ -25,14 +25,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import pickle
 import shutil
 import tempfile
 import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-CACHE_SCHEMA_VERSION = "v3"  # ephemeral per-session cache; no cross-run reuse
+CACHE_SCHEMA_VERSION = "v4"  # v4: pickle removed, all phases use JSON
 
 # Phases that cache per-page. `phase1a` is whole-document (text + vector
 # lines come out of one subprocess call), so it has no page granularity.
@@ -47,14 +46,9 @@ _PER_PAGE_PHASES = {
 }
 _WHOLE_DOC_PHASES = {"phase1a"}
 
-# Phases that store pickle-serializable but not JSON-serializable payloads.
-# Everything else uses JSON.
-_PICKLE_PHASES = {
-    "phase1a",
-    "phase1b",
-    "phase2",
-    "phase3_measure",
-}
+# All phases now use JSON. Pickle was removed to eliminate deserialization
+# risk from untrusted cache files.
+_PICKLE_PHASES: set[str] = set()
 
 # --- Ephemeral per-session cache ---
 # Policy: a cache entry is only ever useful while processing one PDF. Once
@@ -177,8 +171,6 @@ def get(phase: str, pdf_sha256: str, params: str,
             return None
         with open(path, "rb") as f:
             data = f.read()
-        if phase in _PICKLE_PHASES:
-            return pickle.loads(data)
         return json.loads(data.decode("utf-8"))
     except Exception as e:
         print(f"[fence_cache] get({phase}, page={page_idx}) failed: {e}")
@@ -191,10 +183,7 @@ def put(phase: str, pdf_sha256: str, params: str, value: Any,
     """Write value to the cache. Logs and swallows errors (cache is best-effort)."""
     try:
         path = _entry_path(pdf_sha256, phase, params, page_idx, user_scope=user_scope)
-        if phase in _PICKLE_PHASES:
-            data = pickle.dumps(value, protocol=5)
-        else:
-            data = json.dumps(value, default=str).encode("utf-8")
+        data = json.dumps(value, default=str).encode("utf-8")
         _atomic_write_bytes(path, data)
     except Exception as e:
         print(f"[fence_cache] put({phase}, page={page_idx}) failed: {e}")

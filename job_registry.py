@@ -63,9 +63,16 @@ CREATE TABLE IF NOT EXISTS jobs (
     fence_count     INTEGER,
     non_fence_count INTEGER,
     results_dir     TEXT,
-    error_msg       TEXT
+    error_msg       TEXT,
+    config_json     TEXT,
+    queue_position  INTEGER
 );
 """
+
+_MIGRATE_COLUMNS = [
+    ("config_json", "TEXT"),
+    ("queue_position", "INTEGER"),
+]
 
 # Statuses considered "active" (never expire from get_user_jobs).
 _ACTIVE_STATUSES = ("queued", "running", "phases_ready")
@@ -99,6 +106,12 @@ def _db() -> sqlite3.Connection:
         conn.execute("PRAGMA foreign_keys=ON;")
         conn.execute(_CREATE_TABLE_SQL)
 
+        for col_name, col_type in _MIGRATE_COLUMNS:
+            try:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {col_name} {col_type}")
+            except sqlite3.OperationalError:
+                pass
+
         _conn = conn
         _db_initialized = True
         return _conn
@@ -127,6 +140,7 @@ def create_job(
     filename: str,
     pdf_hash: str | None = None,
     pdf_path: str | None = None,
+    config_json: str | None = None,
 ) -> str:
     """Create a new job row and its results directory.
 
@@ -139,32 +153,38 @@ def create_job(
     results_dir = _RESULTS_ROOT / job_id
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    row = {
-        "job_id": job_id,
-        "user_id": user_id,
-        "filename": filename,
-        "pdf_hash": pdf_hash,
-        "pdf_path": pdf_path,
-        "status": "queued",
-        "created_at": now,
-        "started_at": None,
-        "completed_at": None,
-        "expires_at": expires_at,
-        "total_pages": None,
-        "fence_count": None,
-        "non_fence_count": None,
-        "results_dir": str(results_dir),
-        "error_msg": None,
-    }
-
-    cols = ", ".join(row.keys())
-    placeholders = ", ".join("?" for _ in row)
-    sql = f"INSERT INTO jobs ({cols}) VALUES ({placeholders})"
-
     db = _db()
     with _lock:
         db.execute("BEGIN IMMEDIATE")
         try:
+            max_pos = db.execute(
+                "SELECT COALESCE(MAX(queue_position), 0) FROM jobs WHERE status = 'queued'"
+            ).fetchone()[0]
+            queue_position = max_pos + 1
+
+            row = {
+                "job_id": job_id,
+                "user_id": user_id,
+                "filename": filename,
+                "pdf_hash": pdf_hash,
+                "pdf_path": pdf_path,
+                "status": "queued",
+                "created_at": now,
+                "started_at": None,
+                "completed_at": None,
+                "expires_at": expires_at,
+                "total_pages": None,
+                "fence_count": None,
+                "non_fence_count": None,
+                "results_dir": str(results_dir),
+                "error_msg": None,
+                "config_json": config_json,
+                "queue_position": queue_position,
+            }
+
+            cols = ", ".join(row.keys())
+            placeholders = ", ".join("?" for _ in row)
+            sql = f"INSERT INTO jobs ({cols}) VALUES ({placeholders})"
             db.execute(sql, list(row.values()))
             db.execute("COMMIT")
         except Exception:
@@ -188,7 +208,7 @@ def update_job(job_id: str, **fields: Any) -> None:
         "user_id", "filename", "pdf_hash", "pdf_path", "status",
         "created_at", "started_at", "completed_at", "expires_at",
         "total_pages", "fence_count", "non_fence_count", "results_dir",
-        "error_msg",
+        "error_msg", "config_json", "queue_position",
     }
     unknown = set(fields) - _KNOWN_COLUMNS
     if unknown:
@@ -357,3 +377,139 @@ def read_progress(job_id: str) -> dict | None:
         return json.loads(progress_path.read_bytes())
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Queue management (used by api_server.py background workers)
+# ---------------------------------------------------------------------------
+
+
+def next_queued_job() -> dict | None:
+    """Atomically claim the oldest queued job (lowest queue_position).
+
+    Sets status='running' and started_at=now(). Returns the job dict,
+    or None if the queue is empty.
+    """
+    db = _db()
+    with _lock:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            row = db.execute(
+                "SELECT * FROM jobs WHERE status = 'queued' "
+                "ORDER BY queue_position ASC, created_at ASC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                db.execute("ROLLBACK")
+                return None
+            job = dict(row)
+            now = int(time.time())
+            db.execute(
+                "UPDATE jobs SET status = 'running', started_at = ? WHERE job_id = ?",
+                (now, job["job_id"]),
+            )
+            db.execute("COMMIT")
+            job["status"] = "running"
+            job["started_at"] = now
+            return job
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
+
+
+def count_running_jobs() -> int:
+    """Return the total number of currently running jobs."""
+    db = _db()
+    with _lock:
+        (count,) = db.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'running'"
+        ).fetchone()
+    return count
+
+
+def count_queued_jobs() -> int:
+    """Return the total number of queued jobs."""
+    db = _db()
+    with _lock:
+        (count,) = db.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'queued'"
+        ).fetchone()
+    return count
+
+
+def queue_position(job_id: str) -> int | None:
+    """Return 1-based queue position for a queued job, or None if not queued."""
+    db = _db()
+    with _lock:
+        rows = db.execute(
+            "SELECT job_id FROM jobs WHERE status = 'queued' "
+            "ORDER BY queue_position ASC, created_at ASC"
+        ).fetchall()
+    for i, r in enumerate(rows, 1):
+        if r["job_id"] == job_id:
+            return i
+    return None
+
+
+def mark_stale_running_as_failed(max_age_seconds: int = 7200) -> int:
+    """Mark jobs stuck in 'running' status as 'failed'.
+
+    Called on API server startup to recover from crashes. Jobs running
+    longer than max_age_seconds are considered stale.
+    """
+    cutoff = int(time.time()) - max_age_seconds
+    db = _db()
+    with _lock:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = db.execute(
+                "UPDATE jobs SET status = 'failed', "
+                "error_msg = 'Server restarted during analysis', "
+                "completed_at = ? "
+                "WHERE status = 'running' AND started_at < ?",
+                (int(time.time()), cutoff),
+            )
+            count = cursor.rowcount
+            db.execute("COMMIT")
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
+    return count
+
+
+def save_results(job_id: str, results: dict) -> None:
+    """Save the analysis results JSON to the job's results directory."""
+    job = get_job(job_id)
+    if job is None:
+        return
+    results_dir = Path(job.get("results_dir") or str(_RESULTS_ROOT / job_id))
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    target = results_dir / "results.json"
+    tmp = results_dir / "results.json.tmp"
+    encoded = json.dumps(results, default=str).encode("utf-8")
+    tmp.write_bytes(encoded)
+    os.replace(str(tmp), str(target))
+
+
+def load_results(job_id: str) -> dict | None:
+    """Load results.json for a completed job. Returns None if missing."""
+    job = get_job(job_id)
+    if job is None:
+        return None
+    results_dir = Path(job.get("results_dir") or str(_RESULTS_ROOT / job_id))
+    results_path = results_dir / "results.json"
+    try:
+        if not results_path.exists():
+            return None
+        return json.loads(results_path.read_bytes())
+    except Exception:
+        return None
+
+
+def get_highlighted_pdf_path(job_id: str) -> Path | None:
+    """Return the path to the highlighted PDF if it exists."""
+    job = get_job(job_id)
+    if job is None or not job.get("results_dir"):
+        return None
+    hl_path = Path(job["results_dir"]) / "highlighted.pdf"
+    return hl_path if hl_path.exists() else None

@@ -1,0 +1,21 @@
+[Unit]
+Description=Fence Detector FastAPI Backend
+After=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/leo_streamlit
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/leo_streamlit/venv/bin/uvicorn api_server:app \
+  --host 127.0.0.1 \
+  --port 8503 \
+  --workers 1
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=true
+MemoryMax=12G
+MemoryHigh=10G
+
+[Install]
+WantedBy=multi-user.target
