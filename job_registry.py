@@ -489,6 +489,33 @@ def mark_stale_running_as_failed(max_age_seconds: int = 7200) -> int:
     return count
 
 
+def requeue_orphaned_running() -> int:
+    """Move 'running' jobs back to 'queued' status (orphaned by API restart).
+
+    Called on API startup. Worker threads die when uvicorn exits, so any
+    job left in 'running' state is orphaned. Re-queue at the front so it
+    resumes (cached phases are reused via fence_cache). Returns count.
+    """
+    db = _db()
+    with _lock:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            # Place orphans ahead of any newly-queued work
+            cursor = db.execute(
+                "UPDATE jobs SET status = 'queued', started_at = NULL, "
+                "queue_position = COALESCE("
+                "  (SELECT MIN(queue_position) FROM jobs WHERE status = 'queued'), 1"
+                ") - 1 "
+                "WHERE status = 'running'"
+            )
+            count = cursor.rowcount
+            db.execute("COMMIT")
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
+    return count
+
+
 def save_results(job_id: str, results: dict) -> None:
     """Save the analysis results JSON to the job's results directory."""
     job = get_job(job_id)

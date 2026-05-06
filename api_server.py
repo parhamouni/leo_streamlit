@@ -226,6 +226,11 @@ def _ttl_cleanup_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Re-queue jobs orphaned by previous API restart (clean recovery)
+    requeued = job_registry.requeue_orphaned_running()
+    if requeued:
+        log.info(f"Startup: re-queued {requeued} orphaned running jobs")
+    # Catch ancient stale rows that pre-date the requeue logic
     stale = job_registry.mark_stale_running_as_failed(max_age_seconds=7200)
     if stale:
         log.info(f"Startup: marked {stale} stale running jobs as failed")
