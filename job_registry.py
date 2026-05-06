@@ -194,6 +194,19 @@ def create_job(
     return job_id
 
 
+def delete_job(job_id: str) -> None:
+    """Hard-delete a job row from the registry. Silent if not found."""
+    db = _db()
+    with _lock:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            db.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+            db.execute("COMMIT")
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
+
+
 def update_job(job_id: str, **fields: Any) -> None:
     """Update arbitrary columns on an existing job.
 

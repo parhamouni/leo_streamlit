@@ -183,7 +183,204 @@ with st.sidebar:
     render_auth_widget()
     st.markdown("---")
 
-    # Toggles — matching original monolith sidebar exactly
+    # ==========================================================================
+    # My Jobs (top of sidebar — primary view)
+    # ==========================================================================
+    st.markdown("### 📂 My Jobs")
+
+    jobs_data = _api_get("/api/jobs")
+    all_jobs = jobs_data.get("jobs", []) if jobs_data else []
+
+    # Hide cancelled jobs from the main list (they stay in DB until TTL or manual purge)
+    visible_jobs = [j for j in all_jobs if j.get("status") != "cancelled"]
+    cancelled_jobs = [j for j in all_jobs if j.get("status") == "cancelled"]
+
+    selected_id = st.session_state.get("_selected_job_id")
+    _any_active = False
+
+    if not visible_jobs:
+        st.caption("_No active jobs. Upload a PDF below._")
+
+    STATUS_STYLE = {
+        "queued":    {"icon": "⏳", "color": "#9CA3AF", "label": "Queued"},
+        "running":   {"icon": "🔄", "color": "#3B82F6", "label": "Running"},
+        "completed": {"icon": "✅", "color": "#10B981", "label": "Done"},
+        "failed":    {"icon": "❌", "color": "#EF4444", "label": "Failed"},
+    }
+
+    for job in visible_jobs[:10]:
+        status = job.get("status", "?")
+        style = STATUS_STYLE.get(status, {"icon": "❔", "color": "#9CA3AF", "label": status})
+        jid = job["job_id"]
+        is_selected = jid == selected_id
+
+        fname = job.get("filename", "unknown.pdf")
+        fname_short = fname if len(fname) <= 32 else fname[:29] + "..."
+
+        age_s = max(0, int(time.time()) - job.get("created_at", 0))
+        if age_s < 60:
+            age_str = "just now"
+        elif age_s < 3600:
+            age_str = f"{age_s // 60}m ago"
+        elif age_s < 86400:
+            age_str = f"{age_s // 3600}h ago"
+        else:
+            age_str = f"{age_s // 86400}d ago"
+
+        # Status text + per-status detail
+        if status == "running":
+            _any_active = True
+            prog = job.get("progress") or {}
+            pct = prog.get("pct", 0)
+            sub = f"{pct}%"
+        elif status == "queued":
+            _any_active = True
+            qp = job.get("queue_position")
+            sub = f"#{qp} in queue" if qp else "queued"
+        elif status == "completed":
+            tp = job.get("total_pages")
+            fc = job.get("fence_count")
+            if tp is not None and fc is not None:
+                sub = f"{tp}p · {fc} fence"
+            elif tp is not None:
+                sub = f"{tp}p"
+            else:
+                sub = "ready"
+        elif status == "failed":
+            sub = "click to view error"
+        else:
+            sub = status
+
+        with st.container(border=True):
+            # Header row: status icon + filename + age
+            head = (
+                f"<div style='line-height:1.3;'>"
+                f"<span style='color:{style['color']};font-weight:600;'>{style['icon']} {style['label']}</span>"
+                f"<span style='color:#6B7280;float:right;font-size:0.8em;'>{age_str}</span>"
+                f"<br><span style='font-size:0.95em;'>{fname_short}</span>"
+                f"<br><span style='color:#6B7280;font-size:0.8em;'>{sub}</span>"
+                f"</div>"
+            )
+            st.markdown(head, unsafe_allow_html=True)
+
+            # Inline progress bar for running jobs
+            if status == "running":
+                pct = (job.get("progress") or {}).get("pct", 0)
+                st.progress(min(1.0, pct / 100.0))
+
+            # Action row
+            if status == "completed":
+                bcol1, bcol2 = st.columns([1, 1])
+                with bcol1:
+                    if st.button(
+                        "Open" if not is_selected else "✓ Open",
+                        key=f"open_{jid[:8]}",
+                        use_container_width=True,
+                        type=("primary" if is_selected else "secondary"),
+                    ):
+                        st.session_state._selected_job_id = jid
+                        st.rerun()
+                with bcol2:
+                    hl_path = job_registry.get_highlighted_pdf_path(jid)
+                    if hl_path:
+                        try:
+                            st.download_button(
+                                "↓ PDF",
+                                hl_path.read_bytes(),
+                                file_name=f"fence_{fname}",
+                                mime="application/pdf",
+                                key=f"dl_{jid[:8]}",
+                                use_container_width=True,
+                            )
+                        except Exception:
+                            pass
+            elif status in ("queued", "running"):
+                bcol1, bcol2 = st.columns([1, 1])
+                with bcol1:
+                    if st.button(
+                        "Open" if not is_selected else "✓ Open",
+                        key=f"open_{jid[:8]}",
+                        use_container_width=True,
+                        type=("primary" if is_selected else "secondary"),
+                    ):
+                        st.session_state._selected_job_id = jid
+                        st.rerun()
+                with bcol2:
+                    if st.button("✕ Cancel", key=f"cancel_{jid[:8]}",
+                                 use_container_width=True):
+                        try:
+                            requests.delete(
+                                f"{API_URL}/api/jobs/{jid}",
+                                headers=_api_headers(), timeout=5,
+                            )
+                        except Exception:
+                            pass
+                        if jid == selected_id:
+                            st.session_state._selected_job_id = None
+                        st.rerun()
+            elif status == "failed":
+                bcol1, bcol2 = st.columns([1, 1])
+                with bcol1:
+                    if st.button(
+                        "Open" if not is_selected else "✓ Open",
+                        key=f"open_{jid[:8]}",
+                        use_container_width=True,
+                        type=("primary" if is_selected else "secondary"),
+                    ):
+                        st.session_state._selected_job_id = jid
+                        st.rerun()
+                with bcol2:
+                    if st.button("🗑 Remove", key=f"del_{jid[:8]}",
+                                 use_container_width=True):
+                        try:
+                            requests.delete(
+                                f"{API_URL}/api/jobs/{jid}",
+                                headers=_api_headers(), timeout=5,
+                            )
+                        except Exception:
+                            pass
+                        if jid == selected_id:
+                            st.session_state._selected_job_id = None
+                        st.rerun()
+
+    # Hidden cancelled jobs — show a small expander with bulk-purge option
+    if cancelled_jobs:
+        with st.expander(f"Cancelled ({len(cancelled_jobs)})", expanded=False):
+            for job in cancelled_jobs[:20]:
+                jid = job["job_id"]
+                fname = job.get("filename", "unknown.pdf")
+                fname_short = fname if len(fname) <= 28 else fname[:25] + "..."
+                col1, col2 = st.columns([4, 1])
+                col1.caption(f"🚫 {fname_short}")
+                with col2:
+                    if st.button("✕", key=f"purge_{jid[:8]}",
+                                 help="Permanently remove from DB"):
+                        try:
+                            requests.delete(
+                                f"{API_URL}/api/jobs/{jid}",
+                                headers=_api_headers(), timeout=5,
+                            )
+                            # Hard-delete (cancelled status already; need a hard purge endpoint)
+                        except Exception:
+                            pass
+                        st.rerun()
+            if st.button("Clear all cancelled", key="purge_all_cancelled",
+                         use_container_width=True):
+                for job in cancelled_jobs:
+                    try:
+                        requests.delete(
+                            f"{API_URL}/api/jobs/{job['job_id']}",
+                            headers=_api_headers(), timeout=5,
+                        )
+                    except Exception:
+                        pass
+                st.rerun()
+
+    # ==========================================================================
+    # Configuration
+    # ==========================================================================
+    st.markdown("---")
+    st.markdown("### ⚙️ Configuration")
     use_ade = st.toggle("Use ADE (LandingAI)", value=True, key="use_ade_toggle")
     enable_measurement = st.toggle("Unified Measurements", value=True, key="unified_measurement_toggle",
                                    help="Auto-detect fence lines and interactively select/draw additional lines")
@@ -197,7 +394,7 @@ with st.sidebar:
 
     # Fence Keywords
     st.markdown("---")
-    st.subheader("Fence Keywords")
+    st.markdown("### 🔍 Fence Keywords")
     kw_str = st.text_area(
         "Custom keywords (one per line):",
         "\n".join(st.session_state.fence_keywords_app),
@@ -227,89 +424,6 @@ with st.sidebar:
         st.caption(
             "Cancels the selected job and returns to upload. Other jobs are unaffected."
         )
-
-    # My Jobs sidebar
-    st.markdown("---")
-    st.subheader("My Jobs")
-
-    jobs_data = _api_get("/api/jobs")
-    jobs = jobs_data.get("jobs", []) if jobs_data else []
-
-    if not jobs:
-        st.caption("No jobs yet. Upload a PDF to start.")
-
-    _any_active = False
-    for job in jobs[:10]:
-        status = job.get("status", "?")
-        fname = job.get("filename", "unknown.pdf")
-        if len(fname) > 25:
-            fname = fname[:22] + "..."
-
-        age_s = max(0, int(time.time()) - job.get("created_at", 0))
-        if age_s < 3600:
-            age_str = f"{age_s // 60}m ago"
-        elif age_s < 86400:
-            age_str = f"{age_s // 3600}h ago"
-        else:
-            age_str = f"{age_s // 86400}d ago"
-
-        icons = {"queued": "⏳", "running": "🔄", "completed": "✅",
-                 "failed": "❌", "cancelled": "🚫"}
-        icon = icons.get(status, "❔")
-
-        prog_text = ""
-        if status in ("running", "queued"):
-            _any_active = True
-            prog = job.get("progress")
-            if prog:
-                prog_text = f" {prog.get('pct', 0)}%"
-            elif status == "queued":
-                qp = job.get("queue_position")
-                if qp:
-                    prog_text = f" #{qp} in queue"
-
-        pages_text = ""
-        if job.get("total_pages"):
-            pages_text = f" | {job['total_pages']}p"
-            if job.get("fence_count") is not None:
-                pages_text += f", {job['fence_count']} fence"
-
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            label = f"{icon} **{fname}**{pages_text}\n\n`{status}{prog_text}` | {age_str}"
-            if st.button(label, key=f"job_{job['job_id'][:8]}", use_container_width=True):
-                st.session_state._selected_job_id = job["job_id"]
-                st.rerun()
-
-        with col2:
-            if status == "completed":
-                hl_path = job_registry.get_highlighted_pdf_path(job["job_id"])
-                if hl_path:
-                    try:
-                        st.download_button(
-                            "PDF", hl_path.read_bytes(),
-                            file_name=f"fence_{fname}",
-                            mime="application/pdf",
-                            key=f"dl_{job['job_id'][:8]}",
-                        )
-                    except Exception:
-                        pass
-            elif status in ("queued", "running"):
-                if st.button("Cancel", key=f"cancel_{job['job_id'][:8]}"):
-                    try:
-                        requests.delete(f"{API_URL}/api/jobs/{job['job_id']}",
-                                       headers=_api_headers(), timeout=5)
-                    except Exception:
-                        pass
-                    st.rerun()
-            elif status == "cancelled":
-                if st.button("X", key=f"del_{job['job_id'][:8]}"):
-                    try:
-                        requests.delete(f"{API_URL}/api/jobs/{job['job_id']}",
-                                       headers=_api_headers(), timeout=5)
-                    except Exception:
-                        pass
-                    st.rerun()
 
     if _any_active:
         st.caption("_Refreshing in 5s..._")

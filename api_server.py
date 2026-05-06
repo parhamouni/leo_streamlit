@@ -456,16 +456,38 @@ async def delete_job(
     job_id: str,
     x_user_id: str = Header("anonymous", alias="X-User-Id"),
 ):
-    """Cancel a queued job or mark a completed job as cancelled."""
+    """Cancel a running/queued job, or hard-delete a terminal one.
+
+    - queued/running → mark cancelled (job loop will skip it)
+    - cancelled/failed/completed → hard-delete row + remove disk results
+    """
     job = job_registry.get_job(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
     if job["user_id"] != x_user_id:
         raise HTTPException(403, "Access denied")
 
-    job_registry.update_job(job_id, status="cancelled",
-                             completed_at=int(time.time()))
-    return {"status": "cancelled"}
+    status = job.get("status")
+    if status in ("queued", "running"):
+        job_registry.update_job(job_id, status="cancelled",
+                                completed_at=int(time.time()))
+        return {"status": "cancelled"}
+
+    # Terminal state → hard delete
+    rdir = job.get("results_dir")
+    if rdir:
+        try:
+            shutil.rmtree(rdir, ignore_errors=True)
+        except Exception:
+            pass
+    pdf_path = job.get("pdf_path")
+    if pdf_path:
+        try:
+            Path(pdf_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+    job_registry.delete_job(job_id)
+    return {"status": "deleted"}
 
 
 @app.get("/api/healthz")
