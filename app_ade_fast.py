@@ -432,21 +432,25 @@ with st.sidebar:
 
 
 # ==============================================================================
-# Main Area
+# Main Area — two modes: Upload (no job selected) OR Job View (a job is open)
 # ==============================================================================
 
-# PDF Upload (multi-file)
-st.markdown("---")
-uploaded_files = st.file_uploader(
-    "Upload one or more Engineering PDFs",
-    type=["pdf"],
-    accept_multiple_files=True,
-    key=f"pdf_upload_{st.session_state.get('uploader_counter', 0)}",
-    help="Drag in multiple files; each will queue as a separate job and process in order.",
-)
+_selected_job_id_top = st.session_state.get("_selected_job_id")
 
-if uploaded_files:
-    # Validate sizes; collect (name, bytes, size_mb) for the submit step
+
+def _render_upload_section():
+    st.markdown("---")
+    uploaded_files = st.file_uploader(
+        "Upload one or more Engineering PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key=f"pdf_upload_{st.session_state.get('uploader_counter', 0)}",
+        help="Drag in multiple files; each will queue as a separate job and process in order.",
+    )
+
+    if not uploaded_files:
+        return
+
     valid_files = []
     oversize_files = []
     for f in uploaded_files:
@@ -462,63 +466,71 @@ if uploaded_files:
             f"`{name}` is too large ({smb:.0f} MB). Max is {cfg.MAX_PDF_MB} MB. Skipped."
         )
 
-    if valid_files:
-        total_mb = sum(s for _, _, s in valid_files)
+    if not valid_files:
+        return
+
+    total_mb = sum(s for _, _, s in valid_files)
+    st.success(
+        f"Ready to analyze **{len(valid_files)}** file(s) "
+        f"({total_mb:.1f} MB total)"
+    )
+    with st.expander("Files to submit", expanded=(len(valid_files) <= 5)):
+        for name, _b, smb in valid_files:
+            st.markdown(f"- 📄 `{name}` — {smb:.1f} MB")
+
+    btn_label = (
+        "Analyze PDF" if len(valid_files) == 1
+        else f"Analyze {len(valid_files)} PDFs"
+    )
+    if not st.button(btn_label, type="primary", key="analyze_btn"):
+        return
+
+    config_payload = {
+        "analysis_model": cfg.ANALYSIS_MODEL,
+        "classifier_model": cfg.CLASSIFIER_MODEL,
+        "fence_keywords": st.session_state.fence_keywords_app,
+        "use_ade": st.session_state.get("use_ade_toggle", True),
+        "highlight_fence_text": st.session_state.get("highlight_toggle", True),
+        "enable_unified_measurement": st.session_state.get("unified_measurement_toggle", True),
+        "enable_nonlayer_suggestions": st.session_state.get("nonlayer_suggestions_toggle", False),
+    }
+    submitted_ids = []
+    failed_files = []
+    progress_bar = st.progress(0.0, text="Submitting jobs...")
+    for i, (name, pdf_bytes, _smb) in enumerate(valid_files):
+        progress_bar.progress(
+            (i + 1) / len(valid_files),
+            text=f"Submitting {i + 1}/{len(valid_files)}: {name}",
+        )
+        result = _api_post_file("/api/jobs", pdf_bytes, name, config_payload)
+        if result and result.get("job_id"):
+            submitted_ids.append(result["job_id"])
+        else:
+            err = (result or {}).get("error") or "unknown error"
+            failed_files.append((name, err))
+    progress_bar.empty()
+
+    for name, err in failed_files:
+        st.error(f"`{name}`: {err}")
+
+    if submitted_ids:
+        st.session_state._selected_job_id = submitted_ids[0]
+        st.session_state.uploader_counter = (
+            st.session_state.get("uploader_counter", 0) + 1
+        )
         st.success(
-            f"Ready to analyze **{len(valid_files)}** file(s) "
-            f"({total_mb:.1f} MB total)"
+            f"Submitted **{len(submitted_ids)}** job(s). "
+            f"Opening the first one — others are queued and visible in the sidebar."
         )
-        with st.expander("Files to submit", expanded=(len(valid_files) <= 5)):
-            for name, _b, smb in valid_files:
-                st.markdown(f"- 📄 `{name}` — {smb:.1f} MB")
+        time.sleep(1)
+        st.rerun()
+    elif not failed_files:
+        st.error("Failed to submit. Is the API server running?")
 
-        btn_label = (
-            "Analyze PDF" if len(valid_files) == 1
-            else f"Analyze {len(valid_files)} PDFs"
-        )
-        if st.button(btn_label, type="primary", key="analyze_btn"):
-            config_payload = {
-                "analysis_model": cfg.ANALYSIS_MODEL,
-                "classifier_model": cfg.CLASSIFIER_MODEL,
-                "fence_keywords": st.session_state.fence_keywords_app,
-                "use_ade": st.session_state.get("use_ade_toggle", True),
-                "highlight_fence_text": st.session_state.get("highlight_toggle", True),
-                "enable_unified_measurement": st.session_state.get("unified_measurement_toggle", True),
-                "enable_nonlayer_suggestions": st.session_state.get("nonlayer_suggestions_toggle", False),
-            }
-            submitted_ids = []
-            failed_files = []
-            progress_bar = st.progress(0.0, text="Submitting jobs...")
-            for i, (name, pdf_bytes, _smb) in enumerate(valid_files):
-                progress_bar.progress(
-                    (i + 1) / len(valid_files),
-                    text=f"Submitting {i + 1}/{len(valid_files)}: {name}",
-                )
-                result = _api_post_file("/api/jobs", pdf_bytes, name, config_payload)
-                if result and result.get("job_id"):
-                    submitted_ids.append(result["job_id"])
-                else:
-                    err = (result or {}).get("error") or "unknown error"
-                    failed_files.append((name, err))
-            progress_bar.empty()
 
-            for name, err in failed_files:
-                st.error(f"`{name}`: {err}")
-
-            if submitted_ids:
-                # Auto-open the first submitted job so user sees its progress
-                st.session_state._selected_job_id = submitted_ids[0]
-                st.session_state.uploader_counter = (
-                    st.session_state.get("uploader_counter", 0) + 1
-                )
-                st.success(
-                    f"Submitted **{len(submitted_ids)}** job(s). "
-                    f"Opening the first one — others are queued and visible in the sidebar."
-                )
-                time.sleep(1)
-                st.rerun()
-            elif not failed_files:
-                st.error("Failed to submit. Is the API server running?")
+# Render the upload section ONLY when no job is selected
+if not _selected_job_id_top:
+    _render_upload_section()
 
 
 # ==============================================================================
@@ -565,13 +577,6 @@ def _show_results(results: dict, job: dict):
             key="dl_highlighted_main",
             type="primary",
         )
-
-    # New Analysis button
-    st.markdown("---")
-    if st.button("New Analysis", type="primary", key="new_analysis_btn"):
-        st.session_state._selected_job_id = None
-        st.session_state.uploader_counter = st.session_state.get("uploader_counter", 0) + 1
-        st.rerun()
 
     # Fence pages with tabs
     if fence_pages:
@@ -881,19 +886,33 @@ selected_job_id = st.session_state.get("_selected_job_id")
 if selected_job_id:
     job_data = _api_get(f"/api/jobs/{selected_job_id}")
     if job_data is None:
-        st.warning("Job not found.")
-        st.session_state._selected_job_id = None
+        st.warning("Job not found — it may have expired or been removed.")
+        if st.button("← Back to upload", key="back_after_404"):
+            st.session_state._selected_job_id = None
+            st.rerun()
     else:
         status = job_data.get("status", "?")
         filename = job_data.get("filename", "unknown.pdf")
 
+        # Header: filename + back link + status badge
+        head_l, head_r = st.columns([4, 1])
+        with head_l:
+            st.markdown(f"### 📄 {filename}")
+        with head_r:
+            if st.button("← New upload", key="back_to_upload",
+                         use_container_width=True):
+                st.session_state._selected_job_id = None
+                st.rerun()
         st.markdown("---")
-        st.subheader(f"Job: {filename}")
 
         if status == "queued":
             qp = job_data.get("queue_position", "?")
-            st.info(f"Queued (position #{qp}). Waiting for worker...")
-            if st.button("Cancel Job", key="cancel_queued"):
+            st.info(f"⏳ **Queued** — position #{qp}. Waiting for worker...")
+            st.caption(
+                "This page auto-refreshes. You can close the tab and come back later — "
+                "the job will keep going."
+            )
+            if st.button("Cancel this job", key="cancel_queued"):
                 requests.delete(f"{API_URL}/api/jobs/{selected_job_id}",
                                headers=_api_headers(), timeout=5)
                 st.session_state._selected_job_id = None
@@ -903,7 +922,10 @@ if selected_job_id:
 
         elif status == "running":
             _render_running(selected_job_id, job_data)
-            if st.button("Cancel Job", key="cancel_running"):
+            st.caption(
+                "Auto-refreshes every few seconds. Safe to close the tab and come back."
+            )
+            if st.button("Cancel this job", key="cancel_running"):
                 requests.delete(f"{API_URL}/api/jobs/{selected_job_id}",
                                headers=_api_headers(), timeout=5)
                 st.session_state._selected_job_id = None
@@ -912,7 +934,7 @@ if selected_job_id:
             st.rerun()
 
         elif status == "failed":
-            st.error(f"Analysis failed: {job_data.get('error_msg', 'Unknown error')}")
+            st.error(f"❌ Analysis failed: {job_data.get('error_msg', 'Unknown error')}")
             if st.button("New Analysis", key="new_after_fail"):
                 st.session_state._selected_job_id = None
                 st.rerun()
@@ -925,13 +947,13 @@ if selected_job_id:
                 _show_results(results, job_data)
 
         elif status == "cancelled":
-            st.warning("This job was cancelled.")
+            st.warning("🚫 This job was cancelled.")
             if st.button("New Analysis", key="new_after_cancel"):
                 st.session_state._selected_job_id = None
                 st.rerun()
 
-elif not st.session_state.get("_selected_job_id"):
-    st.info("Upload a PDF to begin analysis, or select a job from the sidebar.")
+else:
+    st.info("Upload a PDF above to begin analysis, or select a job from the sidebar.")
 
 
 # Job registry cleanup
