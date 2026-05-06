@@ -147,6 +147,14 @@ def _mem_mb() -> float:
     return psutil.Process().memory_info().rss / (1024 * 1024)
 
 
+def _text_to_lines(text: str, source: str = "pdf") -> list[dict]:
+    """Convert plain text into structured line dicts for scan_page_for_keywords_fast."""
+    return [
+        {"text": line, "x0": 0, "y0": 0, "x1": 0, "y1": 0, "source": source}
+        for line in text.split("\n") if line.strip()
+    ]
+
+
 def run_analysis(
     pdf_path: str,
     config: PipelineConfig,
@@ -274,16 +282,21 @@ def run_analysis(
                     try:
                         batch_pdf = ade.safe_multi_page_pdf_from_path(
                             pdf_path_str, batch,
-                            max_bytes=cfg.OCR_BATCH_TARGET_BYTES,
+                            per_page_max_bytes=cfg.OCR_BATCH_TARGET_BYTES,
                         )
-                        ocr_results = ade.run_google_ocr_blocks_multipage(
+                        dims_by_local = {}
+                        for local_idx, pi in enumerate(batch):
+                            d = page_dims.get(str(pi), {})
+                            dims_by_local[local_idx] = (
+                                d.get("width", 612), d.get("height", 792))
+                        result_by_local = ade.run_google_ocr_blocks_multipage(
                             batch_pdf, config.google_cloud_config,
-                            expected_pages=len(batch),
+                            dims_by_local,
                         )
                         for local_idx, pi in enumerate(batch):
-                            text = ""
-                            if local_idx < len(ocr_results):
-                                text = ocr_results[local_idx].get("text", "")
+                            lines = result_by_local.get(local_idx, [])
+                            text = " ".join(
+                                ln.get("text", "") for ln in lines).strip()
                             ocr_texts_by_page[str(pi)] = text
                             fence_cache.put("phase1b", pdf_hash, params,
                                            {"ocr_text": text}, page_idx=pi,
@@ -292,10 +305,15 @@ def run_analysis(
                         log.warning(f"Phase 1b batch OCR failed: {e}")
                         for pi in batch:
                             try:
-                                page_pdf = ade.create_single_page_pdf(pdf_path_str, pi)
-                                ocr_result = ade.run_google_ocr_blocks(
-                                    page_pdf, config.google_cloud_config)
-                                text = ocr_result.get("text", "") if ocr_result else ""
+                                page_pdf = ade.create_single_page_pdf_from_path(
+                                    pdf_path_str, pi)
+                                d = page_dims.get(str(pi), {})
+                                ocr_lines = ade.run_google_ocr_blocks(
+                                    page_pdf, config.google_cloud_config,
+                                    d.get("width", 612), d.get("height", 792))
+                                text = " ".join(
+                                    ln.get("text", "") for ln in ocr_lines
+                                ).strip()
                                 ocr_texts_by_page[str(pi)] = text
                                 fence_cache.put("phase1b", pdf_hash, params,
                                                {"ocr_text": text}, page_idx=pi,
@@ -338,9 +356,10 @@ def run_analysis(
             keyword_hits: dict[int, bool] = {}
             llm_needed: list[int] = []
             for pi in pages_to_classify:
-                text = merged_texts.get(str(pi), "")
-                kw_result = ade.scan_page_for_keywords_fast(text, config.fence_keywords)
-                if kw_result.get("has_fence_keywords"):
+                pdf_lines = _text_to_lines(page_texts.get(str(pi), ""), "pdf")
+                ocr_lines = _text_to_lines(ocr_texts_by_page.get(str(pi), ""), "ocr")
+                kw_result = ade.scan_page_for_keywords_fast(pdf_lines, ocr_lines, config.fence_keywords)
+                if kw_result.get("has_keywords"):
                     keyword_hits[pi] = True
                     fence_page_indices.append(pi)
                     fence_cache.put("phase1c", pdf_hash, params,
@@ -353,11 +372,16 @@ def run_analysis(
                 batch_size = cfg.CLASSIFY_BATCH_SIZE
                 for batch_start in range(0, len(llm_needed), batch_size):
                     batch = llm_needed[batch_start:batch_start + batch_size]
-                    batch_texts = [merged_texts.get(str(pi), "")[:2000] for pi in batch]
+                    batch_pages = [
+                        (pi, merged_texts.get(str(pi), "")[:2000], [])
+                        for pi in batch
+                    ]
                     try:
                         results = ade.llm_classify_pages_batch(
-                            batch_texts, llm_classifier, keywords=config.fence_keywords)
-                        for pi, is_fence in zip(batch, results):
+                            llm_classifier, batch_pages, config.fence_keywords)
+                        for pi in batch:
+                            page_cls = results.get(pi, {})
+                            is_fence = page_cls.get("is_fence_related", False)
                             if is_fence:
                                 fence_page_indices.append(pi)
                             else:
@@ -417,12 +441,14 @@ def run_analysis(
                         )
                         if page_pdf is None:
                             page_pdf = ade.create_single_page_pdf(pdf_path_str, pi)
-                        chunks = ade.ade_parse_document(
+                        resp = ade.ade_parse_document(
                             page_pdf, config.ade_api_key)
                         dims = page_dims.get(str(pi), {})
-                        if chunks and dims:
+                        chunks = []
+                        if resp and resp.get("success") and dims:
                             chunks = ade.align_ade_chunks_to_page(
-                                chunks, dims.get("width", 612),
+                                resp, 0,
+                                dims.get("width", 612),
                                 dims.get("height", 792))
                         fence_cache.put("phase2", pdf_hash, params,
                                        {"chunks": chunks}, page_idx=pi,
@@ -476,14 +502,19 @@ def run_analysis(
             page_result["ade_chunks"] = chunks
 
             if chunks:
-                segmented = ade.segment_chunks(chunks)
-                page_result["definitions"] = segmented.get("definitions", [])
-                page_result["instances"] = segmented.get("instances", [])
-                page_result["keyword_matches"] = segmented.get("keyword_matches", [])
+                legend_chunks, figure_chunks = ade.segment_chunks(chunks)
+                page_result["definitions"] = legend_chunks
+                page_result["instances"] = figure_chunks
+                page_result["keyword_matches"] = []
             else:
                 page_result["definitions"] = []
                 page_result["instances"] = []
                 page_result["keyword_matches"] = []
+
+            legend_chunks = page_result.get("definitions", [])
+            figure_chunks = page_result.get("instances", [])
+            pdf_lines = _text_to_lines(page_texts.get(str(pi), ""), "pdf")
+            ocr_lines = _text_to_lines(ocr_texts_by_page.get(str(pi), ""), "ocr")
 
             # Legend extraction
             cached_legend = fence_cache.get("phase3_legend", pdf_hash, params,
@@ -493,7 +524,10 @@ def run_analysis(
             elif llm_analysis and chunks:
                 try:
                     legend_entries = ade.extract_legend_entries(
-                        chunks, text, llm_analysis)
+                        legend_chunks, pdf_lines, ocr_lines,
+                        config.fence_keywords, llm_analysis,
+                        figure_chunks=figure_chunks,
+                    )
                     page_result["legend_entries"] = legend_entries
                     fence_cache.put("phase3_legend", pdf_hash, params,
                                    {"entries": legend_entries}, page_idx=pi,
@@ -511,8 +545,9 @@ def run_analysis(
                 page_result["scale_info"] = cached_scale
             else:
                 try:
+                    page_obj = doc[pi]
                     scale_info = verify_scale_with_bar_fast(
-                        doc, pi, text,
+                        page_obj,
                         llm=llm_scale or llm_analysis,
                     )
                     page_result["scale_info"] = scale_info or {}
@@ -530,12 +565,16 @@ def run_analysis(
                 page_result["measurements"] = cached_measure
             elif config.enable_unified_measurement:
                 try:
+                    page_obj = doc[pi]
+                    scale_val = (page_result.get("scale_info") or {}).get("verified_scale") or \
+                                (page_result.get("scale_info") or {}).get("text_scale")
                     measurements = ade.measure_fence_elements(
-                        doc, pi, text, chunks,
-                        page_result.get("legend_entries", []),
-                        page_result.get("scale_info", {}),
+                        page_obj, legend_chunks, figure_chunks,
+                        figure_chunks=figure_chunks,
                         llm=llm_analysis,
-                        classifier_llm=llm_classifier,
+                        scale_factor=scale_val,
+                        ocr_text=text,
+                        light_llm=llm_classifier,
                     )
                     page_result["measurements"] = measurements or {}
                     fence_cache.put("phase3_measure", pdf_hash, params,
@@ -591,16 +630,19 @@ def run_analysis(
         if llm_analysis and fence_results:
             try:
                 progress("details", 97, "Extracting element details...")
-                all_texts = [r.get("fence_text", "") for r in fence_results]
-                combined = "\n\n".join(all_texts)[:8000]
-                details_llm = ChatOpenAI(
-                    model=config.analysis_model,
-                    temperature=0,
-                    openai_api_key=config.openai_api_key,
-                    timeout=300,
-                    max_retries=1,
-                )
-                element_details = ade.extract_element_details(combined, details_llm)
+                element_names = set()
+                for r in fence_results:
+                    for defn in r.get("definitions", []):
+                        name = defn.get("text", "")[:80]
+                        if name:
+                            element_names.add(name)
+                if element_names:
+                    all_page_texts = {}
+                    for r in fence_results:
+                        pi = r.get("page_idx", 0)
+                        all_page_texts[pi] = merged_texts.get(str(pi), "")
+                    element_details = ade.extract_element_details(
+                        llm_analysis, list(element_names)[:20], all_page_texts)
             except Exception as e:
                 log.warning(f"Element details extraction failed: {e}")
 
