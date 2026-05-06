@@ -25,13 +25,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pickle
 import shutil
 import tempfile
 import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-CACHE_SCHEMA_VERSION = "v4"  # v4: pickle removed, all phases use JSON
+CACHE_SCHEMA_VERSION = "v5"  # v5: restored pickle for typed-object phases
 
 # Phases that cache per-page. `phase1a` is whole-document (text + vector
 # lines come out of one subprocess call), so it has no page granularity.
@@ -46,9 +47,15 @@ _PER_PAGE_PHASES = {
 }
 _WHOLE_DOC_PHASES = {"phase1a"}
 
-# All phases now use JSON. Pickle was removed to eliminate deserialization
-# risk from untrusted cache files.
-_PICKLE_PHASES: set[str] = set()
+# Phases whose values contain typed Python objects (e.g. VectorLine instances
+# with .start / .end / .length_pts attributes, fitz Rects, ADE chunk dicts).
+# These must be pickled — JSON loses the type information and downstream
+# attribute access blows up.
+#
+# Pickle here is safe because the cache files are written and read by the
+# same trusted process, on a path the user controls (~/.cache/fence_ade).
+# We never load pickle data from untrusted sources.
+_PICKLE_PHASES: set[str] = {"phase1a", "phase1b", "phase2", "phase3_measure"}
 
 # --- Ephemeral per-session cache ---
 # Policy: a cache entry is only ever useful while processing one PDF. Once
@@ -171,6 +178,8 @@ def get(phase: str, pdf_sha256: str, params: str,
             return None
         with open(path, "rb") as f:
             data = f.read()
+        if phase in _PICKLE_PHASES:
+            return pickle.loads(data)
         return json.loads(data.decode("utf-8"))
     except Exception as e:
         print(f"[fence_cache] get({phase}, page={page_idx}) failed: {e}")
@@ -183,7 +192,10 @@ def put(phase: str, pdf_sha256: str, params: str, value: Any,
     """Write value to the cache. Logs and swallows errors (cache is best-effort)."""
     try:
         path = _entry_path(pdf_sha256, phase, params, page_idx, user_scope=user_scope)
-        data = json.dumps(value, default=str).encode("utf-8")
+        if phase in _PICKLE_PHASES:
+            data = pickle.dumps(value, protocol=5)
+        else:
+            data = json.dumps(value, default=str).encode("utf-8")
         _atomic_write_bytes(path, data)
     except Exception as e:
         print(f"[fence_cache] put({phase}, page={page_idx}) failed: {e}")
