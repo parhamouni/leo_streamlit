@@ -269,6 +269,29 @@ async def create_job(
     if not pdf_bytes:
         raise HTTPException(400, "Empty PDF file")
 
+    size_mb = len(pdf_bytes) / (1024 * 1024)
+    if size_mb > cfg.MAX_PDF_MB:
+        raise HTTPException(
+            413,
+            f"File too large ({size_mb:.0f} MB). Max is {cfg.MAX_PDF_MB} MB.",
+        )
+
+    # Peek page count before queueing
+    try:
+        import fitz as _fitz
+        _doc = _fitz.open(stream=pdf_bytes, filetype="pdf")
+        n_pages = _doc.page_count
+        _doc.close()
+    except Exception as e:
+        raise HTTPException(400, f"Could not read PDF: {e}")
+
+    if n_pages > cfg.MAX_PAGES:
+        raise HTTPException(
+            413,
+            f"PDF has {n_pages} pages (max {cfg.MAX_PAGES}). "
+            "Please split the document by page range.",
+        )
+
     upload_dir = Path(cfg.PDF_TMP_DIR) / x_user_id
     upload_dir.mkdir(parents=True, exist_ok=True)
 
