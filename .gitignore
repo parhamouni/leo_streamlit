@@ -53,6 +53,13 @@ data/
 *.tmp
 temp/
 
+# Local backups + Claude Code worktree state
+*.bak
+.claude/
+
+# Job runtime data
+.leo/
+
 # Archive (keep in repo but mark for reference)
 # archive/
 
