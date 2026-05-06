@@ -52,6 +52,50 @@ def get_user_id() -> str:
     return f"dev_{get_session_id()}"
 
 
+def _render_oidc_landing():
+    """Welcome / sign-in page shown to unauthenticated visitors."""
+    st.markdown(
+        """
+        <div style='text-align:center; padding: 2rem 0 1rem 0;'>
+            <h1 style='margin-bottom:0.25rem;'>ADE Fence Detection</h1>
+            <p style='color:#6B7280; font-size:1.05rem; margin-top:0;'>
+                Automatic fence + measurement extraction from engineering drawings.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    col_l, col_c, col_r = st.columns([1, 2, 1])
+    with col_c:
+        with st.container(border=True):
+            st.markdown("### Welcome")
+            st.markdown(
+                "Upload an engineering PDF and this tool will:\n"
+                "- detect fence-related pages,\n"
+                "- extract fence definitions, instances, and dimensions,\n"
+                "- compute total fence length per category,\n"
+                "- generate a highlighted PDF + Excel report."
+            )
+            st.markdown("---")
+            st.markdown(
+                "**Sign in with your Google account to continue.** "
+                "Your jobs and results are private to your account and "
+                "kept for 24 hours."
+            )
+            if st.button("🔐 Sign in with Google",
+                         type="primary", use_container_width=True,
+                         key="_oidc_login_btn"):
+                st.login("google")
+
+    st.markdown(
+        "<p style='text-align:center; color:#9CA3AF; font-size:0.85rem; margin-top:2rem;'>"
+        "We only use your email to identify your jobs. Nothing else is stored."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+
 def _streamlit_password_gate():
     if st.session_state.get("_auth_ok"):
         return
@@ -89,9 +133,7 @@ def require_auth():
     if cfg.AUTH_MODE == "streamlit_oidc":
         try:
             if not st.user.is_logged_in:
-                st.title("Leo Fence Detection")
-                st.markdown("Sign in with your Google account to continue.")
-                st.login("google")
+                _render_oidc_landing()
                 st.stop()
         except AttributeError:
             pass

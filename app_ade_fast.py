@@ -33,11 +33,11 @@ try:
 except Exception:
     pass
 
+# Auth gate (renders its own landing page for unauthenticated visitors)
+require_auth()
+
 st.markdown("<h1 style='text-align:center;'>ADE Fence Detection in Engineering Drawings</h1>",
             unsafe_allow_html=True)
-
-# Auth gate
-require_auth()
 
 # Session init
 session_id = get_session_id()
