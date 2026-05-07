@@ -4,6 +4,21 @@
 
 ---
 
+## Git workflow
+
+- **`main`** is the single source of truth. It is protected — direct pushes are not allowed; changes land via PR.
+- **Feature work** branches off `main` as `feat/<short-name>` (e.g. `feat/utils-ade-split`, `feat/cli`) and merges back via PR.
+- **Hotfixes for `app_ade_prod.py`** (the live production app served by `fence-fast.service`) branch off the `prod-2026-05-07` tag as `hotfix/prod-<date>` and merge back to `main`. Do not touch `app_ade_prod.py` outside of this lane.
+- **Tags worth knowing**:
+  - `prod-2026-05-07` — exact source of `app_ade_prod.py` + `ops/analysis_worker.py` as deployed on 2026-05-07.
+  - `archive/main-monolith-2026-05-07` — frozen reference to the old `app.py` monolith line of work (replaced by current `main`).
+  - `archive/ocr-improvement` — frozen reference to a defunct OCR experiment branch.
+- **Long-lived branch policy**: there are no long-lived branches besides `main` and `prod-snapshot/<date>`. Old `working-backup`, `fast-clean`, `claude/*`, etc. were retired in the 2026-05-07 cleanup.
+
+> Note: this README's **Repository Structure** and **Key Files** sections below still reflect the old monolith layout. They are scheduled for rewrite in Phase 3 of the refactor (see `/home/ubuntu/.claude/plans/how-to-refactor-and-groovy-mist.md`).
+
+---
+
 ## 📁 Repository Structure (After Cleanup)
 
 ```

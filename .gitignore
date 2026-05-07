@@ -45,9 +45,14 @@ Thumbs.db
 # Logs
 *.log
 
-# Local data
+# Sample / customer PDFs (never commit; production-sensitive content)
 data/
 *.pdf
+incident_pdfs/
+
+# Generated debug images (produced by debug scripts; never commit)
+debug_page_*.png
+debug_*.png
 
 # Temporary files
 *.tmp
@@ -57,43 +62,14 @@ temp/
 *.bak
 .claude/
 
-# Job runtime data
+# Job runtime data (SQLite DB, results dir)
 .leo/
 
-# Archive (keep in repo but mark for reference)
-# archive/
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-archive/
-
+# archive/ IS tracked — historical reference for evaluation harnesses,
+# predecessors, and one-off debug scripts. Subdirectories (predecessors/,
+# evaluation/, debug/, empty_pkg/, ade_backup/) are populated by Phase 2
+# of the refactor.
+#
+# Exception: archive/temp_outputs/ is regenerable test output (visualizations,
+# extraction dumps); ~22 MB, never commit.
+archive/temp_outputs/
