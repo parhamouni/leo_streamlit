@@ -1,144 +1,122 @@
-# 🔍 ADE Fence Detector
+# ADE Fence Detector
 
-**Intelligent fence detection and measurement in engineering/architectural PDF drawings.**
+**Detect, classify, and measure fences in engineering / architectural PDF drawings.**
+
+A B2B tool that ingests construction PDFs, identifies fence-related pages, extracts legend definitions, locates fence indicators on drawings, and calculates fence lengths from the underlying CAD geometry.
 
 ---
 
 ## Git workflow
 
-- **`main`** is the single source of truth. It is protected — direct pushes are not allowed; changes land via PR.
+- **`main`** is the single source of truth. Protected — changes land via PR.
 - **Feature work** branches off `main` as `feat/<short-name>` (e.g. `feat/utils-ade-split`, `feat/cli`) and merges back via PR.
-- **Hotfixes for `app_ade_prod.py`** (the live production app served by `fence-fast.service`) branch off the `prod-2026-05-07` tag as `hotfix/prod-<date>` and merge back to `main`. Do not touch `app_ade_prod.py` outside of this lane.
+- **Hotfixes for `app_ade_prod.py`** (the live production app served by `fence-fast.service`) branch off the `prod-2026-05-07` tag as `hotfix/prod-<date>` and merge back to `main`. Do not edit `app_ade_prod.py` outside of this lane.
 - **Tags worth knowing**:
   - `prod-2026-05-07` — exact source of `app_ade_prod.py` + `ops/analysis_worker.py` as deployed on 2026-05-07.
   - `archive/main-monolith-2026-05-07` — frozen reference to the old `app.py` monolith line of work (replaced by current `main`).
   - `archive/ocr-improvement` — frozen reference to a defunct OCR experiment branch.
-- **Long-lived branch policy**: there are no long-lived branches besides `main` and `prod-snapshot/<date>`. Old `working-backup`, `fast-clean`, `claude/*`, etc. were retired in the 2026-05-07 cleanup.
 
-> Note: this README's **Repository Structure** and **Key Files** sections below still reflect the old monolith layout. They are scheduled for rewrite in Phase 3 of the refactor (see `/home/ubuntu/.claude/plans/how-to-refactor-and-groovy-mist.md`).
+There are no long-lived branches besides `main` and `prod-snapshot/<date>`.
 
 ---
 
-## 📁 Repository Structure (After Cleanup)
+## Repository layout
 
 ```
 leo_streamlit/
-├── app_ade.py          # Main Streamlit application
-├── utils_ade.py        # Core detection utilities
-├── utils_vector.py     # Vector line extraction & measurement
-├── requirements.txt    # Python dependencies
-├── .streamlit/         # Streamlit configuration & secrets
-├── notebooks/          # Development & analysis notebooks
-├── subset_gold/        # Test PDF files
-├── ade_backup/         # Historical backups & experiments
-└── archive/            # Archived old versions & temp outputs
+├── app_ade_prod.py          # LIVE prod Streamlit app (port 8502)  ── do not edit ──
+├── app_ade_fast.py          # Next-gen Streamlit frontend (talks to api_server.py)
+├── api_server.py            # FastAPI backend for the fast stack (port 8503)
+├── pipeline.py              # Streamlit-free analysis engine (Phase 1a → 3)
+├── ops/
+│   ├── analysis_worker.py    #   Phase 1 background worker (used by api_server)
+│   ├── phase3_worker.py      #   Phase 3 subprocess (memory isolation)
+│   ├── highlight_pdf_worker.py
+│   ├── page_extractor.py
+│   ├── systemd/              #   Production unit files
+│   └── watchdog/             #   Health probes
+├── utils_ade.py             # Core detection: ADE API, OCR, LLM, highlighting (3.1 KLOC)
+├── utils_vector.py          # Vector line extraction, scale inference, measurement
+├── umt.py                   # Unified Measurement Tool (interactive UI for Phase 3b)
+├── job_registry.py          # SQLite-backed persistent job queue
+├── fence_cache.py           # Disk cache for intermediate analysis phases
+├── auth.py                  # Pluggable auth (none / OIDC / proxy / password)
+├── config.py                # Central config (env-var-driven dataclass)
+├── state.py                 # Typed Streamlit session state for app_ade_fast.py
+├── exports.py               # PDF + Excel report generation
+├── telemetry.py             # @timed / @checkpoint decorators → JSONL
+├── spend_tracker.py         # Per-user API cost tracking → JSONL
+├── tools/                   # Operator tools (telemetry_report, telemetry_watch)
+├── notebooks/               # Development & analysis notebooks
+├── subset_gold/             # Test PDF fixtures
+├── archive/                 # Historical reference (predecessors, evaluation harnesses, debug)
+├── DEPLOY.md                # Deployment + nginx + systemd setup
+└── requirements.txt
 ```
+
+`archive/` contains:
+- `predecessors/` — `app_ade.py` (older monolith), `app_ade_fast_new.py`, `app_ade_fast_monolith.py` (pre-FastAPI-split backup)
+- `evaluation/` — `fence_evaluator.py`, `fence_detection_comparison.py`, `fence_detector_agentic.py` (research harnesses)
+- `debug/` — `debug_pipeline.py`, `debug_deep.py`, `debug_instances.py`
+- `ade_backup/` — older ADE notebooks and experiments
+- `old_versions/`, `debug_scripts/` — even earlier reference material
 
 ---
 
-## 🚀 System Capabilities
+## Two stacks running side-by-side
 
-### 1. **Multi-Layer Text Extraction**
-- **PDF Native Text**: Extracts embedded text with precise bounding boxes
-- **Google Document AI OCR**: For scanned/image-based content
-- **Coordinate Transformation**: Handles rotated pages (0°, 90°, 180°, 270°)
+| Stack | Status | Process | Port | Talks to API? |
+|---|---|---|---|---|
+| **Prod** | Live for users | `app_ade_prod.py` (Streamlit monolith) | 8502 | No — analysis runs inline |
+| **Fast** | Backend live, frontend not yet cut over | `api_server.py` (FastAPI) + `app_ade_fast.py` (thin Streamlit) | 8503 | Yes — frontend submits jobs |
 
-### 2. **Intelligent Pre-Filtering**
-- **Keyword Scanning**: Word-boundary matching to avoid false positives (e.g., "gate" not in "aggregate")
-- **High-Signal Keywords**: Immediate detection for definitive terms (fence, gate, guardrail, etc.)
-- **LLM Confirmation**: Optional GPT validation for ambiguous pages
-
-### 3. **ADE (LandingAI) Structured Extraction**
-- **Document Parsing**: Sends fence-related pages to ADE API
-- **Chunk Segmentation**: Separates legend chunks from figure/drawing chunks
-- **Legend Entry Extraction**: LLM-powered extraction of indicator→description pairs
-
-### 4. **Instance Detection**
-- **Indicator Matching**: Finds legend indicators (e.g., "1", "F-3") in drawing areas
-- **Figure-Constrained Search**: Only searches within ADE-detected figure regions
-- **Duplicate Filtering**: Excludes matches in legend areas
-
-### 5. **Visual Highlighting**
-| Element | Color | Description |
-|---------|-------|-------------|
-| Definitions | 🟢 Green | Legend entries with fence keywords |
-| Instances | 🟣 Purple | Indicators found in drawings |
-| Keywords | 🟠 Orange | Fallback keyword matches |
-| Fence Lines | 🔵 Cyan | Measured vector lines |
-
-### 6. **Smart Fence Measurement** (Experimental)
-- **Layer Detection**: LLM identifies fence-related CAD layers
-- **Vector Extraction**: Extracts line segments from PDF drawings
-- **Scale Inference**: Auto-detects drawing scale from annotations
-- **Connected-Line Grouping**: Groups continuous fence runs
-- **Per-Indicator Measurement**: Associates lengths with specific fence types
+**Goal:** add features to `app_ade_fast.py` until it has parity with `app_ade_prod.py`, then swap `fence-fast.service`'s `ExecStart=` from `app_ade_prod.py` to `app_ade_fast.py`. See [plans/how-to-refactor-and-groovy-mist.md](.claude/plans/how-to-refactor-and-groovy-mist.md) for the migration sequence.
 
 ---
 
-## 🔧 Detection Pipeline
+## What the system does
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        PDF Upload                                │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  STEP 1: Text Extraction                                        │
-│  • PDF native text lines                                        │
-│  • Google OCR (if configured)                                   │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  STEP 2: Pre-Filter (Keyword + LLM)                             │
-│  • Scan for fence keywords                                      │
-│  • High-signal → immediate pass                                 │
-│  • Low-signal → LLM confirmation                                │
-│  • No keywords → skip page                                      │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                    ┌─────────┴─────────┐
-                    │                   │
-              fence_found=True    fence_found=False
-                    │                   │
-                    ▼                   ▼
-┌──────────────────────────┐    ┌──────────────────┐
-│  STEP 3: ADE Parsing     │    │  Non-Fence Page  │
-│  • Send to LandingAI API │    │  (Skip)          │
-│  • Get structured chunks │    └──────────────────┘
-└──────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  STEP 4: Chunk Processing                                       │
-│  • Segment: legend vs figure chunks                             │
-│  • Extract definitions from legends (LLM)                       │
-│  • Find instances in figures                                    │
-└─────────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  STEP 5: Measurement (Optional)                                 │
-│  • Identify fence layers (LLM)                                  │
-│  • Extract vector lines                                         │
-│  • Calculate lengths per indicator                              │
-└─────────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  STEP 6: Visualization & Output                                 │
-│  • Highlight definitions (green)                                │
-│  • Highlight instances (purple)                                 │
-│  • Generate downloadable PDF                                    │
-└─────────────────────────────────────────────────────────────────┘
-```
+1. **Pre-filter**: scan each PDF page for fence keywords (`fence`, `gate`, `guardrail`, …) with word-boundary matching to avoid false positives like "aggregate".
+2. **OCR + native text**: extract text from PDFs using both PyMuPDF (native) and Google Document AI (scanned). Coordinate transforms handle rotated pages.
+3. **LLM classification**: ambiguous pages go to GPT for confirmation.
+4. **ADE structured extraction**: fence pages are sent to LandingAI's ADE API; chunks are split into legend vs. figure regions.
+5. **Legend extraction**: an LLM extracts indicator → description pairs from legend chunks.
+6. **Instance detection**: indicators are located in figure regions, excluding legend areas.
+7. **Measurement**: vector lines are extracted from the PDF; an LLM identifies fence-related CAD layers; scale is inferred from text or a scale bar; lengths are calculated per indicator.
+8. **Visualization**: highlighted PDF + Excel report.
+
+Output highlight colors:
+| Element | Color |
+|---|---|
+| Definitions (legend entries) | Green |
+| Instances (indicators in drawings) | Purple |
+| Keyword matches (fallback) | Orange |
+| Measured fence lines | Cyan |
 
 ---
 
-## ⚙️ Configuration
+## Local development
 
-### Required Secrets (`.streamlit/secrets.toml`)
+```bash
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+
+# Copy + fill in API keys
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml
+
+# Run the prod monolith locally on a non-prod port
+./venv/bin/streamlit run app_ade_prod.py --server.port 8510
+
+# Or run the fast stack locally
+./venv/bin/uvicorn api_server:app --port 8513 &
+./venv/bin/streamlit run app_ade_fast.py --server.port 8511
+```
+
+For deployment (nginx + systemd), see [DEPLOY.md](DEPLOY.md).
+
+---
+
+## Required secrets (`.streamlit/secrets.toml`)
 
 ```toml
 OPENAI_API_KEY = "sk-..."
@@ -151,48 +129,17 @@ processor_id = "abc123..."
 
 [gcp_service_account]
 type = "service_account"
-project_id = "your-project"
 # ... full service account JSON
+
+[auth]
+# Only required for FENCE_AUTH_MODE=streamlit_oidc
+client_id = "..."
+client_secret = "..."
+redirect_uri = "https://your-host/oauth2callback"
 ```
 
-### Sidebar Options
-- **🔍 Highlight text & indicators**: Toggle visual highlighting
-- **🧠 Use ADE (LandingAI)**: Enable/disable ADE API calls
-- **Fence Keywords**: Customizable keyword list
-
 ---
 
-## 📊 Output Formats
-
-1. **Live UI Display**: Real-time page-by-page results with expandable details
-2. **Highlighted PDF Download**: Combined PDF with only fence-related pages
-3. **Per-Page Analysis**: Definitions, instances, keyword matches, measurements
-
----
-
-## 🛠️ Development
-
-### Run the App
-```bash
-streamlit run app_ade.py
-```
-
-### Key Files
-| File | Purpose |
-|------|---------|
-| `app_ade.py` | Streamlit UI, session management, display logic |
-| `utils_ade.py` | ADE API, OCR, text extraction, LLM prompts, highlighting |
-| `utils_vector.py` | PDF vector extraction, line measurement, scale inference |
-
----
-
-## 📝 Version History
-
-- **v2.0** (Current): Pre-filtering, ADE integration, smart measurement
-- **v1.0**: Basic keyword detection with LLM classification
-
----
-
-## 📄 License
+## License
 
 Internal use only.
