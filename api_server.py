@@ -167,6 +167,17 @@ def _run_job(job: dict, keys: dict):
                 is_fence_page=bool(page.get("is_fence_page", False)),
                 result_json=page.get("result_json"),
             )
+            rj = page.get("result_json") or {}
+            phase = rj.get("phase") or (
+                "phase3" if (rj.get("measurements") or rj.get("legend_entries")) else "rich?"
+            )
+            log.info(
+                "page_cb job=%s page=%s fence=%s phase=%s",
+                job_id[:8],
+                page.get("page_number"),
+                page.get("is_fence_page"),
+                phase,
+            )
         except Exception:
             log.exception(f"Job {job_id[:8]}: upsert_page_result failed")
 
