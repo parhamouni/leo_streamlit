@@ -838,13 +838,13 @@ function FencePageCard({
         {/* Page image with fence overlays (lazy-loaded) */}
         {jobId && <PageImage jobId={jobId} pageNum={page.page_num} />}
 
-        {/* Sprint 4 / C1: interactive measurement canvas (read-only for
-            now — checkpoint 4a.3). Click handlers + drawing land in 4a.4. */}
+        {/* Sprint 4 / C1: interactive measurement canvas. */}
         {jobId && (
           <UMTCanvas
             jobId={jobId}
             pageNum={page.page_num}
             legendEntries={legend}
+            skipReason={skipReason ?? null}
           />
         )}
 
@@ -986,10 +986,37 @@ function NonFencePageCard({ page }: { page: NonFencePage }) {
 }
 
 function LegendTable({ rows }: { rows: LegendEntry[] }) {
+  // The extraction pipeline emits one row per real legend entry plus a
+  // duplicate "indicator code" row where keyword == indicator and the
+  // description is the literal "Indicator Code" — pure noise. Drop them.
+  // Also collapse exact (indicator, keyword) duplicates: keep the entry
+  // with the longer description.
+  const visible = (() => {
+    const filtered = rows.filter((r) => {
+      const ind = (r.indicator ?? "").trim();
+      const kw = (r.keyword ?? "").trim();
+      const desc = (r.description ?? "").trim();
+      if (ind && kw && ind === kw) return false;
+      if (desc.toLowerCase() === "indicator code") return false;
+      return true;
+    });
+    const byKey = new Map<string, LegendEntry>();
+    for (const r of filtered) {
+      const key = `${(r.indicator ?? "").trim()}|${(r.keyword ?? "").trim().toUpperCase()}`;
+      const prev = byKey.get(key);
+      if (
+        !prev ||
+        (r.description ?? "").length > (prev.description ?? "").length
+      ) {
+        byKey.set(key, r);
+      }
+    }
+    return Array.from(byKey.values());
+  })();
   return (
     <div>
       <div className="text-xs uppercase text-gray-500 mb-1">
-        Legend definitions ({rows.length})
+        Legend definitions ({visible.length})
       </div>
       <div className="overflow-x-auto border rounded">
         <table className="w-full text-sm">
@@ -1001,7 +1028,7 @@ function LegendTable({ rows }: { rows: LegendEntry[] }) {
             </tr>
           </thead>
           <tbody className="divide-y">
-            {rows.map((r, i) => (
+            {visible.map((r, i) => (
               <tr key={i} className="hover:bg-gray-50">
                 <td className="px-3 py-1.5 align-top font-mono text-xs">
                   {r.indicator || "—"}

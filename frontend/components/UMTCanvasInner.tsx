@@ -21,6 +21,7 @@ type VectorLinesResponse = {
   lines: VectorLine[];
   auto_categories: Record<string, CategoryInfo>;
   auto_assignments: Record<string, string>;
+  source_missing?: boolean;
 };
 
 type UserDrawnLine = {
@@ -65,6 +66,29 @@ function rgb([r, g, b]: [number, number, number], alpha = 1) {
   return `rgba(${r},${g},${b},${alpha})`;
 }
 
+// Drop the pipeline's "indicator code" placeholders (where the keyword is
+// just the indicator number, e.g. "11: 11"). Mirrors `_clean_legend_entries`
+// on the backend so the chip list matches what `auto_categories` returns.
+function isPlaceholderCategory(name: string, info: CategoryInfo): boolean {
+  const ind = (info.indicator ?? "").trim();
+  const kw = (info.keyword ?? "").trim();
+  if (ind && kw && ind === kw) return true;
+  // Defensive fallback when only the name is available.
+  const m = name.match(/^([^:]+):\s*(.+)$/);
+  if (m && m[1].trim() === m[2].trim()) return true;
+  return false;
+}
+
+function cleanCategoryMap(
+  cats: Record<string, CategoryInfo>,
+): Record<string, CategoryInfo> {
+  const out: Record<string, CategoryInfo> = {};
+  for (const [name, info] of Object.entries(cats)) {
+    if (!isPlaceholderCategory(name, info)) out[name] = info;
+  }
+  return out;
+}
+
 function defaultCategoriesFromLegend(
   legend: Array<{ indicator?: string; keyword?: string }>,
 ): Record<string, CategoryInfo> {
@@ -73,6 +97,7 @@ function defaultCategoriesFromLegend(
     const indicator = (le.indicator ?? "").trim();
     const keyword = (le.keyword ?? "").trim();
     if (!keyword) continue;
+    if (indicator && indicator === keyword) continue;
     const name = indicator ? `${indicator}: ${keyword}` : keyword;
     if (cats[name]) continue;
     cats[name] = {
@@ -89,11 +114,13 @@ export default function UMTCanvasInner({
   pageNum,
   legendEntries,
   initiallyOpen = false,
+  skipReason = null,
 }: {
   jobId: string;
   pageNum: number;
   legendEntries: Array<{ indicator?: string; keyword?: string }>;
   initiallyOpen?: boolean;
+  skipReason?: string | null;
 }) {
   const [open, setOpen] = useState(initiallyOpen);
   const [loading, setLoading] = useState(false);
@@ -111,6 +138,26 @@ export default function UMTCanvasInner({
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">(
     "idle",
   );
+  const [drawMode, setDrawMode] = useState(false);
+  const [pendingLine, setPendingLine] = useState<{
+    start: [number, number];
+    end: [number, number];
+  } | null>(null);
+  const [highlightedLayer, setHighlightedLayer] = useState<string | null>(null);
+  const [linePopover, setLinePopover] = useState<
+    | { kind: "vector"; idx: number; x: number; y: number }
+    | { kind: "drawn"; idx: number; x: number; y: number }
+    | null
+  >(null);
+  const [zoom, setZoom] = useState(1.0);
+  const [panMode, setPanMode] = useState(false);
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const panStateRef = useRef<{
+    startX: number;
+    startY: number;
+    scrollLeft: number;
+    scrollTop: number;
+  } | null>(null);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [containerWidth, setContainerWidth] = useState(800);
@@ -143,6 +190,46 @@ export default function UMTCanvasInner({
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
   }, []);
+
+  // Read latest zoom from a ref so the wheel handler doesn't have to
+  // re-bind on every zoom change.
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+
+  // Ctrl/Cmd + wheel zooms around the cursor; plain wheel scrolls
+  // natively. We attach manually with passive: false so we can call
+  // preventDefault to suppress the browser's page-zoom fallback.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el || !open) return;
+    const handler = (e: WheelEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      const rect = el.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      const oldZoom = zoomRef.current;
+      const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+      const newZoom = Math.max(
+        0.25,
+        Math.min(4, +(oldZoom * factor).toFixed(3)),
+      );
+      if (newZoom === oldZoom) return;
+      // Keep the point under the cursor anchored: scrollLeft and
+      // scrollTop adjust so cursorPdfPoint stays at the same screen pos
+      // after zoom changes the content size.
+      const oldContentX = el.scrollLeft + cx;
+      const oldContentY = el.scrollTop + cy;
+      const ratio = newZoom / oldZoom;
+      setZoom(newZoom);
+      requestAnimationFrame(() => {
+        el.scrollLeft = oldContentX * ratio - cx;
+        el.scrollTop = oldContentY * ratio - cy;
+      });
+    };
+    el.addEventListener("wheel", handler, { passive: false });
+    return () => el.removeEventListener("wheel", handler);
+  }, [open, vectorData, bgImage]);
 
   useEffect(() => {
     return () => {
@@ -196,8 +283,8 @@ export default function UMTCanvasInner({
       // Categories: saved wins when non-empty; otherwise prefer the
       // server-built palette (legend + auto-detected fallback bucket),
       // falling back to legend-only as a last resort.
-      const savedCats = existing?.categories ?? {};
-      const autoCats = vecData.auto_categories ?? {};
+      const savedCats = cleanCategoryMap(existing?.categories ?? {});
+      const autoCats = cleanCategoryMap(vecData.auto_categories ?? {});
       const cats =
         Object.keys(savedCats).length > 0
           ? savedCats
@@ -209,10 +296,16 @@ export default function UMTCanvasInner({
       // alone shouldn't block the auto-seed — that was the previous bug.
       const savedAssignments = existing?.line_assignments ?? {};
       const savedDrawn = existing?.user_drawn_lines ?? [];
-      const assignments =
+      const rawAssignments =
         Object.keys(savedAssignments).length > 0 || savedDrawn.length > 0
           ? savedAssignments
           : (vecData.auto_assignments ?? {});
+      // Drop assignments whose target category no longer exists (most
+      // commonly because we just filtered out an indicator-code placeholder).
+      const assignments: Record<string, string> = {};
+      for (const [k, v] of Object.entries(rawAssignments)) {
+        if (cats[v]) assignments[k] = v;
+      }
       setPageState({
         categories: cats,
         line_assignments: assignments,
@@ -223,22 +316,108 @@ export default function UMTCanvasInner({
       const firstCat = Object.keys(cats)[0];
       setActiveCategory(firstCat ?? null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const raw = e instanceof Error ? e.message : String(e);
+      // Common case: backend 404 for pages with no vector data — surface
+      // a friendlier message than "API 404 for /api/jobs/.../page-vector-lines/X".
+      const friendly = /\b404\b/.test(raw)
+        ? "No measurement data is available for this page (the pipeline may have skipped it)."
+        : raw;
+      setError(friendly);
     } finally {
       setLoading(false);
     }
   }
 
-  const scale = useMemo(() => {
+  const baseScale = useMemo(() => {
     if (!vectorData) return 1;
     const targetW = Math.min(containerWidth || 800, 1400);
     return targetW / vectorData.pdf_width;
   }, [vectorData, containerWidth]);
+  const scale = baseScale * zoom;
 
   const stageWidth = vectorData ? vectorData.pdf_width * scale : 0;
   const stageHeight = vectorData ? vectorData.pdf_height * scale : 0;
 
   const minLen = pageState.min_line_pts ?? 20;
+
+  const layerSummary = useMemo(() => {
+    if (!vectorData)
+      return [] as Array<{
+        name: string;
+        count: number;
+        lengthPts: number;
+        dominantCat: string | null;
+      }>;
+    const map = new Map<
+      string,
+      { count: number; lengthPts: number; catCounts: Map<string, number> }
+    >();
+    for (const ln of vectorData.lines) {
+      const k = ln.layer || "(no layer)";
+      const cur = map.get(k) ?? {
+        count: 0,
+        lengthPts: 0,
+        catCounts: new Map<string, number>(),
+      };
+      cur.count += 1;
+      cur.lengthPts += ln.length_pts;
+      const cat = pageState.line_assignments[String(ln.idx)];
+      if (cat) cur.catCounts.set(cat, (cur.catCounts.get(cat) ?? 0) + 1);
+      map.set(k, cur);
+    }
+    return Array.from(map.entries())
+      .map(([name, v]) => {
+        let dominantCat: string | null = null;
+        let bestCount = 0;
+        v.catCounts.forEach((c, cat) => {
+          if (c > bestCount) {
+            bestCount = c;
+            dominantCat = cat;
+          }
+        });
+        return {
+          name,
+          count: v.count,
+          lengthPts: v.lengthPts,
+          dominantCat,
+        };
+      })
+      .sort((a, b) => b.lengthPts - a.lengthPts);
+  }, [vectorData, pageState.line_assignments]);
+
+  // Explicit assign — used by per-line popover and per-layer dropdown.
+  // Pass `null` as `cat` to unassign.
+  function assignLineTo(lineIdx: number, cat: string | null) {
+    setError(null);
+    setPageState((prev) => {
+      const next = { ...prev, line_assignments: { ...prev.line_assignments } };
+      const k = String(lineIdx);
+      if (cat === null) delete next.line_assignments[k];
+      else next.line_assignments[k] = cat;
+      return next;
+    });
+    scheduleSave();
+  }
+
+  function assignLayerTo(layerName: string, cat: string | null) {
+    if (!vectorData) return;
+    setError(null);
+    let count = 0;
+    setPageState((prev) => {
+      const next = { ...prev, line_assignments: { ...prev.line_assignments } };
+      for (const ln of vectorData.lines) {
+        const lk = ln.layer || "(no layer)";
+        if (lk !== layerName) continue;
+        const k = String(ln.idx);
+        if (cat === null) delete next.line_assignments[k];
+        else next.line_assignments[k] = cat;
+        count += 1;
+      }
+      return next;
+    });
+    if (count === 0) setError(`No lines on layer "${layerName}".`);
+    else scheduleSave();
+  }
 
   function toggleAssignment(lineIdx: number) {
     if (!activeCategory) {
@@ -321,6 +500,93 @@ export default function UMTCanvasInner({
     scheduleSave();
   }
 
+  function assignLayer(layerName: string) {
+    if (!activeCategory) {
+      setError("Pick a target category first.");
+      return;
+    }
+    if (!vectorData) return;
+    setError(null);
+    let count = 0;
+    setPageState((prev) => {
+      const next = { ...prev, line_assignments: { ...prev.line_assignments } };
+      for (const ln of vectorData.lines) {
+        const lk = ln.layer || "(no layer)";
+        if (lk === layerName) {
+          next.line_assignments[String(ln.idx)] = activeCategory;
+          count += 1;
+        }
+      }
+      return next;
+    });
+    if (count === 0) setError(`No lines on layer "${layerName}".`);
+    else scheduleSave();
+  }
+
+  async function smartAutoAssign() {
+    const existing = Object.keys(pageState.line_assignments).length;
+    if (existing > 0) {
+      if (
+        !confirm(
+          `Smart-assign will replace your ${existing} existing assignment(s) on this page. Continue?`,
+        )
+      ) {
+        return;
+      }
+    }
+    setError(null);
+    try {
+      const data = await apiJson<{
+        assignments: Record<string, string>;
+        layer_assignments: Record<
+          string,
+          { category: string | null; line_count: number }
+        >;
+        stats: {
+          by_indicator: number;
+          by_layer: number;
+          unassigned: number;
+          total: number;
+          instance_count: number;
+          layer_count: number;
+          layers_assigned: number;
+        };
+      }>(
+        `/api/jobs/${jobId}/page-vector-lines/${pageNum}/smart-assign`,
+      );
+      const newAssignments = data.assignments ?? {};
+      // Make sure every assigned-to category exists in our category map —
+      // smart-assign only references legend categories, but the user may
+      // have deleted some locally.
+      setPageState((prev) => {
+        const cats = { ...prev.categories };
+        const distinctCats = Array.from(new Set(Object.values(newAssignments)));
+        for (const c of distinctCats) {
+          if (!cats[c]) {
+            const idx = Object.keys(cats).length;
+            cats[c] = {
+              indicator: c.split(":")[0]?.trim() || "",
+              keyword: c.split(":").slice(1).join(":").trim() || c,
+              color: PALETTE[idx % PALETTE.length],
+            };
+          }
+        }
+        return {
+          ...prev,
+          categories: cats,
+          line_assignments: newAssignments,
+        };
+      });
+      const s = data.stats;
+      setError(
+        `Smart-assigned ${s.layers_assigned} of ${s.layer_count} layers (${s.by_indicator} lines) using indicator-bbox proximity · ${s.unassigned} lines left unassigned (low-confidence layers + layers with no nearby indicator). Click a line to override manually.`,
+      );
+      scheduleSave();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   function reassignAutoDetected() {
     if (!activeCategory) {
       setError("Pick the target category first.");
@@ -349,6 +615,76 @@ export default function UMTCanvasInner({
     }
   }
 
+  function pdfPointFromStage(
+    e: { target: { getStage: () => unknown } },
+  ): [number, number] | null {
+    const stage = (e.target.getStage() as null | {
+      getPointerPosition: () => { x: number; y: number } | null;
+    });
+    if (!stage) return null;
+    const ptr = stage.getPointerPosition();
+    if (!ptr || !vectorData) return null;
+    const x = Math.max(0, Math.min(vectorData.pdf_width, ptr.x / scale));
+    const y = Math.max(0, Math.min(vectorData.pdf_height, ptr.y / scale));
+    return [x, y];
+  }
+
+  function startDrawAt(pt: [number, number]) {
+    setPendingLine({ start: pt, end: pt });
+  }
+
+  function updateDrawTo(pt: [number, number]) {
+    setPendingLine((prev) => (prev ? { start: prev.start, end: pt } : prev));
+  }
+
+  function commitPendingLine() {
+    if (!pendingLine) return;
+    const dx = pendingLine.end[0] - pendingLine.start[0];
+    const dy = pendingLine.end[1] - pendingLine.start[1];
+    const lenPts = Math.hypot(dx, dy);
+    if (lenPts < 4) {
+      // Treat tiny strokes as a click-cancel — discard.
+      setPendingLine(null);
+      return;
+    }
+    if (!activeCategory) {
+      setPendingLine(null);
+      setError("Pick a category before drawing.");
+      return;
+    }
+    const start = pendingLine.start;
+    const end = pendingLine.end;
+    const cat = activeCategory;
+    setPageState((prev) => ({
+      ...prev,
+      user_drawn_lines: [
+        ...(prev.user_drawn_lines ?? []),
+        { start, end, category: cat },
+      ],
+    }));
+    setPendingLine(null);
+    scheduleSave();
+  }
+
+  function removeUserDrawnLine(idx: number) {
+    setPageState((prev) => {
+      const next = [...(prev.user_drawn_lines ?? [])];
+      next.splice(idx, 1);
+      return { ...prev, user_drawn_lines: next };
+    });
+    scheduleSave();
+  }
+
+  function reassignUserDrawnLine(idx: number, cat: string) {
+    setPageState((prev) => {
+      const arr = [...(prev.user_drawn_lines ?? [])];
+      if (idx < 0 || idx >= arr.length) return prev;
+      arr[idx] = { ...arr[idx], category: cat };
+      return { ...prev, user_drawn_lines: arr };
+    });
+    scheduleSave();
+  }
+
   function resetToAuto() {
     if (!vectorData) return;
     if (
@@ -357,15 +693,20 @@ export default function UMTCanvasInner({
       )
     )
       return;
-    const autoCats = vectorData.auto_categories ?? {};
+    const autoCats = cleanCategoryMap(vectorData.auto_categories ?? {});
     const cats =
       Object.keys(autoCats).length > 0
         ? autoCats
         : defaultCategoriesFromLegend(legendEntries);
+    const rawAuto = vectorData.auto_assignments ?? {};
+    const filteredAuto: Record<string, string> = {};
+    for (const [k, v] of Object.entries(rawAuto)) {
+      if (cats[v]) filteredAuto[k] = v;
+    }
     setPageState((prev) => ({
       ...prev,
       categories: cats,
-      line_assignments: vectorData.auto_assignments ?? {},
+      line_assignments: filteredAuto,
     }));
     const firstCat = Object.keys(cats)[0];
     setActiveCategory(firstCat ?? null);
@@ -397,6 +738,13 @@ export default function UMTCanvasInner({
             </div>
           ) : (
             <>
+              {(vectorData.source_missing || skipReason) && (
+                <div className="px-3 py-2 text-xs bg-yellow-50 border-b border-yellow-200 text-yellow-800">
+                  {vectorData.source_missing
+                    ? "Original PDF is no longer on disk — reading vector lines from the highlighted PDF instead. Saved assignments still render; auto-overlay is suppressed (re-upload the document to refresh)."
+                    : `No auto-detected lines on this page${skipReason ? ` (${skipReason})` : ""}. You can still add a category and draw lines manually.`}
+                </div>
+              )}
               <CategoryPanel
                 categories={pageState.categories}
                 active={activeCategory}
@@ -421,6 +769,96 @@ export default function UMTCanvasInner({
                     className="w-16 border rounded px-1 py-0.5 text-xs"
                   />
                 </label>
+                <div
+                  className="flex items-center gap-1"
+                  title="Tip: Ctrl/Cmd + mouse-wheel zooms around the cursor"
+                >
+                  <span>Zoom:</span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setZoom((z) => Math.max(0.25, +(z * 0.8).toFixed(2)))
+                    }
+                    className="px-1.5 border rounded hover:bg-gray-50"
+                    title="Zoom out"
+                  >
+                    −
+                  </button>
+                  <input
+                    type="range"
+                    min={0.25}
+                    max={4}
+                    step={0.05}
+                    value={zoom}
+                    onChange={(e) => setZoom(Number(e.target.value))}
+                    className="w-24"
+                  />
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setZoom((z) => Math.min(4, +(z * 1.25).toFixed(2)))
+                    }
+                    className="px-1.5 border rounded hover:bg-gray-50"
+                    title="Zoom in"
+                  >
+                    +
+                  </button>
+                  <span className="font-mono w-12 text-right">
+                    {Math.round(zoom * 100)}%
+                  </span>
+                  {zoom !== 1 && (
+                    <button
+                      type="button"
+                      onClick={() => setZoom(1)}
+                      className="text-blue-600 hover:underline"
+                      title="Reset zoom to 100%"
+                    >
+                      reset
+                    </button>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDrawMode((m) => !m);
+                    setPanMode(false);
+                    setPendingLine(null);
+                    setError(null);
+                  }}
+                  className={`px-2 py-0.5 rounded border text-xs ${
+                    drawMode
+                      ? "border-blue-500 bg-blue-50 text-blue-700"
+                      : "border-gray-300 hover:bg-gray-50"
+                  }`}
+                  title="Click-drag on the canvas to draw a new line in the active category"
+                >
+                  {drawMode ? "✏️ Draw mode (on)" : "✏️ Draw mode"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPanMode((m) => !m);
+                    setDrawMode(false);
+                    setPendingLine(null);
+                    setError(null);
+                  }}
+                  className={`px-2 py-0.5 rounded border text-xs ${
+                    panMode
+                      ? "border-blue-500 bg-blue-50 text-blue-700"
+                      : "border-gray-300 hover:bg-gray-50"
+                  }`}
+                  title="Click-drag on the canvas to pan around (useful at high zoom)"
+                >
+                  {panMode ? "✋ Pan mode (on)" : "✋ Pan mode"}
+                </button>
+                <button
+                  type="button"
+                  onClick={smartAutoAssign}
+                  className="text-blue-700 hover:underline"
+                  title="Match each line to a category using indicator-bbox proximity, then layer-name tokens. Replaces existing assignments on this page."
+                >
+                  🎯 Smart auto-assign (indicator + layer)
+                </button>
                 <button
                   type="button"
                   onClick={reassignAutoDetected}
@@ -454,8 +892,177 @@ export default function UMTCanvasInner({
                         : ""}
                 </span>
               </div>
-              <div className="overflow-auto max-h-[80vh]">
-                <Stage width={stageWidth} height={stageHeight}>
+              {layerSummary.length > 0 && (
+                <details className="px-3 py-2 text-xs bg-white border-b">
+                  <summary className="cursor-pointer text-gray-700 select-none">
+                    Layers ({layerSummary.length}) — click a row to highlight
+                    its lines on the canvas; use the dropdown to assign the
+                    whole layer
+                    {highlightedLayer ? (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          setHighlightedLayer(null);
+                        }}
+                        className="ml-3 text-blue-600 hover:underline"
+                      >
+                        clear highlight
+                      </button>
+                    ) : null}
+                  </summary>
+                  <div className="mt-2 max-h-64 overflow-auto border rounded">
+                    <table className="w-full text-xs">
+                      <thead className="bg-gray-50 sticky top-0">
+                        <tr className="text-left text-gray-600">
+                          <th className="px-2 py-1 font-medium">Layer</th>
+                          <th className="px-2 py-1 font-medium text-right">
+                            Lines
+                          </th>
+                          <th className="px-2 py-1 font-medium text-right">
+                            Length (pts)
+                          </th>
+                          <th className="px-2 py-1 font-medium">Assigned to</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {layerSummary.map((l) => {
+                          const isHi = highlightedLayer === l.name;
+                          return (
+                            <tr
+                              key={l.name}
+                              className={`border-t cursor-pointer ${
+                                isHi
+                                  ? "bg-yellow-100"
+                                  : "hover:bg-blue-50/40"
+                              }`}
+                              onClick={() =>
+                                setHighlightedLayer((prev) =>
+                                  prev === l.name ? null : l.name,
+                                )
+                              }
+                            >
+                              <td className="px-2 py-1 font-mono break-all">
+                                {l.name}
+                              </td>
+                              <td className="px-2 py-1 text-right tabular-nums">
+                                {l.count}
+                              </td>
+                              <td className="px-2 py-1 text-right tabular-nums">
+                                {l.lengthPts.toFixed(0)}
+                              </td>
+                              <td
+                                className="px-2 py-1"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                <select
+                                  value={l.dominantCat ?? ""}
+                                  onChange={(e) =>
+                                    assignLayerTo(
+                                      l.name,
+                                      e.target.value || null,
+                                    )
+                                  }
+                                  className="border rounded px-1 py-0.5 text-xs max-w-[14rem]"
+                                  title="Assign all lines on this layer to the chosen category (or unassign)"
+                                >
+                                  <option value="">— unassigned —</option>
+                                  {Object.keys(pageState.categories).map(
+                                    (c) => (
+                                      <option key={c} value={c}>
+                                        {c.length > 60
+                                          ? c.slice(0, 57) + "…"
+                                          : c}
+                                      </option>
+                                    ),
+                                  )}
+                                </select>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              )}
+              <div
+                ref={scrollContainerRef}
+                className="overflow-auto max-h-[80vh] select-none"
+                style={{
+                  cursor: panMode
+                    ? panStateRef.current
+                      ? "grabbing"
+                      : "grab"
+                    : "default",
+                }}
+                onMouseDown={(e) => {
+                  if (!panMode || !scrollContainerRef.current) return;
+                  panStateRef.current = {
+                    startX: e.clientX,
+                    startY: e.clientY,
+                    scrollLeft: scrollContainerRef.current.scrollLeft,
+                    scrollTop: scrollContainerRef.current.scrollTop,
+                  };
+                  scrollContainerRef.current.style.cursor = "grabbing";
+                  e.preventDefault();
+                }}
+                onMouseMove={(e) => {
+                  const ps = panStateRef.current;
+                  if (!panMode || !ps || !scrollContainerRef.current) return;
+                  scrollContainerRef.current.scrollLeft =
+                    ps.scrollLeft - (e.clientX - ps.startX);
+                  scrollContainerRef.current.scrollTop =
+                    ps.scrollTop - (e.clientY - ps.startY);
+                }}
+                onMouseUp={() => {
+                  panStateRef.current = null;
+                  if (scrollContainerRef.current) {
+                    scrollContainerRef.current.style.cursor = panMode
+                      ? "grab"
+                      : "default";
+                  }
+                }}
+                onMouseLeave={() => {
+                  panStateRef.current = null;
+                }}
+              >
+                <Stage
+                  width={stageWidth}
+                  height={stageHeight}
+                  onMouseDown={(e) => {
+                    if (panMode) return;
+                    if (!drawMode) return;
+                    // Only start drawing when the click lands on empty
+                    // stage. If it landed on a line, that line's own
+                    // onClick will open the reassignment popover.
+                    if (e.target !== e.target.getStage()) return;
+                    if (!activeCategory) {
+                      setError("Pick a category before drawing.");
+                      return;
+                    }
+                    const pt = pdfPointFromStage(e);
+                    if (pt) startDrawAt(pt);
+                  }}
+                  onMouseMove={(e) => {
+                    if (!drawMode || !pendingLine) return;
+                    const pt = pdfPointFromStage(e);
+                    if (pt) updateDrawTo(pt);
+                  }}
+                  onMouseUp={() => {
+                    if (drawMode) commitPendingLine();
+                  }}
+                  onMouseLeave={() => {
+                    if (drawMode) commitPendingLine();
+                  }}
+                  style={{
+                    cursor: panMode
+                      ? "inherit"
+                      : drawMode
+                        ? "crosshair"
+                        : "default",
+                  }}
+                >
                   <Layer listening={false}>
                     <KImage
                       image={bgImage}
@@ -465,7 +1072,7 @@ export default function UMTCanvasInner({
                       height={stageHeight}
                     />
                   </Layer>
-                  <Layer>
+                  <Layer listening={!panMode}>
                     {vectorData.lines.map((ln) => {
                       if (ln.length_pts < minLen) return null;
                       const cat = pageState.line_assignments[String(ln.idx)];
@@ -474,6 +1081,13 @@ export default function UMTCanvasInner({
                         : undefined;
                       const color = catInfo?.color ?? UNASSIGNED_RGB;
                       const assigned = !!cat;
+                      const onLayer =
+                        highlightedLayer !== null &&
+                        (ln.layer || "(no layer)") === highlightedLayer;
+                      const stroke = onLayer
+                        ? "rgba(255,235,0,1)"
+                        : rgb(color, assigned ? 0.95 : 0.55);
+                      const strokeWidth = onLayer ? 4 : assigned ? 3 : 1.4;
                       return (
                         <KLine
                           key={`v-${ln.idx}`}
@@ -483,13 +1097,37 @@ export default function UMTCanvasInner({
                             ln.end[0] * scale,
                             ln.end[1] * scale,
                           ]}
-                          stroke={rgb(color, assigned ? 0.95 : 0.55)}
-                          strokeWidth={assigned ? 3 : 1.4}
+                          stroke={stroke}
+                          strokeWidth={strokeWidth}
                           hitStrokeWidth={10}
                           perfectDrawEnabled={false}
                           shadowForStrokeEnabled={false}
-                          onClick={() => toggleAssignment(ln.idx)}
-                          onTap={() => toggleAssignment(ln.idx)}
+                          onClick={(e) => {
+                            const evt = e.evt as MouseEvent;
+                            if (evt.shiftKey) {
+                              toggleAssignment(ln.idx);
+                              return;
+                            }
+                            setLinePopover({
+                              kind: "vector",
+                              idx: ln.idx,
+                              x: evt.clientX,
+                              y: evt.clientY,
+                            });
+                          }}
+                          onTap={(e) => {
+                            const stage = e.target.getStage();
+                            const ptr = stage?.getPointerPosition();
+                            const rect = stage?.container().getBoundingClientRect();
+                            if (ptr && rect) {
+                              setLinePopover({
+                                kind: "vector",
+                                idx: ln.idx,
+                                x: rect.left + ptr.x,
+                                y: rect.top + ptr.y,
+                              });
+                            }
+                          }}
                           onMouseEnter={(e) => {
                             const stage = e.target.getStage();
                             if (stage) stage.container().style.cursor = "pointer";
@@ -515,10 +1153,62 @@ export default function UMTCanvasInner({
                           ]}
                           stroke={rgb(color, 1)}
                           strokeWidth={3}
-                          listening={false}
+                          hitStrokeWidth={10}
+                          listening={!panMode}
+                          onClick={(e) => {
+                            const evt = e.evt as MouseEvent;
+                            setLinePopover({
+                              kind: "drawn",
+                              idx: i,
+                              x: evt.clientX,
+                              y: evt.clientY,
+                            });
+                          }}
+                          onTap={(e) => {
+                            const stage = e.target.getStage();
+                            const ptr = stage?.getPointerPosition();
+                            const rect = stage?.container().getBoundingClientRect();
+                            if (ptr && rect) {
+                              setLinePopover({
+                                kind: "drawn",
+                                idx: i,
+                                x: rect.left + ptr.x,
+                                y: rect.top + ptr.y,
+                              });
+                            }
+                          }}
+                          onMouseEnter={(e) => {
+                            if (drawMode || panMode) return;
+                            const stage = e.target.getStage();
+                            if (stage) stage.container().style.cursor = "pointer";
+                          }}
+                          onMouseLeave={(e) => {
+                            if (drawMode || panMode) return;
+                            const stage = e.target.getStage();
+                            if (stage) stage.container().style.cursor = "default";
+                          }}
                         />
                       );
                     })}
+                    {pendingLine && (
+                      <KLine
+                        points={[
+                          pendingLine.start[0] * scale,
+                          pendingLine.start[1] * scale,
+                          pendingLine.end[0] * scale,
+                          pendingLine.end[1] * scale,
+                        ]}
+                        stroke={rgb(
+                          (activeCategory &&
+                            pageState.categories[activeCategory]?.color) ||
+                            UNASSIGNED_RGB,
+                          0.85,
+                        )}
+                        strokeWidth={2.5}
+                        dash={[6, 4]}
+                        listening={false}
+                      />
+                    )}
                   </Layer>
                 </Stage>
               </div>
@@ -526,7 +1216,153 @@ export default function UMTCanvasInner({
           )}
         </div>
       )}
+      {linePopover && vectorData && linePopover.kind === "vector" && (() => {
+        const ln = vectorData.lines[linePopover.idx];
+        const current =
+          pageState.line_assignments[String(linePopover.idx)] ?? null;
+        return (
+          <LinePopover
+            x={linePopover.x}
+            y={linePopover.y}
+            header={
+              <>
+                <div className="font-medium text-gray-800">
+                  Line #{ln?.idx ?? "?"}
+                </div>
+                <div className="font-mono break-all">
+                  layer: {ln?.layer || "(no layer)"}
+                </div>
+                <div>
+                  length: {ln?.length_pts.toFixed(1) ?? "?"} pts · current:{" "}
+                  {current ?? "— unassigned —"}
+                </div>
+              </>
+            }
+            currentCategory={current}
+            categories={pageState.categories}
+            onPick={(cat) => {
+              assignLineTo(linePopover.idx, cat);
+              setLinePopover(null);
+            }}
+            onRemove={() => {
+              assignLineTo(linePopover.idx, null);
+              setLinePopover(null);
+            }}
+            removeLabel="✕ Unassign"
+            onClose={() => setLinePopover(null)}
+          />
+        );
+      })()}
+      {linePopover && linePopover.kind === "drawn" && (() => {
+        const arr = pageState.user_drawn_lines ?? [];
+        const dl = arr[linePopover.idx];
+        if (!dl) return null;
+        const dx = dl.end[0] - dl.start[0];
+        const dy = dl.end[1] - dl.start[1];
+        const lenPts = Math.hypot(dx, dy);
+        return (
+          <LinePopover
+            x={linePopover.x}
+            y={linePopover.y}
+            header={
+              <>
+                <div className="font-medium text-gray-800">
+                  Drawn line #{linePopover.idx + 1}
+                </div>
+                <div>
+                  length: {lenPts.toFixed(1)} pts · current: {dl.category}
+                </div>
+              </>
+            }
+            currentCategory={dl.category}
+            categories={pageState.categories}
+            onPick={(cat) => {
+              if (cat) reassignUserDrawnLine(linePopover.idx, cat);
+              setLinePopover(null);
+            }}
+            onRemove={() => {
+              removeUserDrawnLine(linePopover.idx);
+              setLinePopover(null);
+            }}
+            removeLabel="🗑 Delete drawn line"
+            onClose={() => setLinePopover(null)}
+          />
+        );
+      })()}
     </div>
+  );
+}
+
+function LinePopover({
+  x,
+  y,
+  header,
+  currentCategory,
+  categories,
+  onPick,
+  onRemove,
+  removeLabel,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  header: React.ReactNode;
+  currentCategory: string | null;
+  categories: Record<string, CategoryInfo>;
+  onPick: (cat: string) => void;
+  onRemove: () => void;
+  removeLabel: string;
+  onClose: () => void;
+}) {
+  const W = 320;
+  const left = Math.min(Math.max(8, x + 8), window.innerWidth - W - 8);
+  const top = Math.min(y + 8, window.innerHeight - 240);
+  return (
+    <>
+      <div
+        className="fixed inset-0 z-40"
+        onClick={onClose}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          onClose();
+        }}
+      />
+      <div
+        role="dialog"
+        className="fixed z-50 bg-white border rounded shadow-lg p-2 text-xs"
+        style={{ left, top, width: W }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-1 pb-1 border-b mb-1 text-gray-600">{header}</div>
+        <div className="max-h-56 overflow-auto">
+          {Object.entries(categories).map(([name, info]) => (
+            <button
+              key={name}
+              type="button"
+              onClick={() => onPick(name)}
+              className={`flex items-center gap-2 w-full px-2 py-1 rounded text-left hover:bg-blue-50 ${
+                currentCategory === name ? "bg-blue-100" : ""
+              }`}
+            >
+              <span
+                className="inline-block w-3 h-3 rounded-sm border border-gray-300 shrink-0"
+                style={{
+                  backgroundColor: `rgb(${info.color[0]},${info.color[1]},${info.color[2]})`,
+                }}
+              />
+              <span className="truncate">{name}</span>
+            </button>
+          ))}
+          <button
+            type="button"
+            onClick={onRemove}
+            className="w-full px-2 py-1 mt-1 rounded text-left text-red-600 hover:bg-red-50"
+          >
+            {removeLabel}
+          </button>
+        </div>
+      </div>
+    </>
   );
 }
 

@@ -692,6 +692,34 @@ async def get_page_image(
     )
 
 
+def _clean_legend_entries(entries: list[dict]) -> list[dict]:
+    """Drop the pipeline's "indicator code" placeholder rows (where the
+    keyword is just the indicator number itself, or description is the
+    literal "Indicator Code") and de-duplicate on (indicator, keyword)
+    keeping the entry with the longer description."""
+    filtered: list[dict] = []
+    for le in entries:
+        ind = (le.get("indicator") or "").strip()
+        kw = (le.get("keyword") or "").strip()
+        desc = (le.get("description") or "").strip()
+        if ind and kw and ind == kw:
+            continue
+        if desc.lower() == "indicator code":
+            continue
+        filtered.append(le)
+    by_key: dict[tuple[str, str], dict] = {}
+    for le in filtered:
+        ind = (le.get("indicator") or "").strip()
+        kw = (le.get("keyword") or "").strip().upper()
+        key = (ind, kw)
+        prev = by_key.get(key)
+        if prev is None or len((le.get("description") or "")) > len(
+            prev.get("description") or ""
+        ):
+            by_key[key] = le
+    return list(by_key.values())
+
+
 @app.get("/api/jobs/{job_id}/page-vector-lines/{page_num}")
 async def get_page_vector_lines(
     job_id: str,
@@ -707,9 +735,25 @@ async def get_page_vector_lines(
     if job["user_id"] != user_id:
         raise HTTPException(403, "Access denied")
 
+    # Resolve a usable PDF on disk. /tmp gets reaped on reboot, so the
+    # original may be gone; fall back to the highlighted PDF (lives under
+    # ~/.leo/results/<job_id>/, persistent). Drawing-mode canvas still
+    # works with the highlighted PDF; auto vector-line extraction may
+    # pick up the cyan overlay strokes too — flagged via source_missing.
     pdf_path = job.get("pdf_path")
+    source_missing = False
     if not pdf_path or not Path(pdf_path).exists():
-        raise HTTPException(404, "Source PDF not on disk")
+        hl = job_registry.get_highlighted_pdf_path(job_id)
+        if hl is not None and Path(hl).exists():
+            pdf_path = str(hl)
+            source_missing = True
+        else:
+            raise HTTPException(
+                404,
+                "Source PDF for this job is no longer on disk and no "
+                "highlighted PDF was found. Re-upload the document to use "
+                "the measurement canvas.",
+            )
 
     results = job_registry.load_results(job_id)
     if results is None:
@@ -721,14 +765,17 @@ async def get_page_vector_lines(
          if fp.get("page_num") == page_num or fp.get("page_number") == page_num),
         None,
     )
-    if target is None:
-        raise HTTPException(404, f"Page {page_num} is not a fence page")
-    # Page index can legitimately be 0; don't use `or` (0 is falsy in Python).
-    page_idx = target.get("page_idx")
+    # Resolve page_idx: prefer the entry from fence_pages (richer metadata for
+    # auto-assignments); fall back to (page_num - 1) so the canvas works on
+    # any page in the PDF, including ones the pipeline marked
+    # measurement_skipped. Drawing mode is always useful even with no auto data.
+    page_idx: int | None = None
+    if target is not None:
+        page_idx = target.get("page_idx")
+        if page_idx is None:
+            page_idx = target.get("page_index_in_original_doc")
     if page_idx is None:
-        page_idx = target.get("page_index_in_original_doc")
-    if page_idx is None:
-        raise HTTPException(500, "Page index missing from results")
+        page_idx = page_num - 1
 
     import fitz
     from utils_vector import extract_vector_lines
@@ -736,7 +783,7 @@ async def get_page_vector_lines(
     doc = None
     try:
         doc = fitz.open(pdf_path)
-        if page_idx >= len(doc):
+        if page_idx < 0 or page_idx >= len(doc):
             raise HTTPException(404, f"Page index {page_idx} out of range")
         page = doc[page_idx]
         # page.rect already reflects display orientation (rotation applied)
@@ -780,7 +827,7 @@ async def get_page_vector_lines(
         (0, 255, 0), (255, 165, 0), (0, 191, 255), (255, 0, 255),
         (255, 255, 0), (0, 255, 255), (255, 105, 180), (173, 255, 47),
     ]
-    legend_entries = target.get("legend_entries") or []
+    legend_entries = _clean_legend_entries((target or {}).get("legend_entries") or [])
     auto_categories: dict[str, dict] = {}
     for le in legend_entries:
         keyword = (le.get("keyword") or "").strip()
@@ -798,7 +845,7 @@ async def get_page_vector_lines(
         }
 
     # Match pipeline auto fence lines → vector indices → category.
-    measurements = target.get("measurements") or {}
+    measurements = (target or {}).get("measurements") or {}
     all_fence_lines = measurements.get("all_fence_lines") or []
     layer_to_cat: dict[str, str] = measurements.get("layer_to_category") or {}
     any_layer_mapped = bool(layer_to_cat)
@@ -841,6 +888,12 @@ async def get_page_vector_lines(
             continue
         auto_assignments[str(vidx)] = category
 
+    # When the source PDF is gone we read from the highlighted PDF, which
+    # contains the cyan fence-overlay strokes. Auto-assignments computed
+    # from coord-matching against `all_fence_lines` would be unreliable —
+    # the user's *saved* assignments still apply because we always return
+    # `lines` (indices match the highlighted PDF's vector order, which is
+    # additive over the original).
     return {
         "page_num": page_num,
         "page_idx": page_idx,
@@ -849,7 +902,251 @@ async def get_page_vector_lines(
         "pdf_height": float(display_h),
         "lines": out_lines,
         "auto_categories": auto_categories,
-        "auto_assignments": auto_assignments,
+        "auto_assignments": {} if source_missing else auto_assignments,
+        "source_missing": source_missing,
+    }
+
+
+@app.get("/api/jobs/{job_id}/page-vector-lines/{page_num}/smart-assign")
+async def smart_assign_page(
+    job_id: str,
+    page_num: int,
+    user_id: str = Depends(get_current_user),
+    proximity_pts: float = 80.0,
+    min_votes: int = 3,
+    min_share: float = 0.5,
+    min_participation: float = 0.05,
+):
+    """Compute *layer-level* category suggestions, not per-line.
+
+    Strategy:
+      1. For each line on a CAD layer, find the nearest indicator-bbox
+         within `proximity_pts`. Cast one vote for that indicator on
+         the line's layer.
+      2. Per layer, the indicator with the most votes wins. All lines
+         on that layer are assigned to the corresponding category.
+      3. Layers with zero votes fall back to a *strict* layer-token
+         match: a category wins only if exactly one category has a
+         5+ char keyword token that appears in the layer name.
+         Ambiguous matches are skipped (left unassigned) to keep the
+         output reliable.
+
+    Returns {assignments: {line_idx: category_name},
+             layer_assignments: {layer_name: {indicator, category, votes, line_count}},
+             stats: {...}}.
+    """
+    job = job_registry.get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if job["user_id"] != user_id:
+        raise HTTPException(403, "Access denied")
+
+    pdf_path = job.get("pdf_path")
+    if not pdf_path or not Path(pdf_path).exists():
+        hl = job_registry.get_highlighted_pdf_path(job_id)
+        if hl is not None and Path(hl).exists():
+            pdf_path = str(hl)
+        else:
+            raise HTTPException(404, "No PDF on disk for this job")
+
+    results = job_registry.load_results(job_id)
+    if results is None:
+        raise HTTPException(404, "Results not available")
+    fence_pages = (results or {}).get("fence_pages") or []
+    target = next(
+        (fp for fp in fence_pages
+         if fp.get("page_num") == page_num or fp.get("page_number") == page_num),
+        None,
+    )
+    page_idx: int | None = None
+    if target is not None:
+        page_idx = target.get("page_idx")
+        if page_idx is None:
+            page_idx = target.get("page_index_in_original_doc")
+    if page_idx is None:
+        page_idx = page_num - 1
+
+    import fitz
+    from utils_vector import extract_vector_lines
+
+    doc = None
+    try:
+        doc = fitz.open(pdf_path)
+        if page_idx < 0 or page_idx >= len(doc):
+            raise HTTPException(404, "Page out of range")
+        page = doc[page_idx]
+        rmat = page.rotation_matrix  # native -> display
+        vlines = extract_vector_lines(page, apply_rotation=True)
+        # Transform instance bboxes from native to display space.
+        instances_disp: list[dict] = []
+        for inst in (target or {}).get("instances") or []:
+            ind = (inst.get("indicator") or "").strip()
+            if not ind:
+                continue
+            try:
+                rect = fitz.Rect(
+                    float(inst["x0"]), float(inst["y0"]),
+                    float(inst["x1"]), float(inst["y1"]),
+                ) * rmat
+                rect.normalize()
+            except (KeyError, TypeError, ValueError):
+                continue
+            instances_disp.append({
+                "indicator": ind,
+                "cx": (rect.x0 + rect.x1) / 2,
+                "cy": (rect.y0 + rect.y1) / 2,
+            })
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+    # Build category lookup tables from legend.
+    legend_entries = _clean_legend_entries((target or {}).get("legend_entries") or [])
+    indicator_to_category: dict[str, str] = {}
+    # token -> set of categories that contain it (for ambiguity check)
+    token_to_categories: dict[str, set[str]] = {}
+    for le in legend_entries:
+        keyword = (le.get("keyword") or "").strip()
+        indicator = (le.get("indicator") or "").strip()
+        if not keyword:
+            continue
+        cat_name = f"{indicator}: {keyword}" if indicator else keyword
+        if indicator:
+            indicator_to_category.setdefault(indicator, cat_name)
+        seen_in_kw: set[str] = set()
+        for raw in keyword.upper().split():
+            tok = "".join(ch for ch in raw if ch.isalnum())
+            # Strict: 5+ chars, not seen twice in the same keyword (avoid
+            # double-counting); we'll only use unambiguous tokens later.
+            if len(tok) >= 5 and tok not in seen_in_kw:
+                seen_in_kw.add(tok)
+                token_to_categories.setdefault(tok, set()).add(cat_name)
+
+    # Group lines by layer.
+    from collections import Counter, defaultdict
+    layer_lines: dict[str, list[tuple[int, "object"]]] = defaultdict(list)
+    for i, ln in enumerate(vlines):
+        layer_lines[(ln.layer or "")].append((i, ln))
+
+    prox_sq = proximity_pts * proximity_pts
+
+    # Per-layer voting: for each line, find its nearest indicator within
+    # the threshold; tally per-layer votes by indicator.
+    layer_votes: dict[str, Counter] = {}
+    for layer_name, items in layer_lines.items():
+        votes: Counter = Counter()
+        for _, ln in items:
+            sx, sy = float(ln.start[0]), float(ln.start[1])
+            ex, ey = float(ln.end[0]), float(ln.end[1])
+            mx, my = (sx + ex) / 2, (sy + ey) / 2
+            best_d2 = prox_sq
+            best_ind: str | None = None
+            for inst in instances_disp:
+                dx = inst["cx"] - mx
+                dy = inst["cy"] - my
+                d2 = dx * dx + dy * dy
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_ind = inst["indicator"]
+            if best_ind is not None:
+                votes[best_ind] += 1
+        layer_votes[layer_name] = votes
+
+    # Decide each layer's category.
+    layer_assignments: dict[str, dict] = {}
+    for layer_name, items in layer_lines.items():
+        if not layer_name:
+            continue
+        line_count = len(items)
+        votes = layer_votes.get(layer_name) or Counter()
+        winner_ind = None
+        winner_votes = 0
+        cat: str | None = None
+        decided_by = "none"
+
+        total_v = sum(votes.values()) if votes else 0
+        participation = total_v / line_count if line_count else 0.0
+        if votes:
+            (winner_ind, winner_votes), *_ = votes.most_common(1)
+            share = winner_votes / total_v if total_v else 0.0
+            if (
+                winner_votes >= min_votes
+                and share >= min_share
+                and participation >= min_participation
+                and indicator_to_category.get(winner_ind)
+            ):
+                cat = indicator_to_category[winner_ind]
+                decided_by = "indicator-vote"
+
+        # Strict layer-token fallback when voting was inconclusive.
+        if cat is None:
+            up = layer_name.upper()
+            unique_hit: str | None = None
+            ambiguous = False
+            for tok, cats in token_to_categories.items():
+                if tok in up:
+                    if len(cats) > 1:
+                        ambiguous = True
+                        unique_hit = None
+                        break
+                    only = next(iter(cats))
+                    if unique_hit is None:
+                        unique_hit = only
+                    elif unique_hit != only:
+                        ambiguous = True
+                        unique_hit = None
+                        break
+            if unique_hit and not ambiguous:
+                cat = unique_hit
+                decided_by = "layer-token"
+
+        layer_assignments[layer_name] = {
+            "indicator": winner_ind,
+            "category": cat,
+            "votes": winner_votes,
+            "total_votes": total_v,
+            "line_count": line_count,
+            "participation": round(participation, 3),
+            "decided_by": decided_by,
+        }
+
+    # Materialize per-line assignments from layer assignments.
+    assignments: dict[str, str] = {}
+    by_indicator = 0
+    by_layer = 0
+    for layer_name, items in layer_lines.items():
+        info = layer_assignments.get(layer_name)
+        if not info or not info.get("category"):
+            continue
+        cat = info["category"]
+        for i, _ in items:
+            assignments[str(i)] = cat
+        if info["decided_by"] == "indicator-vote":
+            by_indicator += len(items)
+        elif info["decided_by"] == "layer-token":
+            by_layer += len(items)
+
+    return {
+        "assignments": assignments,
+        "layer_assignments": layer_assignments,
+        "stats": {
+            "by_indicator": by_indicator,
+            "by_layer": by_layer,
+            "unassigned": len(vlines) - len(assignments),
+            "total": len(vlines),
+            "instance_count": len(instances_disp),
+            "layer_count": len([n for n in layer_lines if n]),
+            "layers_assigned": sum(
+                1 for v in layer_assignments.values() if v.get("category")
+            ),
+            "proximity_pts": proximity_pts,
+            "min_votes": min_votes,
+            "min_share": min_share,
+            "min_participation": min_participation,
+        },
     }
 
 
