@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import { apiJson, ApiError } from "@/lib/api";
+import { UploadButton } from "@/components/UploadButton";
 
 type Document = {
   id: string;
@@ -138,6 +139,11 @@ export default function DashboardPage() {
             </button>
           </div>
         </div>
+
+        {/* Upload */}
+        <section className="bg-white rounded-lg shadow p-4">
+          <UploadButton onUploaded={refresh} />
+        </section>
 
         {/* Documents card */}
         <section className="bg-white rounded-lg shadow">
