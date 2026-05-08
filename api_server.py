@@ -1186,19 +1186,200 @@ _CATEGORY_PALETTE = [
 ]
 
 
-def _build_auto_export_state(results: dict) -> tuple[list, dict, dict, dict]:
-    """Reshape pipeline results into the (line_assignments, page_categories,
-    auto-lines-per-page) tuple that exports.py wants. UMT (Sprint 4) hasn't
-    landed yet, so user_drawn_lines is always empty and we treat every
-    auto-detected fence line as accepted.
+def _auto_export_for_page(fp: dict) -> tuple[dict, dict, list]:
+    """Auto-only export shape for one fence page (no UMT edits).
 
-    Returns: (fence_pages_with_auto_lines, line_assignments, user_drawn_lines,
-    page_categories, per_page_scale_info, lines_by_page).
+    Returns (cats, page_assignments, auto_lines) keyed for this page.
+    Mirrors prod's partial-layer-match + "Auto-detected" fallback.
     """
+    cats: dict[str, dict] = {}
+    for le in _clean_legend_entries(fp.get("legend_entries") or []):
+        keyword = (le.get("keyword") or "").strip()
+        indicator = (le.get("indicator") or "").strip()
+        if not keyword:
+            continue
+        cat_name = f"{indicator}: {keyword}" if indicator else keyword
+        if cat_name in cats:
+            continue
+        cats[cat_name] = {
+            "indicator": indicator,
+            "keyword": keyword,
+            "color": _CATEGORY_PALETTE[len(cats) % len(_CATEGORY_PALETTE)],
+        }
+
+    measurements = fp.get("measurements") or {}
+    all_lines = measurements.get("all_fence_lines") or []
+    layer_to_cat = measurements.get("layer_to_category") or {}
+    any_layer_mapped = bool(layer_to_cat)
+    FALLBACK_CAT = "Auto-detected"
+
+    page_assignments: dict[str, str] = {}
+    auto_lines: list[dict] = []
+    for line in all_lines:
+        if not isinstance(line, dict):
+            continue
+        layer = line.get("layer") or ""
+        category = layer_to_cat.get(layer)
+        if not category and layer and any_layer_mapped:
+            for k, v in layer_to_cat.items():
+                if k and (k in layer or layer in k):
+                    category = v
+                    break
+        if not category:
+            if any_layer_mapped:
+                continue
+            category = FALLBACK_CAT
+        if category not in cats:
+            cats[category] = {
+                "indicator": "",
+                "keyword": category,
+                "color": _CATEGORY_PALETTE[len(cats) % len(_CATEGORY_PALETTE)],
+            }
+        # Key by the auto_lines index (post-filter), not the all_lines
+        # index — exports.generate_measurement_pdf indexes into auto_lines.
+        page_assignments[str(len(auto_lines))] = category
+        auto_lines.append(line)
+
+    return cats, page_assignments, auto_lines
+
+
+def _umt_export_for_page(
+    page_state: dict,
+    vlines_dicts: list[dict],
+) -> tuple[dict, dict, list, list]:
+    """UMT-driven export shape for one fence page.
+
+    Returns (cats, page_assignments, auto_lines, user_drawn_lines).
+    Drops indicator-code placeholder categories and orphaned assignments
+    (saved indices that fall outside the current vector-line list, e.g.
+    after a re-run). Re-keys assignments by auto_lines index to match
+    exports.generate_measurement_pdf's iteration.
+    """
+    raw_cats = page_state.get("categories") or {}
+    cats: dict[str, dict] = {}
+    for cat_name, cat_info in raw_cats.items():
+        ind = (cat_info.get("indicator") or "").strip()
+        kw = (cat_info.get("keyword") or "").strip()
+        if ind and kw and ind == kw:
+            continue  # indicator-code placeholder
+        color = cat_info.get("color")
+        if isinstance(color, list) and len(color) == 3:
+            color_t = (int(color[0]), int(color[1]), int(color[2]))
+        else:
+            color_t = _CATEGORY_PALETTE[len(cats) % len(_CATEGORY_PALETTE)]
+        cats[cat_name] = {
+            "indicator": ind,
+            "keyword": kw,
+            "color": color_t,
+        }
+
+    page_assignments: dict[str, str] = {}
+    auto_lines: list[dict] = []
+    for idx_str, cat in (page_state.get("line_assignments") or {}).items():
+        try:
+            i = int(idx_str)
+        except (TypeError, ValueError):
+            continue
+        if i < 0 or i >= len(vlines_dicts):
+            continue
+        if cat not in cats:
+            cats[cat] = {
+                "indicator": "",
+                "keyword": cat,
+                "color": _CATEGORY_PALETTE[len(cats) % len(_CATEGORY_PALETTE)],
+            }
+        page_assignments[str(len(auto_lines))] = cat
+        auto_lines.append(vlines_dicts[i])
+
+    user_drawn = []
+    for ul in page_state.get("user_drawn_lines") or []:
+        cat = ul.get("category")
+        if not cat:
+            continue
+        try:
+            sx = float(ul["start"][0]); sy = float(ul["start"][1])
+            ex = float(ul["end"][0]); ey = float(ul["end"][1])
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+        if cat not in cats:
+            cats[cat] = {
+                "indicator": "",
+                "keyword": cat,
+                "color": _CATEGORY_PALETTE[len(cats) % len(_CATEGORY_PALETTE)],
+            }
+        user_drawn.append({"start": [sx, sy], "end": [ex, ey], "category": cat})
+
+    return cats, page_assignments, auto_lines, user_drawn
+
+
+def _build_export_state(
+    job_id: str,
+    results: dict,
+    pdf_path: str | None,
+) -> tuple[list, dict, dict, dict, dict, dict]:
+    """Build the export tuple for `exports.generate_measurement_*`.
+
+    Per page: if `umt_state.json` has saved edits, recompute the page's
+    categories / line_assignments / user_drawn_lines from saved state
+    (re-extracting vector lines from `pdf_path` to resolve indices).
+    Otherwise fall back to pipeline auto detection.
+
+    Returns: (fence_pages_with_auto_lines, line_assignments,
+    user_drawn_lines, page_categories, per_page_scale_info, lines_by_page).
+    """
+    from backend.app import umt_state as umt_state_mod
+
     fence_pages_in = (results or {}).get("fence_pages") or []
     per_page_scale = (results or {}).get("per_page_scale_info") or {}
+    umt = umt_state_mod.load(job_id)
+    pages_node = (umt or {}).get("pages") or {}
+
+    # Pre-extract vector lines for any page that has UMT edits, sharing
+    # one fitz.Doc handle across pages to avoid repeated opens.
+    umt_lines_by_idx: dict[int, list[dict]] = {}
+    needs_extraction = [
+        fp for fp in fence_pages_in
+        if isinstance(fp, dict)
+        and pages_node.get(f"page_{fp.get('page_num') or fp.get('page_number')}")
+        and (
+            (pages_node.get(f"page_{fp.get('page_num') or fp.get('page_number')}", {}).get("line_assignments"))
+            or (pages_node.get(f"page_{fp.get('page_num') or fp.get('page_number')}", {}).get("user_drawn_lines"))
+        )
+    ]
+    if needs_extraction and pdf_path and Path(pdf_path).exists():
+        import fitz
+        from utils_vector import extract_vector_lines
+
+        doc = None
+        try:
+            doc = fitz.open(pdf_path)
+            for fp in needs_extraction:
+                page_idx = fp.get("page_idx")
+                if page_idx is None:
+                    page_idx = fp.get("page_index_in_original_doc")
+                if page_idx is None:
+                    continue
+                if not (0 <= page_idx < len(doc)):
+                    continue
+                vlines = extract_vector_lines(doc[page_idx], apply_rotation=True)
+                umt_lines_by_idx[page_idx] = [
+                    {
+                        "start": [float(v.start[0]), float(v.start[1])],
+                        "end": [float(v.end[0]), float(v.end[1])],
+                        "length_pts": float(v.length_pts),
+                        "layer": v.layer or "",
+                    }
+                    for v in vlines
+                ]
+        finally:
+            if doc is not None:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
 
     line_assignments: dict[str, dict[str, str]] = {}
+    user_drawn_lines: dict[str, list] = {}
     page_categories: dict[str, dict] = {}
     lines_by_page: dict[str, list] = {}
     fence_pages_out: list[dict] = []
@@ -1210,88 +1391,53 @@ def _build_auto_export_state(results: dict) -> tuple[list, dict, dict, dict]:
         if page_num is None:
             continue
         page_key = f"page_{page_num}"
+        page_state = pages_node.get(page_key)
+        has_user_edits = bool(
+            page_state
+            and (page_state.get("line_assignments") or page_state.get("user_drawn_lines"))
+        )
 
-        # 1) Build category palette from this page's legend entries (the
-        # LLM-extracted (indicator, keyword, description) tuples). Note: the
-        # `definitions` field on a fence page is the raw ADE chunk text, not
-        # the legend rows — those live on `legend_entries`.
-        cats: dict[str, dict] = {}
-        for le in fp.get("legend_entries") or []:
-            keyword = (le.get("keyword") or "").strip()
-            indicator = (le.get("indicator") or "").strip()
-            if not keyword:
-                continue
-            cat_name = f"{indicator}: {keyword}" if indicator else keyword
-            if cat_name in cats:
-                continue
-            cats[cat_name] = {
-                "indicator": indicator,
-                "keyword": keyword,
-                "color": _CATEGORY_PALETTE[len(cats) % len(_CATEGORY_PALETTE)],
-            }
+        if has_user_edits:
+            page_idx = fp.get("page_idx")
+            if page_idx is None:
+                page_idx = fp.get("page_index_in_original_doc")
+            vlines_dicts = (
+                umt_lines_by_idx.get(int(page_idx)) if page_idx is not None else []
+            ) or []
+            cats, page_assignments, auto_lines, udl = _umt_export_for_page(
+                page_state, vlines_dicts
+            )
+            if udl:
+                user_drawn_lines[page_key] = udl
+        else:
+            cats, page_assignments, auto_lines = _auto_export_for_page(fp)
+
         page_categories[page_key] = cats
-
-        # 2) Auto-detected fence lines + layer→category assignment.
-        measurements = fp.get("measurements") or {}
-        all_lines = measurements.get("all_fence_lines") or []
-        layer_to_cat = measurements.get("layer_to_category") or {}
-
-        page_assignments: dict[str, str] = {}
-        auto_lines: list[dict] = []
-        # Last-resort bucket so users get *something* when the LLM didn't
-        # produce a layer→category mapping (this happens when legend
-        # extraction returns no matches but Phase 3 still detected lines
-        # geometrically — the prod UMT relies on the user assigning these
-        # by hand, which we can't do until Sprint 4).
-        FALLBACK_CAT = "Auto-detected"
-        any_layer_mapped = bool(layer_to_cat)
-
-        for line in all_lines:
-            if not isinstance(line, dict):
-                continue
-            layer = line.get("layer") or ""
-            category = layer_to_cat.get(layer)
-            # Partial layer match fallback (mirrors prod logic at
-            # app_ade_prod.py:4799-4804).
-            if not category and layer and any_layer_mapped:
-                for k, v in layer_to_cat.items():
-                    if k and (k in layer or layer in k):
-                        category = v
-                        break
-            if not category:
-                # If we have NO layer mapping at all, group the page's auto
-                # lines under a single fallback category. Skip lines that
-                # have no geometry though — they wouldn't render anyway.
-                if any_layer_mapped:
-                    continue
-                category = FALLBACK_CAT
-            # Only record an assignment if the named category actually exists
-            # in this page's palette — otherwise the export drops the row.
-            if category not in cats:
-                cats[category] = {
-                    "indicator": "",
-                    "keyword": category,
-                    "color": _CATEGORY_PALETTE[len(cats) % len(_CATEGORY_PALETTE)],
-                }
-            # Key by the auto_lines index (post-filter), not the all_lines
-            # index — exports.generate_measurement_pdf indexes into
-            # auto_lines, so any layer-skipped line would shift later lines
-            # out of alignment and silently drop them from the PDF / Excel.
-            page_assignments[str(len(auto_lines))] = category
-            auto_lines.append(line)
-
         if page_assignments:
             line_assignments[page_key] = page_assignments
         if auto_lines:
             lines_by_page[page_key] = auto_lines
 
-        # 3) Carry the page through with `auto_lines` populated so the PDF
-        # exporter can index into it.
+        # Carry the per-page scale override from umt_state if set.
+        if page_state and page_state.get("scale_override"):
+            override = page_state.get("scale_override")
+            if isinstance(override, (int, float)) and override > 0:
+                ps = dict(per_page_scale.get(page_key) or {})
+                ps["verified_scale"] = float(override)
+                per_page_scale = {**per_page_scale, page_key: ps}
+
         fp_out = dict(fp)
         fp_out["auto_lines"] = auto_lines
         fence_pages_out.append(fp_out)
 
-    return fence_pages_out, line_assignments, {}, page_categories, per_page_scale, lines_by_page
+    return (
+        fence_pages_out,
+        line_assignments,
+        user_drawn_lines,
+        page_categories,
+        per_page_scale,
+        lines_by_page,
+    )
 
 
 @app.get("/api/jobs/{job_id}/measurement-pdf")
@@ -1310,16 +1456,28 @@ async def get_measurement_pdf(
     if job["user_id"] != user_id:
         raise HTTPException(403, "Access denied")
 
+    # PDF generation overlays measurement lines on top of the page's
+    # native vector content. If the original PDF is gone we can't
+    # cleanly fall back to the highlighted PDF — `insert_pdf` would
+    # carry the cyan fence overlays into the output and the resulting
+    # doubly-decorated, deflate-compressed PDF takes minutes on dense
+    # pages. Ask the user to re-upload instead. (Excel works either
+    # way — it only consumes coords, not the visual content.)
     pdf_path = job.get("pdf_path")
     if not pdf_path or not Path(pdf_path).exists():
-        raise HTTPException(404, "Source PDF not on disk")
+        raise HTTPException(
+            404,
+            "Source PDF for this job is no longer on disk. "
+            "Re-upload the document to generate a measurement PDF "
+            "(the Measurement Excel still works without the source).",
+        )
 
     results = job_registry.load_results(job_id)
     if results is None:
         raise HTTPException(404, "Results not available — job may still be running")
 
     fence_pages_out, line_assignments, user_drawn, page_cats, _scale, _lines = (
-        _build_auto_export_state(results)
+        _build_export_state(job_id, results, pdf_path)
     )
 
     from exports import generate_measurement_pdf
@@ -1349,22 +1507,31 @@ async def get_measurement_excel(
     job_id: str,
     user_id: str = Depends(get_current_user),
 ):
-    """Measurement Excel (Sprint 3 / C6).
+    """Measurement Excel (Sprint 3 / C6, UMT-aware after Sprint 4 4a.8).
 
-    Wraps `exports.generate_measurement_spreadsheet`. Same auto-only caveat
-    as the PDF export."""
+    Pulls saved UMT edits from `umt_state.json` per page when present,
+    otherwise falls back to auto-detected fence lines from the pipeline.
+    """
     job = job_registry.get_job(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
     if job["user_id"] != user_id:
         raise HTTPException(403, "Access denied")
 
+    pdf_path = job.get("pdf_path")
+    if not pdf_path or not Path(pdf_path).exists():
+        hl = job_registry.get_highlighted_pdf_path(job_id)
+        if hl is not None and Path(hl).exists():
+            pdf_path = str(hl)
+        # Excel doesn't need the PDF unless UMT edits exist; if none of
+        # the pages have edits, _build_export_state will skip extraction.
+
     results = job_registry.load_results(job_id)
     if results is None:
         raise HTTPException(404, "Results not available — job may still be running")
 
     fence_pages_out, line_assignments, user_drawn, page_cats, scale_info, lines_by_page = (
-        _build_auto_export_state(results)
+        _build_export_state(job_id, results, pdf_path)
     )
     element_details = (results or {}).get("element_details") or {}
 
