@@ -80,6 +80,43 @@ GET    /api/documents/{id}                 — JWT only; single doc with latest 
 
 ---
 
+## Sprint 1 verification (2026-05-08)
+
+Verified against `frontend/app/documents/[id]/page.tsx`. **8 of 9 features fully implemented, 1 cosmetic-only difference:**
+
+| | Feature | Status |
+|---|---|---|
+| A1 | Element specifications table | ✅ (lines 883–944) |
+| A2 | Full Detail Text on row click | ✅ |
+| A3 | Detection method badges | ✅ (557–570) |
+| A4 | Non-fence reasoning | 🟡 Implemented inline in `NonFencePageCard` (727–767) — not as the separate "panel" the original doc described, but all data renders. Functional parity. |
+| A6 | ADE chunk metrics | ✅ (589–596) |
+| B1 | Layer breakdown expander | ✅ (802–843) |
+| B2 | Dimension lines expander | ✅ (846–880) |
+| B3 | Scale detection debug | ✅ (628–661) |
+| — | Three-way filter (fence / non-fence / all) | ✅ (436–471) |
+| — | Phase-timing grid | ✅ (377–390) |
+| — | Highlighted-PDF download button | ✅ (line 353) |
+
+No regressions found. Treat Sprint 1 as **done**.
+
+## Parity audit vs `app_ade_prod.py` (2026-05-08)
+
+Combed prod for user-workflow features the plan might have missed. The user clarified: parity goal = **what the customer touches**, not operator/queue/telemetry surfaces.
+
+**Single net-new gap added to plan:** **C8 — Cross-page summary table by category** (prod 6935–7050). Grand totals across pages, auto vs manual line counts, ft per category, per-page breakdown. Ships with UMT in Sprint 4 — without it, the user has nothing to hand the customer at end of run.
+
+Items the prod app has that **don't** belong in user-workflow parity (deliberately skipped):
+- Queue / slot management UI (operator concern; `job_registry.py` enforces it server-side)
+- Spend / telemetry / daily-cap displays (D1–D3 — internal)
+- Sidebar API-key inputs (replaced by `.env` / Supabase secrets)
+
+Items that initially looked missing but are already covered in the plan or in code:
+- Highlighted PDF download — already on detail page
+- Per-page image download / lazy-load button — same as A5 / C7 in Sprint 2/3
+- Confidence / reasoning text (some) — Sprint 1 covers scale debug; B4/B5 cover the rest
+- New-analysis / reset flow — uploading another PDF on the dashboard already does this; explicit "reset" button not needed
+
 ## What's left — prioritised
 
 ### Sprint 2 — live observability (~1 session)
@@ -101,10 +138,10 @@ Plan refs: A9 / C5 / C6 / C7.
 | C6 | **Measurements Excel download** | `GET /api/jobs/{id}/measurement-excel` wrapping `exports.py:generate_measurement_spreadsheet` | Add download button |
 | C7 | **Per-page image downloads** ("DL HL Img", "DL Orig Img") | Re-uses A5's image endpoint with a `?download=1` param | Add small download links to per-page cards |
 
-### Sprint 4 — UMT (CRITICAL PATH, biggest scope)
-Plan refs: C1–C4.
+### Sprint 4 — UMT + summary report (CRITICAL PATH, biggest scope)
+Plan refs: C1–C4, **C8**.
 
-User confirmed customers *always* correct measurements manually — must ship before launch.
+User confirmed customers *always* correct measurements manually — must ship before launch. C8 (cross-page summary table) ships with UMT — it's the report the user hands to the customer.
 
 **Two paths to evaluate (decision needed at start of sprint):**
 
