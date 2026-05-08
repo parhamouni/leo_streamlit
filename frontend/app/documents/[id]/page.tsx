@@ -5,6 +5,12 @@ import { useRouter, useParams } from "next/navigation";
 import Link from "next/link";
 import { supabase } from "@/lib/supabase";
 import { apiFetch, apiJson, ApiError } from "@/lib/api";
+import {
+  etaSeconds,
+  formatEta,
+  phaseRange,
+  withinPhasePct,
+} from "@/lib/eta";
 import { RowActions } from "@/components/RowActions";
 import {
   cleanElementKey,
@@ -37,6 +43,8 @@ type DashboardDoc = {
   current_phase: string | null;
   progress_percent: number | null;
   error_message: string | null;
+  job_started_at: string | null;
+  phase_started_at: string | null;
 };
 
 type PageRow = {
@@ -368,20 +376,7 @@ export default function DocumentDetailPage() {
                 )}
               </div>
               {isActive && (
-                <div className="mt-3">
-                  <div className="flex items-center gap-2 text-sm text-gray-600">
-                    {doc.current_phase && (
-                      <span className="font-mono">{doc.current_phase}</span>
-                    )}
-                    <span className="font-mono">{doc.progress_percent ?? 0}%</span>
-                  </div>
-                  <div className="mt-1 h-1.5 w-full max-w-md bg-gray-200 rounded overflow-hidden">
-                    <div
-                      className="h-full bg-blue-500 transition-all duration-700 ease-out"
-                      style={{ width: `${doc.progress_percent ?? 0}%` }}
-                    />
-                  </div>
-                </div>
+                <ProgressBlock doc={doc} />
               )}
               {doc.error_message && (
                 <div className="mt-3 text-sm text-red-700 break-all">
@@ -587,6 +582,61 @@ export default function DocumentDetailPage() {
 
 function Empty({ msg }: { msg: string }) {
   return <div className="p-6 text-sm text-gray-500 text-center">{msg}</div>;
+}
+
+function ProgressBlock({ doc }: { doc: DashboardDoc }) {
+  const overall = doc.progress_percent ?? 0;
+  const range = phaseRange(doc.current_phase);
+  const within = range ? withinPhasePct(doc.current_phase, overall) : null;
+  const overallEta = formatEta(etaSeconds(doc.job_started_at, overall));
+  const phaseEta =
+    range && within != null
+      ? formatEta(etaSeconds(doc.phase_started_at, within))
+      : null;
+
+  return (
+    <div className="mt-3 space-y-2">
+      {/* Overall */}
+      <div>
+        <div className="flex items-center gap-2 text-sm text-gray-600">
+          <span className="font-mono text-xs uppercase tracking-wide text-gray-500">
+            Overall
+          </span>
+          <span className="font-mono">{overall}%</span>
+          {overallEta && (
+            <span className="text-xs text-gray-500">· {overallEta} left</span>
+          )}
+        </div>
+        <div className="mt-1 h-1.5 w-full max-w-md bg-gray-200 rounded overflow-hidden">
+          <div
+            className="h-full bg-blue-500 transition-all duration-700 ease-out"
+            style={{ width: `${overall}%` }}
+          />
+        </div>
+      </div>
+
+      {/* Within current phase */}
+      {range && within != null && (
+        <div>
+          <div className="flex items-center gap-2 text-sm text-gray-600">
+            <span className="font-mono text-xs uppercase tracking-wide text-gray-500">
+              {range.label}
+            </span>
+            <span className="font-mono">{Math.round(within)}%</span>
+            {phaseEta && (
+              <span className="text-xs text-gray-500">· {phaseEta} for this phase</span>
+            )}
+          </div>
+          <div className="mt-1 h-1.5 w-full max-w-md bg-gray-100 rounded overflow-hidden">
+            <div
+              className="h-full bg-emerald-500 transition-all duration-700 ease-out"
+              style={{ width: `${within}%` }}
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function StatCard({

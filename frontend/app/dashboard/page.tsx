@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { supabase } from "@/lib/supabase";
 import { apiJson, ApiError } from "@/lib/api";
+import { etaSeconds, formatEta } from "@/lib/eta";
 import { UploadButton } from "@/components/UploadButton";
 import { RowActions } from "@/components/RowActions";
 
@@ -20,6 +21,8 @@ type Document = {
   current_phase: string | null;
   progress_percent: number | null;
   error_message: string | null;
+  job_started_at: string | null;
+  phase_started_at: string | null;
 };
 
 type DocumentList = { documents: Document[] };
@@ -59,6 +62,7 @@ function isActive(d: Document): boolean {
 function ProgressCell({ doc }: { doc: Document }) {
   if (doc.job_status === "running" || doc.job_status === "queued") {
     const pct = doc.progress_percent ?? 0;
+    const eta = formatEta(etaSeconds(doc.job_started_at, pct));
     return (
       <div className="flex items-center gap-2 justify-end">
         <div className="w-24 h-1.5 bg-gray-200 rounded overflow-hidden">
@@ -70,6 +74,11 @@ function ProgressCell({ doc }: { doc: Document }) {
         <span className="text-xs text-gray-500 font-mono w-9 text-right">
           {pct}%
         </span>
+        {eta && (
+          <span className="text-[10px] text-gray-400 font-mono w-16 text-right">
+            {eta}
+          </span>
+        )}
       </div>
     );
   }

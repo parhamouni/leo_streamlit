@@ -96,10 +96,13 @@ def list_documents(user_id: str, limit: int = 100) -> list[dict[str, Any]]:
               j.status        as job_status,
               j.current_phase,
               j.progress_percent,
-              j.error_message
+              j.error_message,
+              j.started_at    as job_started_at,
+              j.phase_started_at
             from documents d
             left join lateral (
-              select id, status, current_phase, progress_percent, error_message
+              select id, status, current_phase, progress_percent, error_message,
+                     started_at, phase_started_at
               from jobs
               where document_id = d.id
               order by created_at desc
@@ -132,10 +135,13 @@ def get_document(document_id: str, user_id: str) -> dict[str, Any] | None:
               j.status        as job_status,
               j.current_phase,
               j.progress_percent,
-              j.error_message
+              j.error_message,
+              j.started_at    as job_started_at,
+              j.phase_started_at
             from documents d
             left join lateral (
-              select id, status, current_phase, progress_percent, error_message
+              select id, status, current_phase, progress_percent, error_message,
+                     started_at, phase_started_at
               from jobs
               where document_id = d.id
               order by created_at desc
@@ -237,10 +243,13 @@ def find_document_by_hash(user_id: str, pdf_hash: str) -> dict[str, Any] | None:
               j.status        as job_status,
               j.current_phase,
               j.progress_percent,
-              j.error_message
+              j.error_message,
+              j.started_at    as job_started_at,
+              j.phase_started_at
             from documents d
             left join lateral (
-              select id, status, current_phase, progress_percent, error_message
+              select id, status, current_phase, progress_percent, error_message,
+                     started_at, phase_started_at
               from jobs
               where document_id = d.id
               order by created_at desc
@@ -273,6 +282,15 @@ def update_job_progress(
         sets.append("status = %s")
         params.append(status)
     if current_phase is not None:
+        # Bump phase_started_at to now() iff the phase actually changes.
+        # The CASE compares the OLD row's current_phase (pre-SET semantics
+        # in PG) against the new value — same %s param used twice via the
+        # two placeholders below.
+        sets.append(
+            "phase_started_at = case when current_phase is distinct from %s "
+            "then now() else phase_started_at end"
+        )
+        params.append(current_phase)
         sets.append("current_phase = %s")
         params.append(current_phase)
     if progress_percent is not None:
