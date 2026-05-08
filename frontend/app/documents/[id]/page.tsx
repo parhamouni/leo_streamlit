@@ -954,46 +954,6 @@ function FencePageCard({
         {/* Legend definitions (rich, with descriptions) */}
         {legend.length > 0 && <LegendTable rows={legend} />}
 
-        {/* Figure / drawing regions detected by ADE.
-            The pipeline puts raw figure-type ADE chunks here, NOT matched
-            indicator codes (those live in legend_entries above). Render as
-            a labeled list instead of a table that pretends each row is an
-            "instance" with an indicator. */}
-        {instances.some((i) => i.indicator && i.indicator.trim()) ? (
-          <div>
-            <div className="text-xs uppercase text-gray-500 mb-1">
-              Detected instances ({instances.filter((i) => i.indicator && i.indicator.trim()).length})
-            </div>
-            <div className="overflow-x-auto border rounded">
-              <table className="w-full text-sm">
-                <thead className="bg-gray-50 text-gray-500 text-xs uppercase">
-                  <tr>
-                    <th className="text-left px-3 py-1.5 font-medium">Indicator</th>
-                    <th className="text-left px-3 py-1.5 font-medium">Location (bbox)</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {instances
-                    .filter((i) => i.indicator && i.indicator.trim())
-                    .slice(0, 50)
-                    .map((i, idx) => (
-                      <tr key={idx} className="hover:bg-gray-50">
-                        <td className="px-3 py-1.5 align-top font-mono">{i.indicator}</td>
-                        <td className="px-3 py-1.5 text-gray-500 font-mono text-xs">
-                          {i.bbox ? `[${i.bbox.map((n) => Math.round(n)).join(", ")}]` : "—"}
-                        </td>
-                      </tr>
-                    ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        ) : null}
-
-        {/* Raw ADE figure chunks intentionally not rendered —
-            app_ade_prod.py only shows matched indicators in its
-            Instances table, never the raw figure regions. */}
-
         {/* Classification reasoning (when keyword fallback) */}
         {page.classification?.reasoning && (
           <div className="text-xs bg-blue-50 border border-blue-200 rounded p-2">

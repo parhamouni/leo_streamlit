@@ -5,8 +5,9 @@
 
 **Branch:** `feat/web-app-migration` (~25 commits, 30+ files)
 **Plan file:** `/home/ubuntu/.claude/plans/yes-i-get-you-refactored-hummingbird.md`
+**Stage-1 highlighting plan (now superseded — work below is done):** `/home/ubuntu/.claude/plans/fuck-you-you-are-splendid-beacon.md`
 **Decision log:** UMT confirmed **critical-path** (customers always correct measurements manually).
-**Last updated:** 2026-05-08 — Sprint 3 done; highlighter geometry fixed; live-pages debug pending a fresh run.
+**Last updated:** 2026-05-08 — Sprint 3 done + stage-1 highlighted-PDF parity with `app_ade_prod.py` shipped (definitions / instances / keyword_matches all from real bboxes incl. OCR-with-bboxes for scanned pages).
 
 ---
 
@@ -56,6 +57,7 @@ The legacy Streamlit prod stays untouched per user instruction (they're serving 
 | `6b66f7d` | **Bug fix**: wire the highlighted-PDF subprocess worker properly (it had been silently dead — `out_path` never set, JSON descriptor written to disk as PDF) + actually draw fence lines on the highlighted PDF |
 | `10146db` | **Bug fix**: line endpoints now transform per-point on rotated pages (`reverse_rotation_point`). Rectangle-shaped formula was scrambling y-coords on rot=90/180/270 pages. |
 | `f61e793` | Diagnostics: `_page_cb` log line + migration 004 (`page_results.updated_at`) for the live-pages debug |
+| **(this commit)** | **Stage-1 highlighted-PDF parity with `app_ade_prod.py`.** Five wins, one file (`pipeline.py`) + one frontend cleanup: (1) `definitions` is now `legend_entries` (LLM per-row tight bboxes) instead of raw legend chunks; (2) new instance-finding step calls `find_instances_in_figures_fast` to get per-token indicator bboxes inside figures; (3) keyword scanner now runs against `get_native_pdf_lines` output (real per-line bboxes) so orange rectangles land at correct locations; (4) `phase1b` OCR step now preserves the per-line bboxes returned by Google DocAI (cache key bumped to `phase1b_v2`) — required for scanned pages where native PDF text is missing or has CID-without-CMap encoding; (5) `keyword_matches` always populated (deviates from prod's fallback semantics — user wants orange alongside green/purple). Frontend: removed the noisy "Detected Instances (bbox)" table from the detail page — only the legend definitions table remains. |
 
 ### Endpoints currently live on the backend
 
@@ -185,8 +187,11 @@ Worker's `reverse_rotation()` was rectangle-shaped — applied a single (x0,y0,x
 
 For the **measurement PDF** (the C5 download), `exports.generate_measurement_pdf` *also* uses the same rect-shaped formula on lines and has the same logical bug — but exports.py is shared with prod's flow, so we have a choice: leave it (matches prod's behaviour, even if both are wrong on rotated pages) or fork. Currently leaving it. Flag if the customer cares.
 
-### 4. `app_ade_prod.py` colour-codes lines per category; we draw uniform cyan
-Prod's drawing loop (lines 1774-1808) reads `categories[category]['color']` for each line. Ours uses cyan for all. User has flagged this implicitly ("highlighting still incorrect"). To match: thread the same auto-assignment that the export builder produces (`_build_auto_export_state` in `api_server.py`) into the highlight worker as a `line_categories` field, then have the worker pick the colour from that map per line. Probably a 30-line addition; not blocking Sprint 4.
+### 4. `app_ade_prod.py` colour-codes lines per category; we draw uniform cyan (stage-2 measurement only — not blocking)
+Prod's drawing loop (lines 1774-1808) reads `categories[category]['color']` for each line. Ours uses cyan for all. **This applies to the stage-2 measurement-PDF download, NOT the stage-1 highlighted PDF.** Stage 1 is now prod-equivalent (definitions/instances/keyword_matches) — see "Stage-1 highlighted-PDF parity" commit above. To close stage-2: thread the same auto-assignment that the export builder produces (`_build_auto_export_state` in `api_server.py`) into the highlight worker as a `line_categories` field, then have the worker pick the colour from that map per line. Probably a 30-line addition; not blocking Sprint 4.
+
+### 5. OCR-with-bboxes covers Google DocAI only
+The new `ocr_lines_by_page` plumbing wires OCR-line bboxes into the keyword scan, legend extraction, and instance-finding — required for scanned pages whose native PDF text is missing/CID-without-CMap. Today this only fires when `google_cloud_config` is configured (DocAI). If the `<50` native-text fallback path is ever broadened (e.g. Tesseract local OCR), keep the same lines-with-bboxes shape.
 
 ---
 
