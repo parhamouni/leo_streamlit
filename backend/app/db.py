@@ -190,6 +190,7 @@ def insert_document_and_job(
     storage_path: str,
     total_pages: int | None,
     job_id: str,
+    pdf_hash: str | None = None,
     document_status: str = "uploaded",
     job_status: str = "queued",
 ) -> tuple[str, str]:
@@ -201,11 +202,11 @@ def insert_document_and_job(
             doc_row = conn.execute(
                 """
                 insert into documents
-                  (user_id, original_filename, storage_path, status, total_pages)
-                values (%s, %s, %s, %s, %s)
+                  (user_id, original_filename, storage_path, status, total_pages, pdf_hash)
+                values (%s, %s, %s, %s, %s, %s)
                 returning id
                 """,
-                (user_id, original_filename, storage_path, document_status, total_pages),
+                (user_id, original_filename, storage_path, document_status, total_pages, pdf_hash),
             ).fetchone()
             doc_id = str(doc_row["id"])
             conn.execute(
@@ -216,6 +217,42 @@ def insert_document_and_job(
                 (job_id, doc_id, user_id, job_status),
             )
     return (doc_id, job_id)
+
+
+def find_document_by_hash(user_id: str, pdf_hash: str) -> dict[str, Any] | None:
+    """Return the most recent document for this user that matches the
+    given pdf_hash, with the latest job's status joined in. Used for
+    upload deduplication."""
+    with pool().connection() as conn:
+        row = conn.execute(
+            """
+            select
+              d.id,
+              d.original_filename,
+              d.status        as document_status,
+              d.total_pages,
+              d.created_at,
+              d.pdf_hash,
+              j.id            as latest_job_id,
+              j.status        as job_status,
+              j.current_phase,
+              j.progress_percent,
+              j.error_message
+            from documents d
+            left join lateral (
+              select id, status, current_phase, progress_percent, error_message
+              from jobs
+              where document_id = d.id
+              order by created_at desc
+              limit 1
+            ) j on true
+            where d.user_id = %s and d.pdf_hash = %s
+            order by d.created_at desc
+            limit 1
+            """,
+            (user_id, pdf_hash),
+        ).fetchone()
+    return _row_to_dict(row) if row else None
 
 
 def update_job_progress(

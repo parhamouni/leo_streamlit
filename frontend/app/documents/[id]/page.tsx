@@ -8,17 +8,14 @@ import { apiFetch, apiJson, ApiError } from "@/lib/api";
 
 // --- Types ---------------------------------------------------------------
 
-type Document = {
+type DashboardDoc = {
   id: string;
   user_id: string;
   original_filename: string;
   storage_path: string;
-  status: string;
+  document_status: string;
   total_pages: number | null;
   created_at: string;
-};
-
-type DashboardDoc = Document & {
   latest_job_id: string | null;
   job_status: string | null;
   current_phase: string | null;
@@ -26,13 +23,70 @@ type DashboardDoc = Document & {
   error_message: string | null;
 };
 
+type ScaleInfo = {
+  success?: boolean;
+  verified_scale?: number;
+  scale_text?: string;
+  confidence?: "low" | "medium" | "high";
+  message?: string;
+  method?: string;
+};
+
+type Measurements = {
+  proximity_totals?: {
+    total_segments?: number;
+    total_length_feet?: number;
+    total_length_pts?: number;
+  };
+  totals?: {
+    total_layers?: number;
+    total_segments?: number;
+    total_length_feet?: number;
+  };
+  measurement_method?: string;
+  fence_layers?: unknown[];
+  layer_measurements?: Record<string, unknown>;
+};
+
+type LegendEntry = {
+  indicator?: string;
+  description?: string;
+  bbox?: number[];
+  [k: string]: unknown;
+};
+
+type Instance = {
+  indicator?: string;
+  bbox?: number[];
+  page_num?: number;
+  [k: string]: unknown;
+};
+
+type FencePage = {
+  page_idx: number;
+  page_num: number;
+  width?: number;
+  height?: number;
+  rotation?: number;
+  fence_text?: string;
+  ade_chunks?: unknown[];
+  definitions?: LegendEntry[];
+  instances?: Instance[];
+  keyword_matches?: unknown[];
+  legend_entries?: LegendEntry[];
+  scale_info?: ScaleInfo;
+  measurements?: Measurements;
+};
+
+type NonFencePage = {
+  page_idx: number;
+  page_num: number;
+  fence_text?: string;
+};
+
 type PipelineResults = {
-  fence_pages?: number[];
-  non_fence_pages?: number[];
-  element_details?: Record<string, unknown>;
-  per_page_scale_info?: Record<string, unknown>;
-  unified_measurements?: Record<string, unknown>;
-  page_categories?: Record<string, unknown>;
+  fence_pages?: FencePage[];
+  non_fence_pages?: NonFencePage[];
   total_pages?: number;
   timings?: Record<string, number>;
   error?: string | null;
@@ -80,19 +134,6 @@ function StatusBadge({ status }: { status: string | null }) {
   );
 }
 
-async function downloadHighlightedPDF(jobId: string, filename: string) {
-  const resp = await apiFetch(`/api/jobs/${jobId}/highlighted-pdf`);
-  const blob = await resp.blob();
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `fence_${filename}`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
 // --- Page ----------------------------------------------------------------
 
 export default function DocumentDetailPage() {
@@ -103,9 +144,10 @@ export default function DocumentDetailPage() {
   const [authReady, setAuthReady] = useState(false);
   const [doc, setDoc] = useState<DashboardDoc | null>(null);
   const [results, setResults] = useState<PipelineResults | null>(null);
+  const [pdfBlobUrl, setPdfBlobUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<"all" | "fence">("all");
+  const [filter, setFilter] = useState<"fence" | "all">("fence");
   const [downloading, setDownloading] = useState(false);
 
   // Auth gate
@@ -168,7 +210,7 @@ export default function DocumentDetailPage() {
     if (authReady) refresh(false);
   }, [authReady, refresh]);
 
-  // Poll while job is active
+  // Poll while running/queued
   const docRef = useRef<DashboardDoc | null>(null);
   docRef.current = doc;
   useEffect(() => {
@@ -199,7 +241,6 @@ export default function DocumentDetailPage() {
       }
     };
     document.addEventListener("visibilitychange", onVisibility);
-
     return () => {
       alive = false;
       if (timer) clearTimeout(timer);
@@ -207,11 +248,47 @@ export default function DocumentDetailPage() {
     };
   }, [authReady, doc, refresh]);
 
+  // Fetch the highlighted PDF blob once, when job completes
+  useEffect(() => {
+    if (!doc || doc.job_status !== "completed" || !doc.latest_job_id) {
+      return;
+    }
+    if (pdfBlobUrl) return; // already loaded
+
+    let active = true;
+    let url: string | null = null;
+    apiFetch(`/api/jobs/${doc.latest_job_id}/highlighted-pdf`)
+      .then((r) => r.blob())
+      .then((blob) => {
+        if (!active) return;
+        url = URL.createObjectURL(blob);
+        setPdfBlobUrl(url);
+      })
+      .catch(() => {
+        // Highlighted PDF may not exist if pipeline didn't generate one
+      });
+
+    return () => {
+      active = false;
+      if (url) URL.revokeObjectURL(url);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doc?.job_status, doc?.latest_job_id]);
+
   async function onDownload() {
     if (!doc?.latest_job_id) return;
     setDownloading(true);
     try {
-      await downloadHighlightedPDF(doc.latest_job_id, doc.original_filename);
+      const resp = await apiFetch(`/api/jobs/${doc.latest_job_id}/highlighted-pdf`);
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `fence_${doc.original_filename}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(`Download failed: ${msg}`);
@@ -248,11 +325,20 @@ export default function DocumentDetailPage() {
 
   if (!doc) return null;
 
-  const fencePages = results?.fence_pages ?? [];
+  const fencePages = (results?.fence_pages ?? []).filter(
+    (p): p is FencePage => p && typeof p === "object",
+  );
   const nonFencePages = results?.non_fence_pages ?? [];
-  const allPagesSorted = [...fencePages, ...nonFencePages].sort((a, b) => a - b);
-  const visiblePages = filter === "fence" ? fencePages : allPagesSorted;
-  const fenceSet = new Set(fencePages);
+  const totalCount = fencePages.length + nonFencePages.length;
+
+  // Sum total fence length across all fence pages
+  const totalLengthFt = fencePages.reduce((acc, p) => {
+    const ft =
+      p.measurements?.proximity_totals?.total_length_feet ??
+      p.measurements?.totals?.total_length_feet ??
+      0;
+    return acc + (ft || 0);
+  }, 0);
 
   const isActive =
     doc.job_status === "queued" || doc.job_status === "running";
@@ -260,7 +346,7 @@ export default function DocumentDetailPage() {
 
   return (
     <main className="min-h-screen bg-gray-50 p-6 sm:p-8">
-      <div className="max-w-5xl mx-auto space-y-6">
+      <div className="max-w-6xl mx-auto space-y-6">
         {/* Back link */}
         <Link
           href="/dashboard"
@@ -287,7 +373,7 @@ export default function DocumentDetailPage() {
                 {results?.timings && formatDuration(results.timings) && (
                   <>
                     <span>•</span>
-                    <span>took {formatDuration(results.timings)}</span>
+                    <span>analysed in {formatDuration(results.timings)}</span>
                   </>
                 )}
               </div>
@@ -326,72 +412,66 @@ export default function DocumentDetailPage() {
         </section>
 
         {/* Summary stats */}
-        {results && (
-          <section className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <StatCard
-              label="Total pages"
-              value={String(results.total_pages ?? doc.total_pages ?? "—")}
-            />
-            <StatCard
-              label="Fence pages"
-              value={String(fencePages.length)}
-              accent="green"
-            />
-            <StatCard
-              label="Non-fence pages"
-              value={String(nonFencePages.length)}
-              accent="gray"
+        {isComplete && results && (
+          <section className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            <StatCard label="Total pages" value={String(totalCount || results.total_pages || doc.total_pages || "—")} />
+            <StatCard label="Fence pages" value={String(fencePages.length)} accent="green" />
+            <StatCard label="Non-fence pages" value={String(nonFencePages.length)} accent="gray" />
+            <StatCard label="Total fence length" value={totalLengthFt > 0 ? `${totalLengthFt.toFixed(1)} ft` : "—"} accent={totalLengthFt > 0 ? "green" : "gray"} />
+          </section>
+        )}
+
+        {/* Embedded highlighted PDF viewer */}
+        {isComplete && pdfBlobUrl && (
+          <section className="bg-white rounded-lg shadow overflow-hidden">
+            <div className="flex items-center justify-between p-4 border-b">
+              <h2 className="font-medium">Highlighted PDF</h2>
+              <span className="text-xs text-gray-500">
+                green = legend definitions • purple = fence indicators • orange = keyword matches • cyan = measured fence lines
+              </span>
+            </div>
+            <iframe
+              src={pdfBlobUrl}
+              className="w-full h-[80vh] border-0"
+              title="Highlighted fence PDF"
             />
           </section>
         )}
 
-        {/* Page-level results */}
+        {/* Per-page details */}
         {isComplete && results && (
           <section className="bg-white rounded-lg shadow">
             <div className="flex items-center justify-between p-4 border-b">
               <h2 className="font-medium">Pages</h2>
               <div className="flex gap-1 text-xs">
                 <FilterChip
-                  active={filter === "all"}
-                  onClick={() => setFilter("all")}
-                >
-                  All ({allPagesSorted.length})
-                </FilterChip>
-                <FilterChip
                   active={filter === "fence"}
                   onClick={() => setFilter("fence")}
                 >
-                  Fence only ({fencePages.length})
+                  Fence ({fencePages.length})
+                </FilterChip>
+                <FilterChip
+                  active={filter === "all"}
+                  onClick={() => setFilter("all")}
+                >
+                  All ({totalCount})
                 </FilterChip>
               </div>
             </div>
-            {visiblePages.length === 0 ? (
-              <div className="p-6 text-sm text-gray-500 text-center">
-                {filter === "fence"
-                  ? "No fence pages detected in this document."
-                  : "No pages."}
-              </div>
-            ) : (
-              <table className="w-full text-sm">
-                <thead className="bg-gray-50 text-gray-500 text-xs uppercase">
-                  <tr>
-                    <th className="text-left px-4 py-2 font-medium w-20">Page</th>
-                    <th className="text-left px-4 py-2 font-medium">Classification</th>
-                    <th className="text-left px-4 py-2 font-medium">Notes</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {visiblePages.map((p) => (
-                    <PageRow
-                      key={p}
-                      pageNumber={p}
-                      isFence={fenceSet.has(p)}
-                      perPageScaleInfo={results.per_page_scale_info}
-                    />
-                  ))}
-                </tbody>
-              </table>
-            )}
+
+            <div className="divide-y">
+              {filter === "fence" ? (
+                fencePages.length === 0 ? (
+                  <div className="p-6 text-sm text-gray-500 text-center">
+                    No fence pages detected.
+                  </div>
+                ) : (
+                  fencePages.map((p) => <FencePageCard key={p.page_num} page={p} />)
+                )
+              ) : (
+                <NonFenceList nonFence={nonFencePages} fence={fencePages} />
+              )}
+            </div>
           </section>
         )}
 
@@ -456,40 +536,202 @@ function FilterChip({
   );
 }
 
-function PageRow({
-  pageNumber,
-  isFence,
-  perPageScaleInfo,
-}: {
-  pageNumber: number;
-  isFence: boolean;
-  perPageScaleInfo?: Record<string, unknown>;
-}) {
-  const scaleEntry = perPageScaleInfo?.[String(pageNumber)] as
-    | { scale?: number; unit?: string; method?: string }
-    | undefined;
-  const scaleNote = scaleEntry?.scale
-    ? `scale 1:${scaleEntry.scale}${
-        scaleEntry.unit ? ` (${scaleEntry.unit})` : ""
-      }`
-    : null;
+function FencePageCard({ page }: { page: FencePage }) {
+  const totalFt =
+    page.measurements?.proximity_totals?.total_length_feet ??
+    page.measurements?.totals?.total_length_feet ??
+    null;
+  const totalSeg =
+    page.measurements?.proximity_totals?.total_segments ??
+    page.measurements?.totals?.total_segments ??
+    null;
+  const totalPts = page.measurements?.proximity_totals?.total_length_pts;
+  const scale = page.scale_info;
+  const definitions = page.definitions ?? page.legend_entries ?? [];
+  const instances = page.instances ?? [];
 
   return (
-    <tr className="hover:bg-gray-50">
-      <td className="px-4 py-2 font-mono text-gray-700">{pageNumber}</td>
-      <td className="px-4 py-2">
-        {isFence ? (
-          <span className="inline-flex items-center gap-1 text-green-700">
-            <span>✓</span>
-            <span>fence</span>
+    <details className="group" open>
+      <summary className="flex items-center justify-between gap-3 px-4 py-3 cursor-pointer hover:bg-gray-50">
+        <div className="flex items-center gap-3 min-w-0">
+          <span className="font-mono text-gray-700">Page {page.page_num}</span>
+          <span className="inline-flex items-center gap-1 text-xs text-green-700">
+            ✓ fence
           </span>
-        ) : (
-          <span className="text-gray-500">non-fence</span>
+          {scale?.verified_scale && (
+            <span className="text-xs text-gray-500">
+              scale 1:{scale.verified_scale}
+              {scale.confidence ? ` (${scale.confidence})` : ""}
+            </span>
+          )}
+        </div>
+        <div className="text-xs text-gray-600 flex items-center gap-3">
+          {totalFt != null && totalFt > 0 && (
+            <span className="font-mono">{totalFt.toFixed(1)} ft</span>
+          )}
+          {definitions.length > 0 && (
+            <span>{definitions.length} legend</span>
+          )}
+          {instances.length > 0 && (
+            <span>{instances.length} instances</span>
+          )}
+        </div>
+      </summary>
+
+      <div className="px-4 pb-4 space-y-4">
+        {/* Fence text */}
+        {page.fence_text && (
+          <div>
+            <div className="text-xs uppercase text-gray-500 mb-1">
+              Detected text
+            </div>
+            <div className="text-sm bg-gray-50 border rounded p-3 whitespace-pre-wrap font-mono text-xs">
+              {page.fence_text.slice(0, 800)}
+              {page.fence_text.length > 800 ? "…" : ""}
+            </div>
+          </div>
         )}
-      </td>
-      <td className="px-4 py-2 text-gray-500 text-xs">
-        {scaleNote ?? "—"}
-      </td>
-    </tr>
+
+        {/* Measurement totals */}
+        {(totalFt != null || totalSeg != null || totalPts != null) && (
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            {totalFt != null && (
+              <Metric label="Length (scaled)" value={`${totalFt.toFixed(1)} ft`} />
+            )}
+            {totalPts != null && (
+              <Metric label="Length (points)" value={totalPts.toLocaleString()} />
+            )}
+            {totalSeg != null && (
+              <Metric label="Segments" value={String(totalSeg)} />
+            )}
+          </div>
+        )}
+
+        {/* Scale details */}
+        {scale && (scale.scale_text || scale.message) && (
+          <div className="text-xs text-gray-600 bg-gray-50 border rounded p-2">
+            <div className="font-medium text-gray-700">Scale: {scale.scale_text ?? "—"}</div>
+            {scale.method && <div>method: {scale.method}</div>}
+            {scale.message && (
+              <div className="mt-1 italic">{scale.message}</div>
+            )}
+          </div>
+        )}
+
+        {/* Legend definitions */}
+        {definitions.length > 0 && (
+          <DataTable
+            title="Legend definitions"
+            rows={definitions.map((d) => ({
+              indicator: String(d.indicator ?? ""),
+              description: String(d.description ?? ""),
+            }))}
+            columns={["indicator", "description"]}
+          />
+        )}
+
+        {/* Instances */}
+        {instances.length > 0 && (
+          <DataTable
+            title="Detected instances"
+            rows={instances.map((i) => ({
+              indicator: String(i.indicator ?? ""),
+              location: i.bbox
+                ? `[${i.bbox.map((n) => Math.round(n)).join(", ")}]`
+                : "—",
+            }))}
+            columns={["indicator", "location"]}
+          />
+        )}
+      </div>
+    </details>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="bg-gray-50 border rounded p-2">
+      <div className="text-[10px] uppercase text-gray-500">{label}</div>
+      <div className="font-mono font-medium text-gray-900">{value}</div>
+    </div>
+  );
+}
+
+function DataTable({
+  title,
+  rows,
+  columns,
+}: {
+  title: string;
+  rows: Record<string, string>[];
+  columns: string[];
+}) {
+  return (
+    <div>
+      <div className="text-xs uppercase text-gray-500 mb-1">{title}</div>
+      <div className="overflow-x-auto border rounded">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50 text-gray-500 text-xs uppercase">
+            <tr>
+              {columns.map((c) => (
+                <th key={c} className="text-left px-3 py-1.5 font-medium">
+                  {c}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y">
+            {rows.map((r, i) => (
+              <tr key={i} className="hover:bg-gray-50">
+                {columns.map((c) => (
+                  <td key={c} className="px-3 py-1.5 text-gray-800 align-top">
+                    {r[c]}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function NonFenceList({
+  nonFence,
+  fence,
+}: {
+  nonFence: NonFencePage[];
+  fence: FencePage[];
+}) {
+  const fenceNums = new Set(fence.map((f) => f.page_num));
+  const all = [
+    ...fence.map((f) => ({ page_num: f.page_num, isFence: true })),
+    ...nonFence.map((n) => ({ page_num: n.page_num, isFence: false })),
+  ].sort((a, b) => a.page_num - b.page_num);
+
+  return (
+    <table className="w-full text-sm">
+      <thead className="bg-gray-50 text-gray-500 text-xs uppercase">
+        <tr>
+          <th className="text-left px-4 py-2 font-medium w-20">Page</th>
+          <th className="text-left px-4 py-2 font-medium">Classification</th>
+        </tr>
+      </thead>
+      <tbody className="divide-y">
+        {all.map((p) => (
+          <tr key={p.page_num} className="hover:bg-gray-50">
+            <td className="px-4 py-2 font-mono">{p.page_num}</td>
+            <td className="px-4 py-2">
+              {fenceNums.has(p.page_num) ? (
+                <span className="text-green-700">✓ fence</span>
+              ) : (
+                <span className="text-gray-500">non-fence</span>
+              )}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
   );
 }

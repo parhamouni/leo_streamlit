@@ -342,11 +342,32 @@ async def create_job(
             "Please split the document by page range.",
         )
 
+    import hashlib
+    pdf_hash = hashlib.sha256(pdf_bytes).hexdigest()
+
+    # Dedup: if this Supabase user already has a document with the same
+    # pdf_hash, return the existing one. Re-process only if the previous
+    # attempt is in a terminal-failed state.
+    if _is_uuid(user_id):
+        try:
+            existing = db.find_document_by_hash(user_id, pdf_hash)
+        except Exception:
+            log.exception("dedup lookup failed; falling through to fresh upload")
+            existing = None
+        if existing and existing.get("job_status") != "failed":
+            return {
+                "job_id": existing.get("latest_job_id"),
+                "document_id": existing["id"],
+                "status": "deduped",
+                "existing_status": existing.get("job_status"),
+                "original_filename": existing["original_filename"],
+                "queue_position": None,
+                "running_jobs": None,
+            }
+
     upload_dir = Path(cfg.PDF_TMP_DIR) / user_id
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    import hashlib
-    pdf_hash = hashlib.sha256(pdf_bytes).hexdigest()
     pdf_filename = f"job_{pdf_hash[:16]}.pdf"
     pdf_path = upload_dir / pdf_filename
     pdf_path.write_bytes(pdf_bytes)
@@ -373,6 +394,7 @@ async def create_job(
                 storage_path=rel_storage_path,
                 total_pages=n_pages,
                 job_id=job_id,
+                pdf_hash=pdf_hash,
             )
         except Exception as e:
             log.exception("Postgres mirror failed for upload")

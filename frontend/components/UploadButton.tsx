@@ -5,7 +5,7 @@ import { supabase } from "@/lib/supabase";
 
 const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 
-type EntryStatus = "queued" | "uploading" | "done" | "failed";
+type EntryStatus = "queued" | "uploading" | "done" | "deduped" | "failed";
 
 type Entry = {
   id: string;
@@ -13,6 +13,7 @@ type Entry = {
   status: EntryStatus;
   progress: number; // 0..100
   error?: string;
+  dedupedExistingStatus?: string;
 };
 
 function fmtBytes(n: number): string {
@@ -26,16 +27,25 @@ async function authToken(): Promise<string | null> {
   return data.session?.access_token ?? null;
 }
 
+type UploadResponse = {
+  job_id?: string | null;
+  document_id?: string | null;
+  status?: string;
+  existing_status?: string;
+  queue_position?: number | null;
+  running_jobs?: number | null;
+};
+
 /**
  * Upload one file via XMLHttpRequest so we get real bytes-uploaded
- * progress events. Resolves with no value on 2xx; rejects with an
- * Error whose message is the server-reported reason.
+ * progress events. Resolves with the server's parsed response on 2xx;
+ * rejects with an Error whose message is the server-reported reason.
  */
 function uploadOne(
   file: File,
   onProgress: (pct: number) => void,
   token: string | null,
-): Promise<void> {
+): Promise<UploadResponse> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const url = `${apiBase}/api/jobs`;
@@ -51,7 +61,11 @@ function uploadOne(
     xhr.addEventListener("load", () => {
       if (xhr.status >= 200 && xhr.status < 300) {
         onProgress(100);
-        resolve();
+        let parsed: UploadResponse = {};
+        try {
+          parsed = JSON.parse(xhr.responseText);
+        } catch {}
+        resolve(parsed);
       } else {
         let detail = xhr.responseText;
         try {
@@ -97,7 +111,7 @@ export function UploadButton({ onUploaded }: { onUploaded: () => void }) {
     (async () => {
       try {
         const token = await authToken();
-        await uploadOne(
+        const resp = await uploadOne(
           next.file,
           (pct) =>
             setQueue((q) =>
@@ -107,9 +121,17 @@ export function UploadButton({ onUploaded }: { onUploaded: () => void }) {
             ),
           token,
         );
+        const wasDeduped = resp.status === "deduped";
         setQueue((q) =>
           q.map((x) =>
-            x.id === next.id ? { ...x, status: "done", progress: 100 } : x,
+            x.id === next.id
+              ? {
+                  ...x,
+                  status: wasDeduped ? "deduped" : "done",
+                  progress: 100,
+                  dedupedExistingStatus: resp.existing_status,
+                }
+              : x,
           ),
         );
         onUploaded();
@@ -162,7 +184,12 @@ export function UploadButton({ onUploaded }: { onUploaded: () => void }) {
 
   function clearFinished() {
     setQueue((q) =>
-      q.filter((x) => x.status !== "done" && x.status !== "failed"),
+      q.filter(
+        (x) =>
+          x.status !== "done" &&
+          x.status !== "failed" &&
+          x.status !== "deduped",
+      ),
     );
   }
 
@@ -289,6 +316,15 @@ function StatusPill({ entry }: { entry: Entry }) {
     case "done":
       return (
         <span className="text-xs text-green-700 whitespace-nowrap">✓ done</span>
+      );
+    case "deduped":
+      return (
+        <span
+          className="text-xs text-yellow-700 whitespace-nowrap"
+          title={`Already uploaded — existing job is ${entry.dedupedExistingStatus ?? "present"}`}
+        >
+          ⊘ already uploaded
+        </span>
       );
     case "failed":
       return (
