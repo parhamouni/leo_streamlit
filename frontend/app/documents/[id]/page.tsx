@@ -850,14 +850,18 @@ function FencePageCard({
           </div>
         )}
 
-        {/* Detected text */}
+        {/* Detected text — collapsed by default. The page text is rarely
+            useful for fence review (mostly site-description / legal text).
+            Show a one-line preview, expand to read the rest. */}
         {page.fence_text && (
-          <div>
-            <div className="text-xs uppercase text-gray-500 mb-1">Detected text</div>
-            <div className="text-sm bg-gray-50 border rounded p-3 whitespace-pre-wrap font-mono text-xs max-h-48 overflow-y-auto">
+          <details className="text-xs bg-gray-50 border rounded">
+            <summary className="cursor-pointer px-3 py-2 font-medium text-gray-700 hover:bg-gray-100">
+              Page text ({page.fence_text.length.toLocaleString()} chars)
+            </summary>
+            <div className="px-3 pb-3 pt-1 whitespace-pre-wrap font-mono text-[11px] max-h-64 overflow-y-auto text-gray-700">
               {page.fence_text}
             </div>
-          </div>
+          </details>
         )}
 
         {/* Measurement totals */}
@@ -917,11 +921,15 @@ function FencePageCard({
         {/* Legend definitions (rich, with descriptions) */}
         {legend.length > 0 && <LegendTable rows={legend} />}
 
-        {/* Detected instances */}
-        {instances.length > 0 && (
+        {/* Figure / drawing regions detected by ADE.
+            The pipeline puts raw figure-type ADE chunks here, NOT matched
+            indicator codes (those live in legend_entries above). Render as
+            a labeled list instead of a table that pretends each row is an
+            "instance" with an indicator. */}
+        {instances.some((i) => i.indicator && i.indicator.trim()) ? (
           <div>
             <div className="text-xs uppercase text-gray-500 mb-1">
-              Detected instances ({instances.length})
+              Detected instances ({instances.filter((i) => i.indicator && i.indicator.trim()).length})
             </div>
             <div className="overflow-x-auto border rounded">
               <table className="w-full text-sm">
@@ -932,27 +940,74 @@ function FencePageCard({
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {instances.slice(0, 50).map((i, idx) => (
-                    <tr key={idx} className="hover:bg-gray-50">
-                      <td className="px-3 py-1.5 align-top">
-                        {i.indicator || (i.text ? i.text.slice(0, 60) + "…" : "—")}
-                      </td>
-                      <td className="px-3 py-1.5 text-gray-500 font-mono text-xs">
-                        {i.bbox ? `[${i.bbox.map((n) => Math.round(n)).join(", ")}]` : "—"}
-                      </td>
-                    </tr>
-                  ))}
-                  {instances.length > 50 && (
-                    <tr>
-                      <td colSpan={2} className="px-3 py-2 text-xs text-gray-500 italic">
-                        … {instances.length - 50} more
-                      </td>
-                    </tr>
-                  )}
+                  {instances
+                    .filter((i) => i.indicator && i.indicator.trim())
+                    .slice(0, 50)
+                    .map((i, idx) => (
+                      <tr key={idx} className="hover:bg-gray-50">
+                        <td className="px-3 py-1.5 align-top font-mono">{i.indicator}</td>
+                        <td className="px-3 py-1.5 text-gray-500 font-mono text-xs">
+                          {i.bbox ? `[${i.bbox.map((n) => Math.round(n)).join(", ")}]` : "—"}
+                        </td>
+                      </tr>
+                    ))}
                 </tbody>
               </table>
             </div>
           </div>
+        ) : null}
+
+        {/* Drawing regions (raw ADE figure chunks, no matched indicator)
+            — collapsed by default; useful for debugging only. */}
+        {instances.length > 0 && (
+          <details className="text-xs bg-gray-50 border rounded">
+            <summary className="cursor-pointer px-3 py-2 font-medium text-gray-700 hover:bg-gray-100">
+              Drawing regions detected by ADE ({instances.length})
+            </summary>
+            <div className="px-3 pb-3 pt-1">
+              <div className="text-[11px] text-gray-500 mb-2 italic">
+                Raw figure-type chunks — bounding boxes of drawing areas on the
+                page. The indicator codes you care about (e.g. 11, 18, 26)
+                appear in &ldquo;Legend definitions&rdquo; above, with positions resolved
+                later by the measurement pipeline.
+              </div>
+              <div className="overflow-x-auto border rounded bg-white">
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-50 text-gray-500 text-xs uppercase">
+                    <tr>
+                      <th className="text-left px-3 py-1.5 font-medium">#</th>
+                      <th className="text-left px-3 py-1.5 font-medium">Region preview</th>
+                      <th className="text-left px-3 py-1.5 font-medium">Location (bbox)</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y">
+                    {instances.slice(0, 25).map((i, idx) => (
+                      <tr key={idx} className="hover:bg-gray-50">
+                        <td className="px-3 py-1.5 align-top text-gray-500 font-mono">
+                          {idx + 1}
+                        </td>
+                        <td className="px-3 py-1.5 align-top text-gray-700 max-w-md truncate">
+                          {i.text ? cleanElementKey(i.text, 80) : "—"}
+                        </td>
+                        <td className="px-3 py-1.5 text-gray-500 font-mono text-xs">
+                          {i.bbox
+                            ? `[${i.bbox.map((n) => Math.round(n)).join(", ")}]`
+                            : "—"}
+                        </td>
+                      </tr>
+                    ))}
+                    {instances.length > 25 && (
+                      <tr>
+                        <td colSpan={3} className="px-3 py-2 text-xs text-gray-500 italic">
+                          … {instances.length - 25} more
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </details>
         )}
 
         {/* Classification reasoning (when keyword fallback) */}
