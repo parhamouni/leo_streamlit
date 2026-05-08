@@ -7,7 +7,7 @@
 **Plan file:** `/home/ubuntu/.claude/plans/yes-i-get-you-refactored-hummingbird.md`
 **Stage-1 highlighting plan (now superseded — work below is done):** `/home/ubuntu/.claude/plans/fuck-you-you-are-splendid-beacon.md`
 **Decision log:** UMT confirmed **critical-path** (customers always correct measurements manually).
-**Last updated:** 2026-05-08 — Sprint 3 done + stage-1 highlighted-PDF parity with `app_ade_prod.py` shipped (definitions / instances / keyword_matches all from real bboxes incl. OCR-with-bboxes for scanned pages).
+**Last updated:** 2026-05-08 — **Sprint 4 (UMT) in progress, option (a) React canvas chosen.** Checkpoints 4a.1–4a.4 done: persistence layer, vector-lines endpoint with server-side auto-assignment matching, read-only canvas, click-to-assign + categories + bulk-reassign + reset-to-auto, debounced PUT persistence. Embedded PDF viewer removed (download button only). Side fixes: `_build_auto_export_state` index bug; rotation handling in `page-vector-lines`; `FENCE_API_AUTH_MODE=supabase` flipped on. Sprint-4 plan: `.claude/plans/sprint4-umt-react-canvas.md`.
 
 ---
 
@@ -57,7 +57,8 @@ The legacy Streamlit prod stays untouched per user instruction (they're serving 
 | `6b66f7d` | **Bug fix**: wire the highlighted-PDF subprocess worker properly (it had been silently dead — `out_path` never set, JSON descriptor written to disk as PDF) + actually draw fence lines on the highlighted PDF |
 | `10146db` | **Bug fix**: line endpoints now transform per-point on rotated pages (`reverse_rotation_point`). Rectangle-shaped formula was scrambling y-coords on rot=90/180/270 pages. |
 | `f61e793` | Diagnostics: `_page_cb` log line + migration 004 (`page_results.updated_at`) for the live-pages debug |
-| **(this commit)** | **Stage-1 highlighted-PDF parity with `app_ade_prod.py`.** Five wins, one file (`pipeline.py`) + one frontend cleanup: (1) `definitions` is now `legend_entries` (LLM per-row tight bboxes) instead of raw legend chunks; (2) new instance-finding step calls `find_instances_in_figures_fast` to get per-token indicator bboxes inside figures; (3) keyword scanner now runs against `get_native_pdf_lines` output (real per-line bboxes) so orange rectangles land at correct locations; (4) `phase1b` OCR step now preserves the per-line bboxes returned by Google DocAI (cache key bumped to `phase1b_v2`) — required for scanned pages where native PDF text is missing or has CID-without-CMap encoding; (5) `keyword_matches` always populated (deviates from prod's fallback semantics — user wants orange alongside green/purple). Frontend: removed the noisy "Detected Instances (bbox)" table from the detail page — only the legend definitions table remains. |
+| `0ed52a8` | **Stage-1 highlighted-PDF parity with `app_ade_prod.py`.** Five wins, one file (`pipeline.py`) + one frontend cleanup: (1) `definitions` is now `legend_entries` (LLM per-row tight bboxes) instead of raw legend chunks; (2) new instance-finding step calls `find_instances_in_figures_fast` to get per-token indicator bboxes inside figures; (3) keyword scanner now runs against `get_native_pdf_lines` output (real per-line bboxes); (4) `phase1b` OCR step now preserves the per-line bboxes returned by Google DocAI (cache key bumped to `phase1b_v2`) — required for scanned pages where native PDF text is missing or has CID-without-CMap encoding; (5) `keyword_matches` always populated. Frontend: removed the noisy "Detected Instances (bbox)" table from the detail page. |
+| **(this commit)** | **Sprint 4 UMT React canvas (checkpoints 4a.1–4a.4) + side fixes.** New: `backend/app/umt_state.py` (per-job JSON persistence with size validation, atomic writes), `frontend/components/UMTCanvas.tsx` + `UMTCanvasInner.tsx` (Konva-based interactive canvas, dynamic-imported as a single client-only module to dodge react-konva named-export resolution issues; pinned `react-konva@^18` for React 18 compat). New API endpoints: `GET/PUT/DELETE /api/jobs/{id}/umt-state[/{page_num}]`, `GET /api/jobs/{id}/page-vector-lines/{n}` (returns ALL display-space vector lines + server-side `auto_categories` and `auto_assignments` mapping pipeline-detected fence lines to vector indices via rounded-coord exact match, with prod's partial-layer-match + "Auto-detected" fallback bucket). Canvas features: category panel (active selection, color swatches, add/delete), click-to-toggle assignment, debounced PUT-save status indicator, "Reassign Auto-detected → \<active>" bulk action, "Reset to auto" button, min-line-pts filter (default 20). Frontend: removed embedded `<iframe>` PDF viewer + dead `pdfBlobUrl` state — download button kept. Side fixes: (1) `_build_auto_export_state` was keying `line_assignments` by `enumerate(all_lines)` index but `exports.py` indexes into the post-filter `auto_lines`; layer-skipped lines silently shifted later lines out-of-bounds. Switched to `len(auto_lines)` (post-append). (2) `page-vector-lines` was swapping `pdf_width`/`pdf_height` for rotation 90/270 — but current PyMuPDF's `page.rect` already reflects display orientation, so the swap mis-sized the stage and lines didn't align with the page image. Removed the swap. (3) `FENCE_API_AUTH_MODE=supabase` set in `.env.local` — was defaulting to `legacy_header`, so JWT-authenticated frontend hits to `get_current_user`-using endpoints fell through to `"anonymous"` and tripped the ownership check. (4) Fixed page-index lookup that treated `0` as falsy. |
 
 ### Endpoints currently live on the backend
 
@@ -72,6 +73,10 @@ GET    /api/jobs/{id}/highlighted-pdf            — FileResponse with cyan fenc
 GET    /api/jobs/{id}/page-image/{n}?dpi=110     — PNG of one page from highlighted PDF (subprocess-isolated)
 GET    /api/jobs/{id}/measurement-pdf            — measurement-overlay PDF (auto-only until UMT)
 GET    /api/jobs/{id}/measurement-excel          — per-line workbook (auto-only until UMT)
+GET    /api/jobs/{id}/page-vector-lines/{n}      — all vector lines on a page + server-side auto_categories/auto_assignments (Sprint 4)
+GET    /api/jobs/{id}/umt-state                  — read user's saved UMT edits (Sprint 4)
+PUT    /api/jobs/{id}/umt-state/{n}              — upsert one page's UMT state (Sprint 4)
+DELETE /api/jobs/{id}/umt-state/{n}              — clear UMT edits for one page (Sprint 4)
 GET    /api/jobs/{id}/progress                   — SSE stream
 DELETE /api/jobs/{id}                            — cancel (active) or hard-delete (terminal)
 GET    /api/documents                            — JWT only; per-user list (powers dashboard)
@@ -84,7 +89,7 @@ GET    /api/documents/{id}/pages                 — JWT only; per-page rows (po
 ```
 /login              email+password OR Google OAuth; redirects to /dashboard if signed in
 /dashboard          documents table, upload area, live polling, cancel/delete
-/documents/[id]     detail page with embedded PDF viewer + rich per-page accordions
+/documents/[id]     detail page with rich per-page accordions, per-fence-page UMT canvas (Sprint 4), download buttons (no longer embeds the highlighted PDF inline)
 /                   redirects to /dashboard
 ```
 
@@ -187,29 +192,34 @@ Worker's `reverse_rotation()` was rectangle-shaped — applied a single (x0,y0,x
 
 For the **measurement PDF** (the C5 download), `exports.generate_measurement_pdf` *also* uses the same rect-shaped formula on lines and has the same logical bug — but exports.py is shared with prod's flow, so we have a choice: leave it (matches prod's behaviour, even if both are wrong on rotated pages) or fork. Currently leaving it. Flag if the customer cares.
 
-### 4. `app_ade_prod.py` colour-codes lines per category; we draw uniform cyan (stage-2 measurement only — not blocking)
-Prod's drawing loop (lines 1774-1808) reads `categories[category]['color']` for each line. Ours uses cyan for all. **This applies to the stage-2 measurement-PDF download, NOT the stage-1 highlighted PDF.** Stage 1 is now prod-equivalent (definitions/instances/keyword_matches) — see "Stage-1 highlighted-PDF parity" commit above. To close stage-2: thread the same auto-assignment that the export builder produces (`_build_auto_export_state` in `api_server.py`) into the highlight worker as a `line_categories` field, then have the worker pick the colour from that map per line. Probably a 30-line addition; not blocking Sprint 4.
+### 4. ~~`app_ade_prod.py` colour-codes lines per category; we draw uniform cyan~~ — **resolved 2026-05-08**
+The stage-2 measurement-PDF generator (`exports.generate_measurement_pdf`) was already wired for per-category colour via `_CATEGORY_PALETTE` in Sprint 3 — note was stale. Side bug found and fixed: `_build_auto_export_state` was keying `line_assignments` by `enumerate(all_lines)` index, but `exports.py` indexes into the post-filter `auto_lines`. Any layer-skipped line silently shifted later lines out of bounds. Switched to `len(auto_lines)` (post-append index).
 
 ### 5. OCR-with-bboxes covers Google DocAI only
 The new `ocr_lines_by_page` plumbing wires OCR-line bboxes into the keyword scan, legend extraction, and instance-finding — required for scanned pages whose native PDF text is missing/CID-without-CMap. Today this only fires when `google_cloud_config` is configured (DocAI). If the `<50` native-text fallback path is ever broadened (e.g. Tesseract local OCR), keep the same lines-with-bboxes shape.
 
 ---
 
-### Sprint 4 — UMT + summary report (CRITICAL PATH, biggest scope)
-Plan refs: C1–C4, **C8**.
+### Sprint 4 — UMT + summary report (IN PROGRESS, option (a) chosen)
+Plan refs: C1–C4, **C8**. Detailed checkpoint plan: `.claude/plans/sprint4-umt-react-canvas.md`.
 
-User confirmed customers *always* correct measurements manually — must ship before launch. C8 (cross-page summary table) ships with UMT — it's the report the user hands to the customer.
+User picked **option (a)** native React canvas over iframe-embed. Done so far:
 
-**Two paths to evaluate (decision needed at start of sprint):**
+| Checkpoint | What |
+|---|---|
+| 4a.1 ✅ | Backend persistence: `backend/app/umt_state.py` + 3 endpoints (GET/PUT/DELETE umt-state). Atomic writes, validated payloads, max 50 cats / 2000 lines per page. |
+| 4a.2 ✅ | `GET /api/jobs/{id}/page-vector-lines/{n}` returns lines + server-side `auto_categories` and `auto_assignments` (matches pipeline's `all_fence_lines` to vector indices via rounded-coord exact match; uses prod's partial-layer-match + "Auto-detected" fallback). |
+| 4a.3 ✅ | Read-only Konva canvas mounted under each fence-page card. Page image as background, vector lines overlaid in display space. |
+| 4a.4 ✅ | Selection wired: category panel (click to set active, add/delete with color swatches), click line to assign/unassign, debounced 500ms PUT, save status indicator, "Reassign Auto-detected → \<active>" bulk action, "Reset to auto", min-line-pts filter. Stage-1 cleanup: removed `<iframe>` PDF viewer (download button kept). |
 
-1. **(a) React rebuild** — port [umt.py](umt.py) (~1,248 lines) into a React canvas with `react-konva` or HTML5 canvas + custom hit-testing. New POST endpoints to persist line state per `(user_id, document_id, page_num)`. Highest fidelity. ~3-5 sessions.
-2. **(b) Iframe-embed the existing Streamlit UMT** — keep `app_ade_fast.py`'s UMT page, embed via iframe in the new detail page. Fast, ugly, unblocks launch. ~1 session for the integration.
+**Remaining checkpoints:**
 
-**Recommendation: Start with (b) for launch; collect React-rebuild requirements over time.** Iframe embedding requires:
-- Passing `user_id` + `job_id` to the Streamlit page (cookie or query param)
-- A small Streamlit shim page that auto-loads the right job and shows only the UMT (no rest of the prod app)
-- CORS / `frame-ancestors` config on the Streamlit server
-- Cookie sharing or token-based handoff between Next.js and Streamlit
+| | What |
+|---|---|
+| 4a.5 | Drawing mode: click-drag on canvas to add a `user_drawn_line` (PDF-space coords); pending-line preview while drawing |
+| 4a.6 | Per-page scale override (numeric input) + zoom slider |
+| 4a.7 | C8 — cross-page summary table component (per-category totals + per-page rows + grand total) above/below per-page UMT panels |
+| 4a.8 | Wire `_build_auto_export_state` to read `umt_state.json` so Measurement PDF / Excel pick up manual edits |
 
 ### Sprint 5 — operational (low priority)
 Plan refs: D1 / D2 / D3.
@@ -234,14 +244,12 @@ Currently SQLite-based [job_registry.py](job_registry.py) handles queueing. Migr
 
 ## Recommended next steps (in order)
 
-1. **Apply migrations 003 + 004 in Supabase** (one paste in SQL Editor — both blocks above)
+1. **Apply migrations 003 + 004 in Supabase** (one paste in SQL Editor — both blocks above) — still pending
 2. **Trigger one fresh upload, send the new uvicorn.log** so I can diagnose the live-pages issue from the `_page_cb` log lines
-3. **Visually verify highlighter on rotated pages** (delete + re-upload `selected_pages_no_annotations.pdf`)
-4. **Decide on per-category line colour** (Open issue #4) — if yes, ~30 lines of work to thread it through
-5. **Sprint 4** — UMT (start with iframe-embed for speed; revisit React rebuild post-launch). C8 cross-page summary ships with UMT.
-6. **Phase 10.1** — authorization tests
-7. **Phase 11** — Vercel + AWS deployment
-8. (later) Sprint 5 (operational/observability), S3 migration, Redis/RQ migration
+3. **Sprint 4 remaining checkpoints (4a.5–4a.8)** — drawing mode, scale override, C8 summary table, wire exports to UMT state
+4. **Phase 10.1** — authorization tests
+5. **Phase 11** — Vercel + AWS deployment
+6. (later) Sprint 5 (operational/observability), S3 migration, Redis/RQ migration
 
 ---
 

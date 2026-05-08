@@ -12,6 +12,7 @@ import {
   withinPhasePct,
 } from "@/lib/eta";
 import { RowActions } from "@/components/RowActions";
+import { UMTCanvas } from "@/components/UMTCanvas";
 import {
   cleanElementKey,
   detectionLabel,
@@ -116,7 +117,6 @@ export default function DocumentDetailPage() {
   const [authReady, setAuthReady] = useState(false);
   const [doc, setDoc] = useState<DashboardDoc | null>(null);
   const [results, setResults] = useState<PipelineResults | null>(null);
-  const [pdfBlobUrl, setPdfBlobUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<"fence" | "all" | "nonfence">("fence");
@@ -260,27 +260,6 @@ export default function DocumentDetailPage() {
       if (timer) clearTimeout(timer);
     };
   }, [authReady, doc, docId]);
-
-  // Highlighted PDF blob for the embedded viewer
-  useEffect(() => {
-    if (!doc || doc.job_status !== "completed" || !doc.latest_job_id) return;
-    if (pdfBlobUrl) return;
-    let active = true;
-    let url: string | null = null;
-    apiFetch(`/api/jobs/${doc.latest_job_id}/highlighted-pdf`)
-      .then((r) => r.blob())
-      .then((blob) => {
-        if (!active) return;
-        url = URL.createObjectURL(blob);
-        setPdfBlobUrl(url);
-      })
-      .catch(() => {});
-    return () => {
-      active = false;
-      if (url) URL.revokeObjectURL(url);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [doc?.job_status, doc?.latest_job_id]);
 
   async function downloadFromJob(
     pathSegment: string,
@@ -481,24 +460,6 @@ export default function DocumentDetailPage() {
                 </div>
               ))}
             </div>
-          </section>
-        )}
-
-        {/* ---------- Embedded PDF viewer ---------- */}
-        {isComplete && pdfBlobUrl && (
-          <section className="bg-white rounded-lg shadow overflow-hidden">
-            <div className="flex items-center justify-between p-4 border-b">
-              <h2 className="font-medium">Highlighted PDF</h2>
-              <span className="text-xs text-gray-500">
-                green = legend defs · purple = indicators · orange = keyword matches · cyan =
-                measured fence lines
-              </span>
-            </div>
-            <iframe
-              src={pdfBlobUrl}
-              className="w-full h-[80vh] border-0"
-              title="Highlighted fence PDF"
-            />
           </section>
         )}
 
@@ -876,6 +837,16 @@ function FencePageCard({
       <div className="px-4 pb-4 space-y-4">
         {/* Page image with fence overlays (lazy-loaded) */}
         {jobId && <PageImage jobId={jobId} pageNum={page.page_num} />}
+
+        {/* Sprint 4 / C1: interactive measurement canvas (read-only for
+            now — checkpoint 4a.3). Click handlers + drawing land in 4a.4. */}
+        {jobId && (
+          <UMTCanvas
+            jobId={jobId}
+            pageNum={page.page_num}
+            legendEntries={legend}
+          />
+        )}
 
         {/* ADE chunks metrics (Sprint 1: A6) */}
         {adeChunkCount > 0 && (

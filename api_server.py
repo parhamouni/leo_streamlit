@@ -692,6 +692,167 @@ async def get_page_image(
     )
 
 
+@app.get("/api/jobs/{job_id}/page-vector-lines/{page_num}")
+async def get_page_vector_lines(
+    job_id: str,
+    page_num: int,
+    user_id: str = Depends(get_current_user),
+):
+    """Return all vector lines on a page (PDF display space) for the
+    UMT canvas. Indices are stable for the lifetime of the job — frontend
+    uses them as keys in `umt_state.line_assignments`."""
+    job = job_registry.get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if job["user_id"] != user_id:
+        raise HTTPException(403, "Access denied")
+
+    pdf_path = job.get("pdf_path")
+    if not pdf_path or not Path(pdf_path).exists():
+        raise HTTPException(404, "Source PDF not on disk")
+
+    results = job_registry.load_results(job_id)
+    if results is None:
+        raise HTTPException(404, "Results not available — job may still be running")
+
+    fence_pages = (results or {}).get("fence_pages") or []
+    target = next(
+        (fp for fp in fence_pages
+         if fp.get("page_num") == page_num or fp.get("page_number") == page_num),
+        None,
+    )
+    if target is None:
+        raise HTTPException(404, f"Page {page_num} is not a fence page")
+    # Page index can legitimately be 0; don't use `or` (0 is falsy in Python).
+    page_idx = target.get("page_idx")
+    if page_idx is None:
+        page_idx = target.get("page_index_in_original_doc")
+    if page_idx is None:
+        raise HTTPException(500, "Page index missing from results")
+
+    import fitz
+    from utils_vector import extract_vector_lines
+
+    doc = None
+    try:
+        doc = fitz.open(pdf_path)
+        if page_idx >= len(doc):
+            raise HTTPException(404, f"Page index {page_idx} out of range")
+        page = doc[page_idx]
+        # page.rect already reflects display orientation (rotation applied)
+        # in current PyMuPDF — matches the coord space `extract_vector_lines`
+        # uses with `apply_rotation=True`.
+        rect = page.rect
+        rotation = page.rotation
+        display_w, display_h = rect.width, rect.height
+        vlines = extract_vector_lines(page, apply_rotation=True)
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+    out_lines = []
+    # Index vector lines by rounded endpoints (both orientations) so we can
+    # match each pipeline-detected fence line to its source vector index.
+    coord_to_idx: dict[tuple, int] = {}
+    for i, ln in enumerate(vlines):
+        sx, sy = float(ln.start[0]), float(ln.start[1])
+        ex, ey = float(ln.end[0]), float(ln.end[1])
+        out_lines.append({
+            "idx": i,
+            "start": [sx, sy],
+            "end": [ex, ey],
+            "length_pts": float(ln.length_pts),
+            "layer": ln.layer or "",
+        })
+        # Round to 1dp — the same VectorLine that was extracted upstream
+        # serialises through json.dumps without precision loss, so exact
+        # match works for ~all lines that came out of extract_vector_lines.
+        k1 = (round(sx, 1), round(sy, 1), round(ex, 1), round(ey, 1))
+        k2 = (round(ex, 1), round(ey, 1), round(sx, 1), round(sy, 1))
+        coord_to_idx.setdefault(k1, i)
+        coord_to_idx.setdefault(k2, i)
+
+    # Build auto-categories from legend entries (matches `umt.py` behaviour).
+    PALETTE = [
+        (0, 255, 0), (255, 165, 0), (0, 191, 255), (255, 0, 255),
+        (255, 255, 0), (0, 255, 255), (255, 105, 180), (173, 255, 47),
+    ]
+    legend_entries = target.get("legend_entries") or []
+    auto_categories: dict[str, dict] = {}
+    for le in legend_entries:
+        keyword = (le.get("keyword") or "").strip()
+        indicator = (le.get("indicator") or "").strip()
+        if not keyword:
+            continue
+        cat_name = f"{indicator}: {keyword}" if indicator else keyword
+        if cat_name in auto_categories:
+            continue
+        c = PALETTE[len(auto_categories) % len(PALETTE)]
+        auto_categories[cat_name] = {
+            "indicator": indicator,
+            "keyword": keyword,
+            "color": [c[0], c[1], c[2]],
+        }
+
+    # Match pipeline auto fence lines → vector indices → category.
+    measurements = target.get("measurements") or {}
+    all_fence_lines = measurements.get("all_fence_lines") or []
+    layer_to_cat: dict[str, str] = measurements.get("layer_to_category") or {}
+    any_layer_mapped = bool(layer_to_cat)
+    FALLBACK_CAT = "Auto-detected"
+
+    auto_assignments: dict[str, str] = {}
+    for fl in all_fence_lines:
+        if not isinstance(fl, dict):
+            continue
+        s = fl.get("start"); e = fl.get("end")
+        if not (isinstance(s, (list, tuple)) and isinstance(e, (list, tuple))):
+            continue
+        try:
+            sx, sy = float(s[0]), float(s[1])
+            ex, ey = float(e[0]), float(e[1])
+        except (TypeError, ValueError):
+            continue
+        layer = fl.get("layer") or ""
+        category = layer_to_cat.get(layer)
+        if not category and layer and any_layer_mapped:
+            for k, v in layer_to_cat.items():
+                if k and (k in layer or layer in k):
+                    category = v
+                    break
+        if not category:
+            if any_layer_mapped:
+                continue
+            category = FALLBACK_CAT
+
+        if category not in auto_categories:
+            c = PALETTE[len(auto_categories) % len(PALETTE)]
+            auto_categories[category] = {
+                "indicator": "",
+                "keyword": category,
+                "color": [c[0], c[1], c[2]],
+            }
+        key = (round(sx, 1), round(sy, 1), round(ex, 1), round(ey, 1))
+        vidx = coord_to_idx.get(key)
+        if vidx is None:
+            continue
+        auto_assignments[str(vidx)] = category
+
+    return {
+        "page_num": page_num,
+        "page_idx": page_idx,
+        "rotation": rotation,
+        "pdf_width": float(display_w),
+        "pdf_height": float(display_h),
+        "lines": out_lines,
+        "auto_categories": auto_categories,
+        "auto_assignments": auto_assignments,
+    }
+
+
 @app.get("/api/jobs/{job_id}/highlighted-pdf")
 async def get_highlighted_pdf(
     job_id: str,
@@ -788,7 +949,7 @@ def _build_auto_export_state(results: dict) -> tuple[list, dict, dict, dict]:
         FALLBACK_CAT = "Auto-detected"
         any_layer_mapped = bool(layer_to_cat)
 
-        for idx, line in enumerate(all_lines):
+        for line in all_lines:
             if not isinstance(line, dict):
                 continue
             layer = line.get("layer") or ""
@@ -815,7 +976,11 @@ def _build_auto_export_state(results: dict) -> tuple[list, dict, dict, dict]:
                     "keyword": category,
                     "color": _CATEGORY_PALETTE[len(cats) % len(_CATEGORY_PALETTE)],
                 }
-            page_assignments[str(idx)] = category
+            # Key by the auto_lines index (post-filter), not the all_lines
+            # index — exports.generate_measurement_pdf indexes into
+            # auto_lines, so any layer-skipped line would shift later lines
+            # out of alignment and silently drop them from the PDF / Excel.
+            page_assignments[str(len(auto_lines))] = category
             auto_lines.append(line)
 
         if page_assignments:
@@ -934,6 +1099,59 @@ async def get_measurement_excel(
             "Cache-Control": "private, no-store",
         },
     )
+
+
+def _job_for_user(job_id: str, user_id: str) -> dict:
+    job = job_registry.get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if job["user_id"] != user_id:
+        raise HTTPException(403, "Access denied")
+    return job
+
+
+@app.get("/api/jobs/{job_id}/umt-state")
+async def get_umt_state(
+    job_id: str,
+    user_id: str = Depends(get_current_user),
+):
+    """Return the user's saved UMT edits for this job. Returns the empty
+    skeleton (`{"version":1,"pages":{}}`) when nothing has been saved yet."""
+    _job_for_user(job_id, user_id)
+    from backend.app import umt_state
+    return umt_state.load(job_id)
+
+
+@app.put("/api/jobs/{job_id}/umt-state/{page_num}")
+async def put_umt_page_state(
+    job_id: str,
+    page_num: int,
+    page_state: dict,
+    user_id: str = Depends(get_current_user),
+):
+    """Upsert one page's UMT state (categories, line assignments,
+    user-drawn lines, scale override, min-length filter)."""
+    _job_for_user(job_id, user_id)
+    from backend.app import umt_state
+    try:
+        full = umt_state.update_page(job_id, page_num, page_state)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    return full
+
+
+@app.delete("/api/jobs/{job_id}/umt-state/{page_num}")
+async def delete_umt_page_state(
+    job_id: str,
+    page_num: int,
+    user_id: str = Depends(get_current_user),
+):
+    """Clear UMT edits for one page (used by the 'Clear auto' button)."""
+    _job_for_user(job_id, user_id)
+    from backend.app import umt_state
+    return umt_state.delete_page(job_id, page_num)
 
 
 @app.get("/api/jobs/{job_id}/progress")
