@@ -20,10 +20,20 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
+# Load .env.local before importing config so SUPABASE_*, AUTH_MODE, etc.
+# are visible to Config's field_factory env reads. Falls back silently if
+# python-dotenv isn't installed (e.g. running the prod monolith only).
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env.local")
+except ImportError:
+    pass
+
 import job_registry
+from backend.app.auth import get_current_user, require_supabase_jwt
 from config import cfg
 from pipeline import PipelineConfig, PipelineResult, run_analysis
 from secrets_loader import load_api_keys as _load_api_keys
@@ -228,7 +238,7 @@ app = FastAPI(title="Leo Fence Detection API", lifespan=lifespan)
 async def create_job(
     pdf: UploadFile = File(...),
     config: str = Form("{}"),
-    x_user_id: str = Header("anonymous", alias="X-User-Id"),
+    user_id: str = Depends(get_current_user),
 ):
     """Submit a PDF for analysis. Returns the job ID immediately."""
     try:
@@ -263,7 +273,7 @@ async def create_job(
             "Please split the document by page range.",
         )
 
-    upload_dir = Path(cfg.PDF_TMP_DIR) / x_user_id
+    upload_dir = Path(cfg.PDF_TMP_DIR) / user_id
     upload_dir.mkdir(parents=True, exist_ok=True)
 
     import hashlib
@@ -273,7 +283,7 @@ async def create_job(
     pdf_path.write_bytes(pdf_bytes)
 
     job_id = job_registry.create_job(
-        user_id=x_user_id,
+        user_id=user_id,
         filename=pdf.filename or "unknown.pdf",
         pdf_hash=pdf_hash,
         pdf_path=str(pdf_path),
@@ -292,9 +302,9 @@ async def create_job(
 
 
 @app.get("/api/jobs")
-async def list_jobs(x_user_id: str = Header("anonymous", alias="X-User-Id")):
+async def list_jobs(user_id: str = Depends(get_current_user)):
     """List the user's recent jobs."""
-    jobs = job_registry.get_user_jobs(x_user_id)
+    jobs = job_registry.get_user_jobs(user_id)
     for job in jobs:
         if job.get("status") in ("queued", "running"):
             prog = job_registry.read_progress(job["job_id"])
@@ -307,13 +317,13 @@ async def list_jobs(x_user_id: str = Header("anonymous", alias="X-User-Id")):
 @app.get("/api/jobs/{job_id}")
 async def get_job(
     job_id: str,
-    x_user_id: str = Header("anonymous", alias="X-User-Id"),
+    user_id: str = Depends(get_current_user),
 ):
     """Get job details. Includes results summary if completed."""
     job = job_registry.get_job(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
-    if job["user_id"] != x_user_id:
+    if job["user_id"] != user_id:
         raise HTTPException(403, "Access denied")
 
     resp = dict(job)
@@ -337,13 +347,13 @@ async def get_job(
 @app.get("/api/jobs/{job_id}/results")
 async def get_results(
     job_id: str,
-    x_user_id: str = Header("anonymous", alias="X-User-Id"),
+    user_id: str = Depends(get_current_user),
 ):
     """Get full analysis results for a completed job."""
     job = job_registry.get_job(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
-    if job["user_id"] != x_user_id:
+    if job["user_id"] != user_id:
         raise HTTPException(403, "Access denied")
     if job["status"] != "completed":
         raise HTTPException(409, f"Job is {job['status']}, not completed")
@@ -357,13 +367,13 @@ async def get_results(
 @app.get("/api/jobs/{job_id}/highlighted-pdf")
 async def get_highlighted_pdf(
     job_id: str,
-    x_user_id: str = Header("anonymous", alias="X-User-Id"),
+    user_id: str = Depends(get_current_user),
 ):
     """Download the highlighted PDF for a completed job."""
     job = job_registry.get_job(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
-    if job["user_id"] != x_user_id:
+    if job["user_id"] != user_id:
         raise HTTPException(403, "Access denied")
 
     hl_path = job_registry.get_highlighted_pdf_path(job_id)
@@ -380,13 +390,13 @@ async def get_highlighted_pdf(
 @app.get("/api/jobs/{job_id}/progress")
 async def stream_progress(
     job_id: str,
-    x_user_id: str = Header("anonymous", alias="X-User-Id"),
+    user_id: str = Depends(get_current_user),
 ):
     """SSE stream of progress updates for a running job."""
     job = job_registry.get_job(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
-    if job["user_id"] != x_user_id:
+    if job["user_id"] != user_id:
         raise HTTPException(403, "Access denied")
 
     async def event_generator() -> AsyncIterator[str]:
@@ -425,7 +435,7 @@ async def stream_progress(
 @app.delete("/api/jobs/{job_id}")
 async def delete_job(
     job_id: str,
-    x_user_id: str = Header("anonymous", alias="X-User-Id"),
+    user_id: str = Depends(get_current_user),
 ):
     """Cancel a running/queued job, or hard-delete a terminal one.
 
@@ -435,7 +445,7 @@ async def delete_job(
     job = job_registry.get_job(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
-    if job["user_id"] != x_user_id:
+    if job["user_id"] != user_id:
         raise HTTPException(403, "Access denied")
 
     status = job.get("status")
@@ -459,6 +469,16 @@ async def delete_job(
             pass
     job_registry.delete_job(job_id)
     return {"status": "deleted"}
+
+
+@app.get("/api/me")
+async def me(user_id: str = Depends(require_supabase_jwt)):
+    """Identity check — verifies a Supabase JWT and echoes its `sub` claim.
+
+    Always demands a valid Bearer token regardless of API_AUTH_MODE.
+    Used by the Next.js frontend to confirm the backend can verify its tokens.
+    """
+    return {"user_id": user_id}
 
 
 @app.get("/api/healthz")

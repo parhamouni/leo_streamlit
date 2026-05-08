@@ -50,6 +50,9 @@ leo_streamlit/
 ├── notebooks/               # Development & analysis notebooks
 ├── subset_gold/             # Test PDF fixtures
 ├── archive/                 # Historical reference (predecessors, evaluation harnesses, debug)
+├── frontend/                # Next.js multi-user web app (in progress — see plan)
+├── backend/db/              # Supabase Postgres migrations
+├── infra/                   # Deployment artifacts for the new stack (systemd, nginx)
 ├── DEPLOY.md                # Deployment + nginx + systemd setup
 └── requirements.txt
 ```
@@ -71,6 +74,20 @@ leo_streamlit/
 | **Fast** | Backend live, frontend not yet cut over | `api_server.py` (FastAPI) + `app_ade_fast.py` (thin Streamlit) | 8503 | Yes — frontend submits jobs |
 
 **Goal:** add features to `app_ade_fast.py` until it has parity with `app_ade_prod.py`, then swap `fence-fast.service`'s `ExecStart=` from `app_ade_prod.py` to `app_ade_fast.py`. See [plans/how-to-refactor-and-groovy-mist.md](.claude/plans/how-to-refactor-and-groovy-mist.md) for the migration sequence.
+
+---
+
+## Multi-user web-app migration (in progress)
+
+A separate effort layers a Next.js frontend + Supabase auth + S3 storage + Postgres + Redis/RQ on top of the existing **fast stack** ([api_server.py](api_server.py), [pipeline.py](pipeline.py), [job_registry.py](job_registry.py)). The **prod stack** ([app_ade_prod.py](app_ade_prod.py)) is unaffected throughout the migration.
+
+New top-level directories created during this work:
+
+- [frontend/](frontend/) — Next.js app deployed to Vercel
+- [backend/db/](backend/db/) — Supabase SQL migrations (run manually)
+- [infra/](infra/) — systemd / nginx artifacts for the new AWS deployment
+
+Step-by-step plan: [.claude/plans/yes-i-get-you-refactored-hummingbird.md](.claude/plans/yes-i-get-you-refactored-hummingbird.md). Each checkpoint stops for verification before continuing.
 
 ---
 
