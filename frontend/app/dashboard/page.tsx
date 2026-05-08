@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { supabase } from "@/lib/supabase";
 import { apiJson, ApiError } from "@/lib/api";
 import { UploadButton } from "@/components/UploadButton";
@@ -302,17 +303,22 @@ export default function DashboardPage() {
               </thead>
               <tbody className="divide-y">
                 {docs.map((d) => (
-                  <tr key={d.id} className="hover:bg-gray-50">
+                  <tr key={d.id} className="hover:bg-gray-50 cursor-pointer">
                     <td className="px-4 py-3">
-                      <div
-                        className="font-medium truncate max-w-md"
-                        title={d.original_filename}
+                      <Link
+                        href={`/documents/${d.id}`}
+                        className="block group"
                       >
-                        {d.original_filename}
-                      </div>
-                      <div className="text-xs text-gray-400 font-mono">
-                        {d.id.slice(0, 8)}
-                      </div>
+                        <div
+                          className="font-medium truncate max-w-md group-hover:text-blue-600 group-hover:underline"
+                          title={d.original_filename}
+                        >
+                          {d.original_filename}
+                        </div>
+                        <div className="text-xs text-gray-400 font-mono">
+                          {d.id.slice(0, 8)}
+                        </div>
+                      </Link>
                     </td>
                     <td className="px-4 py-3">
                       <StatusBadge status={d.job_status} />

@@ -115,10 +115,34 @@ def list_documents(user_id: str, limit: int = 100) -> list[dict[str, Any]]:
 
 
 def get_document(document_id: str, user_id: str) -> dict[str, Any] | None:
-    """Fetch a single document, ownership-checked."""
+    """Fetch a single document with the latest job's status joined in,
+    ownership-checked. Same row shape as list_documents() entries."""
     with pool().connection() as conn:
         row = conn.execute(
-            "select * from documents where id = %s and user_id = %s",
+            """
+            select
+              d.id,
+              d.user_id,
+              d.original_filename,
+              d.storage_path,
+              d.status        as document_status,
+              d.total_pages,
+              d.created_at,
+              j.id            as latest_job_id,
+              j.status        as job_status,
+              j.current_phase,
+              j.progress_percent,
+              j.error_message
+            from documents d
+            left join lateral (
+              select id, status, current_phase, progress_percent, error_message
+              from jobs
+              where document_id = d.id
+              order by created_at desc
+              limit 1
+            ) j on true
+            where d.id = %s and d.user_id = %s
+            """,
             (document_id, user_id),
         ).fetchone()
     return _row_to_dict(row) if row else None
