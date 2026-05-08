@@ -22,7 +22,7 @@ from typing import AsyncIterator
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 # Load .env.local before importing config so SUPABASE_*, AUTH_MODE, etc.
 # are visible to Config's field_factory env reads. Falls back silently if
@@ -486,12 +486,76 @@ async def get_job(
     return resp
 
 
+def _slim_results(results: dict) -> dict:
+    """Strip megabytes of payload that the new web UI doesn't render but
+    that bloat the response for large PDFs. For a 179-page run the raw
+    JSON is ~780 MB; this trim brings it to ~5-15 MB.
+
+    Removed:
+      - unified_measurements (duplicate of fence_pages[].measurements,
+        re-indexed by page_idx string — same data twice)
+      - fence_pages[].ade_chunks (raw LandingAI response payload — not
+        rendered anywhere; chunk metadata users care about is already
+        in definitions/instances/legend_entries)
+      - definition / instance .text bodies that are larger than 800
+        chars (preserves indicator + bbox + a preview)
+
+    Set ?full=1 on the request to get the unmodified payload (legacy
+    Streamlit clients).
+    """
+    if not isinstance(results, dict):
+        return results
+    out = {k: v for k, v in results.items() if k != "unified_measurements"}
+
+    fps = out.get("fence_pages")
+    if isinstance(fps, list):
+        slim_fps = []
+        for p in fps:
+            if not isinstance(p, dict):
+                slim_fps.append(p)
+                continue
+            sp = {k: v for k, v in p.items() if k != "ade_chunks"}
+            for field in ("definitions", "instances"):
+                arr = sp.get(field)
+                if isinstance(arr, list):
+                    sp[field] = [_slim_chunk(c) for c in arr]
+            # Strip the raw vector-line geometry from measurements — it's
+            # internal pipeline data (used for the measurement calc, not
+            # rendered in the UI). Can be ~4 MB per page on a 100-page run.
+            m = sp.get("measurements")
+            if isinstance(m, dict):
+                sp["measurements"] = {
+                    k: v for k, v in m.items() if k != "all_fence_lines"
+                }
+            slim_fps.append(sp)
+        out["fence_pages"] = slim_fps
+    return out
+
+
+def _slim_chunk(c):
+    if not isinstance(c, dict):
+        return c
+    out = dict(c)
+    txt = out.get("text")
+    if isinstance(txt, str) and len(txt) > 800:
+        out["text"] = txt[:800] + "…"
+        out["text_truncated"] = True
+    return out
+
+
 @app.get("/api/jobs/{job_id}/results")
 async def get_results(
     job_id: str,
     user_id: str = Depends(get_current_user),
+    full: int = 0,
 ):
-    """Get full analysis results for a completed job."""
+    """Get analysis results for a completed job.
+
+    Returns a slim payload by default (drops `unified_measurements`,
+    `ade_chunks`, and truncates oversized chunk text bodies). Pass
+    ?full=1 for the unmodified original — needed by legacy Streamlit
+    UMT and other older clients.
+    """
     job = job_registry.get_job(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
@@ -503,7 +567,63 @@ async def get_results(
     results = job_registry.load_results(job_id)
     if results is None:
         raise HTTPException(404, "Results not found on disk")
-    return results
+    return results if full else _slim_results(results)
+
+
+@app.get("/api/jobs/{job_id}/page-image/{page_num}")
+async def get_page_image(
+    job_id: str,
+    page_num: int,
+    dpi: int = 110,
+    user_id: str = Depends(get_current_user),
+):
+    """Rasterize page `page_num` (1-indexed) from the job's highlighted PDF
+    and return it as a PNG. Used by the detail page's per-page cards so the
+    user can see the colored fence overlays inline without scrolling the
+    whole embedded PDF.
+
+    DPI defaults to 110 (fast) — matches the "Low-DPI preview" toggle in
+    app_ade_prod.py:2077-2081. Cap at 200 to avoid render-bombs.
+    """
+    if dpi < 50 or dpi > 200:
+        raise HTTPException(400, "dpi must be between 50 and 200")
+    job = job_registry.get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if job["user_id"] != user_id:
+        raise HTTPException(403, "Access denied")
+
+    hl_path = job_registry.get_highlighted_pdf_path(job_id)
+    if hl_path is None:
+        raise HTTPException(404, "Highlighted PDF not available")
+
+    try:
+        import fitz as _fitz
+        with _fitz.open(str(hl_path)) as doc:
+            if page_num < 1 or page_num > doc.page_count:
+                raise HTTPException(
+                    404,
+                    f"Page {page_num} out of range (1..{doc.page_count})",
+                )
+            page = doc.load_page(page_num - 1)
+            zoom = dpi / 72.0
+            mat = _fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            png_bytes = pix.tobytes("png")
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("page-image render failed")
+        raise HTTPException(500, f"Page rasterization failed: {e}")
+
+    return Response(
+        content=png_bytes,
+        media_type="image/png",
+        headers={
+            "Cache-Control": "private, max-age=3600",
+            "X-Page-Number": str(page_num),
+        },
+    )
 
 
 @app.get("/api/jobs/{job_id}/highlighted-pdf")

@@ -509,7 +509,13 @@ export default function DocumentDetailPage() {
                 (fencePages.length === 0 ? (
                   <Empty msg="No fence pages detected." />
                 ) : (
-                  fencePages.map((p) => <FencePageCard key={p.page_num} page={p} />)
+                  fencePages.map((p) => (
+                    <FencePageCard
+                      key={p.page_num}
+                      page={p}
+                      jobId={doc.latest_job_id}
+                    />
+                  ))
                 ))}
               {filter === "nonfence" &&
                 (nonFencePages.length === 0 ? (
@@ -520,7 +526,11 @@ export default function DocumentDetailPage() {
               {filter === "all" && (
                 <>
                   {fencePages.map((p) => (
-                    <FencePageCard key={`f-${p.page_num}`} page={p} />
+                    <FencePageCard
+                      key={`f-${p.page_num}`}
+                      page={p}
+                      jobId={doc.latest_job_id}
+                    />
                   ))}
                   {nonFencePages.map((p) => (
                     <NonFencePageCard key={`n-${p.page_num}`} page={p} />
@@ -550,7 +560,11 @@ export default function DocumentDetailPage() {
             ) : (
               <div className="divide-y">
                 {pagesSoFar.map((row) => (
-                  <LivePageRow key={row.page_number} row={row} />
+                  <LivePageRow
+                    key={row.page_number}
+                    row={row}
+                    jobId={doc.latest_job_id}
+                  />
                 ))}
               </div>
             )}
@@ -619,11 +633,13 @@ function FilterChip({
   );
 }
 
-function LivePageRow({ row }: { row: PageRow }) {
+function LivePageRow({ row, jobId }: { row: PageRow; jobId?: string | null }) {
   const stub = isPhase1cStub(row);
   if (!stub && row.is_fence_page && row.result_json) {
     // Phase 3 enrichment is in — render with the existing rich card.
-    return <FencePageCard page={row.result_json as FencePage} />;
+    return (
+      <FencePageCard page={row.result_json as FencePage} jobId={jobId} />
+    );
   }
 
   // Phase 1c stub — minimal placeholder.
@@ -644,7 +660,79 @@ function LivePageRow({ row }: { row: PageRow }) {
   );
 }
 
-function FencePageCard({ page }: { page: FencePage }) {
+function PageImage({ jobId, pageNum }: { jobId: string; pageNum: number }) {
+  const [open, setOpen] = useState(false);
+  const [url, setUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Cleanup blob URL on unmount
+  useEffect(() => {
+    return () => {
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [url]);
+
+  async function load() {
+    if (url) {
+      setOpen(!open);
+      return;
+    }
+    setOpen(true);
+    setLoading(true);
+    setError(null);
+    try {
+      const resp = await apiFetch(
+        `/api/jobs/${jobId}/page-image/${pageNum}?dpi=110`,
+      );
+      const blob = await resp.blob();
+      setUrl(URL.createObjectURL(blob));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={load}
+        className="text-xs text-blue-600 hover:underline"
+      >
+        {loading
+          ? "Loading image…"
+          : url
+            ? open
+              ? "Hide page image"
+              : "Show page image"
+            : "🖼️ Load page image"}
+      </button>
+      {error && (
+        <div className="mt-1 text-xs text-red-600 break-all">{error}</div>
+      )}
+      {open && url && (
+        <div className="mt-2 border rounded overflow-hidden bg-gray-50">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={url}
+            alt={`Page ${pageNum} with fence highlights`}
+            className="w-full h-auto block"
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FencePageCard({
+  page,
+  jobId,
+}: {
+  page: FencePage;
+  jobId?: string | null;
+}) {
   const totalFt =
     page.measurements?.proximity_totals?.total_length_feet ??
     page.measurements?.totals?.total_length_feet ??
@@ -693,6 +781,9 @@ function FencePageCard({ page }: { page: FencePage }) {
       </summary>
 
       <div className="px-4 pb-4 space-y-4">
+        {/* Page image with fence overlays (lazy-loaded) */}
+        {jobId && <PageImage jobId={jobId} pageNum={page.page_num} />}
+
         {/* ADE chunks metrics (Sprint 1: A6) */}
         {adeChunkCount > 0 && (
           <div className="grid grid-cols-3 gap-3">
