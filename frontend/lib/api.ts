@@ -2,11 +2,10 @@
 
 import { supabase } from "./supabase";
 
-const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL;
-
-if (!apiBase) {
-  throw new Error("Missing NEXT_PUBLIC_API_BASE_URL in frontend/.env.local");
-}
+// Empty means same-origin (Next.js rewrites /api/* to the backend).
+// Set NEXT_PUBLIC_API_BASE_URL to absolute URL when the backend lives
+// on a different host (e.g. production: https://api.adamsfence.net).
+const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 
 export class ApiError extends Error {
   status: number;
