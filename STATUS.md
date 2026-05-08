@@ -3,9 +3,10 @@
 > Snapshot for a fresh-context resumption. Read this first, then the plan at
 > `.claude/plans/yes-i-get-you-refactored-hummingbird.md` for full detail.
 
-**Branch:** `feat/web-app-migration` (12 commits, 30+ files)
+**Branch:** `feat/web-app-migration` (~25 commits, 30+ files)
 **Plan file:** `/home/ubuntu/.claude/plans/yes-i-get-you-refactored-hummingbird.md`
 **Decision log:** UMT confirmed **critical-path** (customers always correct measurements manually).
+**Last updated:** 2026-05-08 — Sprint 3 done; highlighter geometry fixed; live-pages debug pending a fresh run.
 
 ---
 
@@ -43,21 +44,37 @@ The legacy Streamlit prod stays untouched per user instruction (they're serving 
 | `0613be4` | **Dedup** (migration 002 `pdf_hash`) + rich detail page (embedded PDF viewer, per-page accordion, scale info, legend, instances) |
 | `c5c87f2` | **Cancel** running jobs and **Delete** terminal jobs (with Postgres cleanup via cascade) |
 | `c574c0b` | **Sprint 1 of feature parity**: detection method badges, ADE chunk metrics, layer breakdown, dimension lines, scale debug expander, element specs table, non-fence reasoning panel, phase timings, three-way filter |
+| `b0afa86` | docs: Sprint 1 verification + parity audit vs `app_ade_prod.py` (added C8 to plan) |
+| `8651482` | **Sprint 2 / A7** — live per-page updates (Phase 1c stubs + Phase 3 enrichment via new `page_cb`) |
+| `aac0cb2` | **Sprint 2 / A5** — `GET /api/jobs/{id}/page-image/{n}` + lazy "🖼️ Load page image" button + slim-results payload |
+| `7fcda90` | Hardening: page-image renders in subprocess (MuPDF crash isolation) |
+| `a120f17` | **Sprint 2 / A8** — phase-window dual progress bars + rate-based ETAs (needs migration 003) |
+| `f9e4559` | (you) Detail-card cleanup: collapse "page text" + relabel "detected instances" |
+| `e8467e3` | (you) Detail-card cleanup: drop sections prod never showed |
+| `61d21c7` | **Bug fix**: serialize `VectorLine` → dict before saving results (was being repr'd to a string and breaking exports + highlighter) |
+| `22dfead` | **Sprint 3 / C5+C6** — `GET /measurement-pdf` + `GET /measurement-excel` endpoints; download buttons on detail page |
+| `6b66f7d` | **Bug fix**: wire the highlighted-PDF subprocess worker properly (it had been silently dead — `out_path` never set, JSON descriptor written to disk as PDF) + actually draw fence lines on the highlighted PDF |
+| `10146db` | **Bug fix**: line endpoints now transform per-point on rotated pages (`reverse_rotation_point`). Rectangle-shaped formula was scrambling y-coords on rot=90/180/270 pages. |
+| `f61e793` | Diagnostics: `_page_cb` log line + migration 004 (`page_results.updated_at`) for the live-pages debug |
 
 ### Endpoints currently live on the backend
 
 ```
-GET    /api/healthz                        — public
-GET    /api/me                             — JWT only (verifies Supabase token)
-POST   /api/jobs                           — JWT or X-User-Id; dedup-aware; mirrors Postgres
-GET    /api/jobs                           — list user's jobs (legacy, used by old Streamlit)
-GET    /api/jobs/{id}                      — single job
-GET    /api/jobs/{id}/results              — full pipeline result JSON
-GET    /api/jobs/{id}/highlighted-pdf      — FileResponse, FileDownload
-GET    /api/jobs/{id}/progress             — SSE stream
-DELETE /api/jobs/{id}                      — cancel (active) or hard-delete (terminal)
-GET    /api/documents                      — JWT only; per-user list (powers dashboard)
-GET    /api/documents/{id}                 — JWT only; single doc with latest job joined
+GET    /api/healthz                              — public
+GET    /api/me                                   — JWT only (verifies Supabase token)
+POST   /api/jobs                                 — JWT or X-User-Id; dedup-aware; mirrors Postgres; accepts `config` JSON form field
+GET    /api/jobs                                 — list user's jobs (legacy, used by old Streamlit)
+GET    /api/jobs/{id}                            — single job
+GET    /api/jobs/{id}/results                    — full pipeline result JSON (slim by default; ?full=1 for raw)
+GET    /api/jobs/{id}/highlighted-pdf            — FileResponse with cyan fence-line overlay (Sprint-2/3 fixes)
+GET    /api/jobs/{id}/page-image/{n}?dpi=110     — PNG of one page from highlighted PDF (subprocess-isolated)
+GET    /api/jobs/{id}/measurement-pdf            — measurement-overlay PDF (auto-only until UMT)
+GET    /api/jobs/{id}/measurement-excel          — per-line workbook (auto-only until UMT)
+GET    /api/jobs/{id}/progress                   — SSE stream
+DELETE /api/jobs/{id}                            — cancel (active) or hard-delete (terminal)
+GET    /api/documents                            — JWT only; per-user list (powers dashboard)
+GET    /api/documents/{id}                       — JWT only; single doc + latest job (now includes started_at + phase_started_at)
+GET    /api/documents/{id}/pages                 — JWT only; per-page rows (powers live "Pages so far")
 ```
 
 ### Frontend routes
@@ -119,24 +136,59 @@ Items that initially looked missing but are already covered in the plan or in co
 
 ## What's left — prioritised
 
-### Sprint 2 — live observability (~1 session)
-Bridges what the user sees during analysis. Plan refs: A5 / A7 / A8.
+### Sprint 2 — live observability ✅ DONE
+| | What | Notes |
+|---|---|---|
+| A5 | Per-page rasterized image with overlays | Lazy "🖼️ Load page image" button; subprocess-isolated render |
+| A7 | Live per-page updates while job runs | `page_cb` in pipeline; Phase 1c stubs + Phase 3 rich payloads upserted to `page_results`; `/api/documents/{id}/pages` polled at 3 s; **see [Open issues](#open-issues) — UI may not surface these live** |
+| A8 | Phase-window dual progress bars + ETAs | `lib/eta.ts` with known phase ranges; "Overall" + "Within phase" bars on detail page; ETA on dashboard rows; **needs migration 003 in Supabase** |
 
-| | What | Backend | Frontend |
-|---|---|---|---|
-| A7 | **Live per-page updates** while job runs (pages appear in detail view as the worker completes them) | Worker writes one `page_results` row per page when phase 1c classifies it; new `GET /api/documents/{id}/pages` endpoint | Detail page subscribes to `/pages` while running |
-| A8 | **Phase-window progress with ETAs** (separate overall + within-phase bars; rate-based ETA per phase) | Add `phase_started_at` to `jobs` (migration 003); record phase transitions in `_progress` callback | Compute ETA from rate + remaining %; render dual bars in dashboard + detail page |
-| A5 | **Per-page rasterized image** with overlays (lazy-loaded thumbnail / full image view) | New `GET /api/jobs/{id}/page-image/{n}?dpi=110` returning a rasterized PNG | Per-page card adds "🖼️ Load page image" button → fetches PNG → renders inline |
+### Sprint 3 — settings + alternate exports ✅ DONE
+| | What | Notes |
+|---|---|---|
+| A9 | Analysis settings panel | `frontend/components/AnalysisSettings.tsx`; toggles persisted in localStorage; posted as `config` JSON on upload |
+| C5 | Measurement PDF download | Wraps `exports.generate_measurement_pdf`; auto-populated UMT state from `layer_to_category` (with prod's partial-match fallback + "Auto-detected" bucket) |
+| C6 | Measurement Excel download | Wraps `exports.generate_measurement_spreadsheet`; same caveats — fully populates only after UMT (Sprint 4) lands |
+| C7 | Per-page image downloads | Covered by A5's "Load page image" button (right-click → save) |
 
-### Sprint 3 — settings + alternate exports (~1 session)
-Plan refs: A9 / C5 / C6 / C7.
+## Open issues (need attention before Sprint 4)
 
-| | What | Backend | Frontend |
-|---|---|---|---|
-| A9 | **Settings panel** (Use ADE / Highlights / Low-DPI / Non-layer / fence keywords editor) | Already accepts `config` JSON on `POST /api/jobs` (currently empty); just wire the toggles into the FormData | Component above upload area: form, posts JSON `config` along with the file |
-| C5 | **Measurements PDF download** | New `GET /api/jobs/{id}/measurement-pdf` wrapping `exports.py:generate_measurement_pdf` | Add download button to detail page header |
-| C6 | **Measurements Excel download** | `GET /api/jobs/{id}/measurement-excel` wrapping `exports.py:generate_measurement_spreadsheet` | Add download button |
-| C7 | **Per-page image downloads** ("DL HL Img", "DL Orig Img") | Re-uses A5's image endpoint with a `?download=1` param | Add small download links to per-page cards |
+### 1. Live "Pages so far" not visibly streaming during a run
+User reported: "early on the pages don't load, then after the experiment is done it loads". The plumbing exists end-to-end (Phase 1c stubs *and* Phase 3 enrichment land in `page_results` — confirmed by inspecting the latest job's row content), but the UI behaviour suggests either:
+- Phase 3 upserts are batched at job-end instead of per-page (worker-thread serialization?)
+- Or the frontend polling effect resets too aggressively when `doc` changes every 3 s
+- Or both
+
+**Diagnostic shipped (`f61e793`):** `_page_cb` now logs one INFO line per upsert. The next run's `/tmp/uvicorn.log` will tell us exactly when each emission lands.
+
+**Optional follow-up:** apply migration 004 (`page_results.updated_at`) so we can also see from the row itself when it was last touched. Migration is idempotent SQL in `backend/db/migrations/004_page_results_updated_at.sql`.
+
+**Plan after the diagnostic run:** if Phase 3 emissions are landing live, the bug is in the frontend polling effect (likely the `doc`-in-deps causing constant resets); fix is to split the pages poll from the doc poll. If Phase 3 emissions are landing in a batch, the bug is in pipeline (e.g. ThreadPoolExecutor's `as_completed` accumulating before yielding); fix is in pipeline.py.
+
+### 2. Migration 003 + 004 not yet applied in Supabase
+Both are idempotent and ship with the code:
+
+```sql
+-- 003 (A8 ETA needs this)
+alter table jobs
+  add column if not exists phase_started_at timestamptz;
+
+-- 004 (live-pages diagnostic; optional)
+alter table page_results
+  add column if not exists updated_at timestamptz not null default now();
+```
+
+Until 003 runs, A8's "within-phase" bar stays empty (overall bar still works because `started_at` already existed).
+
+### 3. Highlighter geometry on rotated pages (FIXED 2026-05-08, needs visual verification)
+Worker's `reverse_rotation()` was rectangle-shaped — applied a single (x0,y0,x1,y1) formula treating them as bbox corners. For lines, this scrambled the y-coords of the two endpoints on rotation=90/180/270 pages. Fix in `10146db` adds a per-point `reverse_rotation_point()` and applies it to each endpoint independently. Smoke-test with synthetic horizontal lines on all four rotations confirmed cyan stays centred. **Re-upload a rotated PDF to confirm visually.**
+
+For the **measurement PDF** (the C5 download), `exports.generate_measurement_pdf` *also* uses the same rect-shaped formula on lines and has the same logical bug — but exports.py is shared with prod's flow, so we have a choice: leave it (matches prod's behaviour, even if both are wrong on rotated pages) or fork. Currently leaving it. Flag if the customer cares.
+
+### 4. `app_ade_prod.py` colour-codes lines per category; we draw uniform cyan
+Prod's drawing loop (lines 1774-1808) reads `categories[category]['color']` for each line. Ours uses cyan for all. User has flagged this implicitly ("highlighting still incorrect"). To match: thread the same auto-assignment that the export builder produces (`_build_auto_export_state` in `api_server.py`) into the highlight worker as a `line_categories` field, then have the worker pick the colour from that map per line. Probably a 30-line addition; not blocking Sprint 4.
+
+---
 
 ### Sprint 4 — UMT + summary report (CRITICAL PATH, biggest scope)
 Plan refs: C1–C4, **C8**.
@@ -177,12 +229,14 @@ Currently SQLite-based [job_registry.py](job_registry.py) handles queueing. Migr
 
 ## Recommended next steps (in order)
 
-1. **Sprint 2** — live per-page updates + phase ETAs + page images
-2. **Sprint 3** — settings panel + Measurements PDF/Excel downloads
-3. **Sprint 4** — UMT (start with iframe-embed for speed; revisit React rebuild post-launch)
-4. **Phase 10.1** — authorization tests
-5. **Phase 11** — Vercel + AWS deployment
-6. (later) Sprint 5, S3 migration, Redis/RQ migration
+1. **Apply migrations 003 + 004 in Supabase** (one paste in SQL Editor — both blocks above)
+2. **Trigger one fresh upload, send the new uvicorn.log** so I can diagnose the live-pages issue from the `_page_cb` log lines
+3. **Visually verify highlighter on rotated pages** (delete + re-upload `selected_pages_no_annotations.pdf`)
+4. **Decide on per-category line colour** (Open issue #4) — if yes, ~30 lines of work to thread it through
+5. **Sprint 4** — UMT (start with iframe-embed for speed; revisit React rebuild post-launch). C8 cross-page summary ships with UMT.
+6. **Phase 10.1** — authorization tests
+7. **Phase 11** — Vercel + AWS deployment
+8. (later) Sprint 5 (operational/observability), S3 migration, Redis/RQ migration
 
 ---
 
