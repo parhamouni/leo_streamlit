@@ -72,6 +72,17 @@ export default function DashboardPage() {
         setEmail(data.session.user.email ?? null);
         setUserId(data.session.user.id);
         setAuthReady(true);
+
+        // Strip the OAuth #access_token=... fragment from the URL so it
+        // doesn't linger in the address bar / browser history. Supabase
+        // has already consumed it via detectSessionInUrl by this point.
+        if (window.location.hash.includes("access_token")) {
+          window.history.replaceState(
+            null,
+            "",
+            window.location.pathname + window.location.search,
+          );
+        }
       });
     return () => {
       active = false;
