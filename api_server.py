@@ -631,9 +631,18 @@ async def get_page_image(
     if job["user_id"] != user_id:
         raise HTTPException(403, "Access denied")
 
+    # Prefer the highlighted PDF (with overlays). It's only written at the
+    # very end of run_analysis(), so during a running/queued job we fall
+    # back to the original uploaded PDF — the user can still see the page,
+    # just without the colored boxes yet. Once the job completes the same
+    # endpoint serves the highlighted version automatically.
     hl_path = job_registry.get_highlighted_pdf_path(job_id)
-    if hl_path is None:
-        raise HTTPException(404, "Highlighted PDF not available")
+    src_pdf = hl_path if hl_path is not None else job.get("pdf_path")
+    if not src_pdf or not Path(src_pdf).exists():
+        raise HTTPException(
+            404,
+            "Source PDF not available — try again once upload finishes",
+        )
 
     import subprocess
     try:
@@ -642,7 +651,7 @@ async def get_page_image(
                 sys.executable,
                 "-c",
                 _PAGE_RENDER_SCRIPT,
-                str(hl_path),
+                str(src_pdf),
                 str(page_num),
                 str(dpi),
             ],
@@ -666,12 +675,19 @@ async def get_page_image(
         )
         raise HTTPException(500, f"Page render failed: {err}")
 
+    is_highlighted = hl_path is not None
     return Response(
         content=proc.stdout,
         media_type="image/png",
         headers={
-            "Cache-Control": "private, max-age=3600",
+            # Don't cache long while the job is running — we want the
+            # highlighted version once it lands. After completion the
+            # response is stable so an hour is fine.
+            "Cache-Control": (
+                "private, max-age=3600" if is_highlighted else "private, max-age=10"
+            ),
             "X-Page-Number": str(page_num),
+            "X-Image-Source": "highlighted" if is_highlighted else "original",
         },
     )
 
