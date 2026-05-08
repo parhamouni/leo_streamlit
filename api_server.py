@@ -688,6 +688,227 @@ async def get_highlighted_pdf(
     )
 
 
+# ---------------------------------------------------------------------------
+# Sprint 3 / C5 + C6 — Measurement export endpoints
+# ---------------------------------------------------------------------------
+
+# Default category palette mirrors prod's CATEGORY_COLORS at
+# app_ade_prod.py:4844 so that lacking-UMT exports still get distinguishable
+# line colors per fence type.
+_CATEGORY_PALETTE = [
+    (0, 255, 0),     (255, 165, 0),  (0, 191, 255),  (255, 0, 255),
+    (255, 255, 0),   (0, 255, 255),  (255, 105, 180), (173, 255, 47),
+]
+
+
+def _build_auto_export_state(results: dict) -> tuple[list, dict, dict, dict]:
+    """Reshape pipeline results into the (line_assignments, page_categories,
+    auto-lines-per-page) tuple that exports.py wants. UMT (Sprint 4) hasn't
+    landed yet, so user_drawn_lines is always empty and we treat every
+    auto-detected fence line as accepted.
+
+    Returns: (fence_pages_with_auto_lines, line_assignments, user_drawn_lines,
+    page_categories, per_page_scale_info, lines_by_page).
+    """
+    fence_pages_in = (results or {}).get("fence_pages") or []
+    per_page_scale = (results or {}).get("per_page_scale_info") or {}
+
+    line_assignments: dict[str, dict[str, str]] = {}
+    page_categories: dict[str, dict] = {}
+    lines_by_page: dict[str, list] = {}
+    fence_pages_out: list[dict] = []
+
+    for fp in fence_pages_in:
+        if not isinstance(fp, dict):
+            continue
+        page_num = fp.get("page_num") or fp.get("page_number")
+        if page_num is None:
+            continue
+        page_key = f"page_{page_num}"
+
+        # 1) Build category palette from this page's legend entries (the
+        # LLM-extracted (indicator, keyword, description) tuples). Note: the
+        # `definitions` field on a fence page is the raw ADE chunk text, not
+        # the legend rows — those live on `legend_entries`.
+        cats: dict[str, dict] = {}
+        for le in fp.get("legend_entries") or []:
+            keyword = (le.get("keyword") or "").strip()
+            indicator = (le.get("indicator") or "").strip()
+            if not keyword:
+                continue
+            cat_name = f"{indicator}: {keyword}" if indicator else keyword
+            if cat_name in cats:
+                continue
+            cats[cat_name] = {
+                "indicator": indicator,
+                "keyword": keyword,
+                "color": _CATEGORY_PALETTE[len(cats) % len(_CATEGORY_PALETTE)],
+            }
+        page_categories[page_key] = cats
+
+        # 2) Auto-detected fence lines + layer→category assignment.
+        measurements = fp.get("measurements") or {}
+        all_lines = measurements.get("all_fence_lines") or []
+        layer_to_cat = measurements.get("layer_to_category") or {}
+
+        page_assignments: dict[str, str] = {}
+        auto_lines: list[dict] = []
+        # Last-resort bucket so users get *something* when the LLM didn't
+        # produce a layer→category mapping (this happens when legend
+        # extraction returns no matches but Phase 3 still detected lines
+        # geometrically — the prod UMT relies on the user assigning these
+        # by hand, which we can't do until Sprint 4).
+        FALLBACK_CAT = "Auto-detected"
+        any_layer_mapped = bool(layer_to_cat)
+
+        for idx, line in enumerate(all_lines):
+            if not isinstance(line, dict):
+                continue
+            layer = line.get("layer") or ""
+            category = layer_to_cat.get(layer)
+            # Partial layer match fallback (mirrors prod logic at
+            # app_ade_prod.py:4799-4804).
+            if not category and layer and any_layer_mapped:
+                for k, v in layer_to_cat.items():
+                    if k and (k in layer or layer in k):
+                        category = v
+                        break
+            if not category:
+                # If we have NO layer mapping at all, group the page's auto
+                # lines under a single fallback category. Skip lines that
+                # have no geometry though — they wouldn't render anyway.
+                if any_layer_mapped:
+                    continue
+                category = FALLBACK_CAT
+            # Only record an assignment if the named category actually exists
+            # in this page's palette — otherwise the export drops the row.
+            if category not in cats:
+                cats[category] = {
+                    "indicator": "",
+                    "keyword": category,
+                    "color": _CATEGORY_PALETTE[len(cats) % len(_CATEGORY_PALETTE)],
+                }
+            page_assignments[str(idx)] = category
+            auto_lines.append(line)
+
+        if page_assignments:
+            line_assignments[page_key] = page_assignments
+        if auto_lines:
+            lines_by_page[page_key] = auto_lines
+
+        # 3) Carry the page through with `auto_lines` populated so the PDF
+        # exporter can index into it.
+        fp_out = dict(fp)
+        fp_out["auto_lines"] = auto_lines
+        fence_pages_out.append(fp_out)
+
+    return fence_pages_out, line_assignments, {}, page_categories, per_page_scale, lines_by_page
+
+
+@app.get("/api/jobs/{job_id}/measurement-pdf")
+async def get_measurement_pdf(
+    job_id: str,
+    user_id: str = Depends(get_current_user),
+):
+    """Measurement-overlay PDF (Sprint 3 / C5).
+
+    Wraps `exports.generate_measurement_pdf`. Until UMT (Sprint 4) ships,
+    this only contains auto-detected lines pre-assigned via the layer →
+    category map. User edits are not yet captured."""
+    job = job_registry.get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if job["user_id"] != user_id:
+        raise HTTPException(403, "Access denied")
+
+    pdf_path = job.get("pdf_path")
+    if not pdf_path or not Path(pdf_path).exists():
+        raise HTTPException(404, "Source PDF not on disk")
+
+    results = job_registry.load_results(job_id)
+    if results is None:
+        raise HTTPException(404, "Results not available — job may still be running")
+
+    fence_pages_out, line_assignments, user_drawn, page_cats, _scale, _lines = (
+        _build_auto_export_state(results)
+    )
+
+    from exports import generate_measurement_pdf
+    pdf_bytes, fname = generate_measurement_pdf(
+        pdf_path=pdf_path,
+        fence_pages=fence_pages_out,
+        line_assignments=line_assignments,
+        user_drawn_lines=user_drawn,
+        page_categories=page_cats,
+        uploaded_pdf_name=job.get("filename") or "document.pdf",
+    )
+    if not pdf_bytes:
+        raise HTTPException(500, "Measurement PDF generation returned no bytes")
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
+@app.get("/api/jobs/{job_id}/measurement-excel")
+async def get_measurement_excel(
+    job_id: str,
+    user_id: str = Depends(get_current_user),
+):
+    """Measurement Excel (Sprint 3 / C6).
+
+    Wraps `exports.generate_measurement_spreadsheet`. Same auto-only caveat
+    as the PDF export."""
+    job = job_registry.get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if job["user_id"] != user_id:
+        raise HTTPException(403, "Access denied")
+
+    results = job_registry.load_results(job_id)
+    if results is None:
+        raise HTTPException(404, "Results not available — job may still be running")
+
+    fence_pages_out, line_assignments, user_drawn, page_cats, scale_info, lines_by_page = (
+        _build_auto_export_state(results)
+    )
+    element_details = (results or {}).get("element_details") or {}
+
+    from exports import generate_measurement_spreadsheet
+    xlsx_bytes = generate_measurement_spreadsheet(
+        fence_pages=fence_pages_out,
+        line_assignments=line_assignments,
+        user_drawn_lines=user_drawn,
+        page_categories=page_cats,
+        per_page_scale_info=scale_info,
+        element_details=element_details,
+        lines_by_page=lines_by_page,
+    )
+    if not xlsx_bytes:
+        raise HTTPException(
+            500,
+            "No measurement rows were generated — likely because no fence "
+            "lines were auto-detected. After UMT (Sprint 4) ships, manual "
+            "edits will populate this export.",
+        )
+
+    base = (job.get("filename") or "document.pdf").rsplit(".", 1)[0]
+    fname = f"{base}_measurements.xlsx"
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
 @app.get("/api/jobs/{job_id}/progress")
 async def stream_progress(
     job_id: str,

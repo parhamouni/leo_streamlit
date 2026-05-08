@@ -282,16 +282,25 @@ export default function DocumentDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [doc?.job_status, doc?.latest_job_id]);
 
-  async function onDownload() {
+  async function downloadFromJob(
+    pathSegment: string,
+    filenameFallback: string,
+  ) {
     if (!doc?.latest_job_id) return;
     setDownloading(true);
     try {
-      const resp = await apiFetch(`/api/jobs/${doc.latest_job_id}/highlighted-pdf`);
+      const resp = await apiFetch(
+        `/api/jobs/${doc.latest_job_id}/${pathSegment}`,
+      );
       const blob = await resp.blob();
+      // Honour Content-Disposition filename when present.
+      const cd = resp.headers.get("Content-Disposition") || "";
+      const m = /filename="?([^"]+)"?/.exec(cd);
+      const filename = m?.[1] || filenameFallback;
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `fence_${doc.original_filename}`;
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -303,6 +312,19 @@ export default function DocumentDetailPage() {
       setDownloading(false);
     }
   }
+
+  const onDownloadHighlighted = () =>
+    downloadFromJob("highlighted-pdf", `fence_${doc?.original_filename ?? "document.pdf"}`);
+  const onDownloadMeasurementPdf = () =>
+    downloadFromJob(
+      "measurement-pdf",
+      `${(doc?.original_filename ?? "document").replace(/\.[^.]+$/, "")}_measurements.pdf`,
+    );
+  const onDownloadMeasurementExcel = () =>
+    downloadFromJob(
+      "measurement-excel",
+      `${(doc?.original_filename ?? "document").replace(/\.[^.]+$/, "")}_measurements.xlsx`,
+    );
 
   if (!authReady || (loading && !doc)) {
     return (
@@ -398,13 +420,33 @@ export default function DocumentDetailPage() {
                 }}
               />
               {isComplete && (
-                <button
-                  onClick={onDownload}
-                  disabled={downloading}
-                  className="rounded bg-black text-white px-4 py-2 text-sm hover:bg-gray-800 disabled:opacity-60"
-                >
-                  {downloading ? "Preparing…" : "Download highlighted PDF"}
-                </button>
+                <div className="flex flex-col gap-1.5 items-stretch">
+                  <button
+                    onClick={onDownloadHighlighted}
+                    disabled={downloading}
+                    className="rounded bg-black text-white px-4 py-2 text-sm hover:bg-gray-800 disabled:opacity-60"
+                  >
+                    {downloading ? "Preparing…" : "Download highlighted PDF"}
+                  </button>
+                  <div className="flex gap-1.5">
+                    <button
+                      onClick={onDownloadMeasurementPdf}
+                      disabled={downloading}
+                      className="flex-1 rounded border border-gray-300 px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-100 disabled:opacity-60"
+                      title="Auto-detected measurement lines (UMT edits not yet supported)"
+                    >
+                      Measurement PDF
+                    </button>
+                    <button
+                      onClick={onDownloadMeasurementExcel}
+                      disabled={downloading}
+                      className="flex-1 rounded border border-gray-300 px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-100 disabled:opacity-60"
+                      title="Auto-detected measurement rows as XLSX"
+                    >
+                      Measurement Excel
+                    </button>
+                  </div>
+                </div>
               )}
             </div>
           </div>
