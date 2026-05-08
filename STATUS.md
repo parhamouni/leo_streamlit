@@ -7,7 +7,7 @@
 **Plan file:** `/home/ubuntu/.claude/plans/yes-i-get-you-refactored-hummingbird.md`
 **Stage-1 highlighting plan (now superseded — work below is done):** `/home/ubuntu/.claude/plans/fuck-you-you-are-splendid-beacon.md`
 **Decision log:** UMT confirmed **critical-path** (customers always correct measurements manually).
-**Last updated:** 2026-05-08 — **Sprint 4 (UMT) in progress, option (a) React canvas chosen.** Checkpoints 4a.1–4a.4 done: persistence layer, vector-lines endpoint with server-side auto-assignment matching, read-only canvas, click-to-assign + categories + bulk-reassign + reset-to-auto, debounced PUT persistence. Embedded PDF viewer removed (download button only). Side fixes: `_build_auto_export_state` index bug; rotation handling in `page-vector-lines`; `FENCE_API_AUTH_MODE=supabase` flipped on. Sprint-4 plan: `.claude/plans/sprint4-umt-react-canvas.md`.
+**Last updated:** 2026-05-08 — **Sprint 4 (UMT) — 4a.5 + 4a.6 + UX overhaul shipped.** Drawing mode (click-drag on empty stage), zoom slider + pan mode + Ctrl/Cmd-wheel zoom-around-cursor, per-line popover (vector + drawn) for reassignment with click-to-pick category, Layers panel with row highlight + per-layer category dropdown, smart auto-assign with layer-vote confidence thresholds + page-rotation, indicator-code de-duplication everywhere, highlighted-PDF fallback when `/tmp` source PDF is reaped. Sprint-4 plan: `.claude/plans/sprint4-umt-react-canvas.md`. **Next:** 4a.7 (C8 cross-page summary table).
 
 ---
 
@@ -58,7 +58,8 @@ The legacy Streamlit prod stays untouched per user instruction (they're serving 
 | `10146db` | **Bug fix**: line endpoints now transform per-point on rotated pages (`reverse_rotation_point`). Rectangle-shaped formula was scrambling y-coords on rot=90/180/270 pages. |
 | `f61e793` | Diagnostics: `_page_cb` log line + migration 004 (`page_results.updated_at`) for the live-pages debug |
 | `0ed52a8` | **Stage-1 highlighted-PDF parity with `app_ade_prod.py`.** Five wins, one file (`pipeline.py`) + one frontend cleanup: (1) `definitions` is now `legend_entries` (LLM per-row tight bboxes) instead of raw legend chunks; (2) new instance-finding step calls `find_instances_in_figures_fast` to get per-token indicator bboxes inside figures; (3) keyword scanner now runs against `get_native_pdf_lines` output (real per-line bboxes); (4) `phase1b` OCR step now preserves the per-line bboxes returned by Google DocAI (cache key bumped to `phase1b_v2`) — required for scanned pages where native PDF text is missing or has CID-without-CMap encoding; (5) `keyword_matches` always populated. Frontend: removed the noisy "Detected Instances (bbox)" table from the detail page. |
-| **(this commit)** | **Sprint 4 UMT React canvas (checkpoints 4a.1–4a.4) + side fixes.** New: `backend/app/umt_state.py` (per-job JSON persistence with size validation, atomic writes), `frontend/components/UMTCanvas.tsx` + `UMTCanvasInner.tsx` (Konva-based interactive canvas, dynamic-imported as a single client-only module to dodge react-konva named-export resolution issues; pinned `react-konva@^18` for React 18 compat). New API endpoints: `GET/PUT/DELETE /api/jobs/{id}/umt-state[/{page_num}]`, `GET /api/jobs/{id}/page-vector-lines/{n}` (returns ALL display-space vector lines + server-side `auto_categories` and `auto_assignments` mapping pipeline-detected fence lines to vector indices via rounded-coord exact match, with prod's partial-layer-match + "Auto-detected" fallback bucket). Canvas features: category panel (active selection, color swatches, add/delete), click-to-toggle assignment, debounced PUT-save status indicator, "Reassign Auto-detected → \<active>" bulk action, "Reset to auto" button, min-line-pts filter (default 20). Frontend: removed embedded `<iframe>` PDF viewer + dead `pdfBlobUrl` state — download button kept. Side fixes: (1) `_build_auto_export_state` was keying `line_assignments` by `enumerate(all_lines)` index but `exports.py` indexes into the post-filter `auto_lines`; layer-skipped lines silently shifted later lines out-of-bounds. Switched to `len(auto_lines)` (post-append). (2) `page-vector-lines` was swapping `pdf_width`/`pdf_height` for rotation 90/270 — but current PyMuPDF's `page.rect` already reflects display orientation, so the swap mis-sized the stage and lines didn't align with the page image. Removed the swap. (3) `FENCE_API_AUTH_MODE=supabase` set in `.env.local` — was defaulting to `legacy_header`, so JWT-authenticated frontend hits to `get_current_user`-using endpoints fell through to `"anonymous"` and tripped the ownership check. (4) Fixed page-index lookup that treated `0` as falsy. |
+| `33bad86` | **Sprint 4 4a.5 + 4a.6 + UMT UX overhaul.** Drawing mode (click-drag on empty stage starts a new line; click on a line still opens its popover so Draw mode is sticky). Zoom slider 25–400% + ✋ Pan mode + Ctrl/Cmd+wheel zoom-around-cursor (anchors scrollLeft/Top to the cursor's PDF point post-zoom). Per-line popover for both vector and user-drawn lines (line idx / layer / length / current category, full category list with color swatches, ✕ Unassign or 🗑 Delete). Layers panel: click a row to highlight all its lines on the canvas in yellow; per-row category dropdown bulk-assigns the whole layer in one pick. 🎯 Smart auto-assign (`/page-vector-lines/{n}/smart-assign`): per-CAD-layer indicator-bbox proximity voting with confidence thresholds (≥3 votes, ≥50% share, ≥5% participation), strict layer-token fallback for layers with no votes. Page rotation applied via `fitz.page.rotation_matrix`. `_clean_legend_entries` filters indicator-code duplicates (kw==ind, desc=="Indicator Code") at the source; frontend `cleanCategoryMap` mirrors it and drops orphaned line_assignments — old saved umt_state self-heals on next save. Highlighted-PDF fallback when /tmp source PDF was reaped (returns source_missing=true; saved assignments still render). Dropped the over-defensive 15k LINE_CAP. |
+| `e8956b7` | **Sprint 4 UMT React canvas (checkpoints 4a.1–4a.4) + side fixes.** New: `backend/app/umt_state.py` (per-job JSON persistence with size validation, atomic writes), `frontend/components/UMTCanvas.tsx` + `UMTCanvasInner.tsx` (Konva-based interactive canvas, dynamic-imported as a single client-only module to dodge react-konva named-export resolution issues; pinned `react-konva@^18` for React 18 compat). New API endpoints: `GET/PUT/DELETE /api/jobs/{id}/umt-state[/{page_num}]`, `GET /api/jobs/{id}/page-vector-lines/{n}` (returns ALL display-space vector lines + server-side `auto_categories` and `auto_assignments` mapping pipeline-detected fence lines to vector indices via rounded-coord exact match, with prod's partial-layer-match + "Auto-detected" fallback bucket). Canvas features: category panel (active selection, color swatches, add/delete), click-to-toggle assignment, debounced PUT-save status indicator, "Reassign Auto-detected → \<active>" bulk action, "Reset to auto" button, min-line-pts filter (default 20). Frontend: removed embedded `<iframe>` PDF viewer + dead `pdfBlobUrl` state — download button kept. Side fixes: (1) `_build_auto_export_state` was keying `line_assignments` by `enumerate(all_lines)` index but `exports.py` indexes into the post-filter `auto_lines`; layer-skipped lines silently shifted later lines out-of-bounds. Switched to `len(auto_lines)` (post-append). (2) `page-vector-lines` was swapping `pdf_width`/`pdf_height` for rotation 90/270 — but current PyMuPDF's `page.rect` already reflects display orientation, so the swap mis-sized the stage and lines didn't align with the page image. Removed the swap. (3) `FENCE_API_AUTH_MODE=supabase` set in `.env.local` — was defaulting to `legacy_header`, so JWT-authenticated frontend hits to `get_current_user`-using endpoints fell through to `"anonymous"` and tripped the ownership check. (4) Fixed page-index lookup that treated `0` as falsy. |
 
 ### Endpoints currently live on the backend
 
@@ -73,7 +74,8 @@ GET    /api/jobs/{id}/highlighted-pdf            — FileResponse with cyan fenc
 GET    /api/jobs/{id}/page-image/{n}?dpi=110     — PNG of one page from highlighted PDF (subprocess-isolated)
 GET    /api/jobs/{id}/measurement-pdf            — measurement-overlay PDF (auto-only until UMT)
 GET    /api/jobs/{id}/measurement-excel          — per-line workbook (auto-only until UMT)
-GET    /api/jobs/{id}/page-vector-lines/{n}      — all vector lines on a page + server-side auto_categories/auto_assignments (Sprint 4)
+GET    /api/jobs/{id}/page-vector-lines/{n}      — all vector lines on a page + server-side auto_categories/auto_assignments (Sprint 4); falls back to highlighted PDF if /tmp source is gone (source_missing flag)
+GET    /api/jobs/{id}/page-vector-lines/{n}/smart-assign — layer-vote indicator proximity assignment (Sprint 4 4a.5+)
 GET    /api/jobs/{id}/umt-state                  — read user's saved UMT edits (Sprint 4)
 PUT    /api/jobs/{id}/umt-state/{n}              — upsert one page's UMT state (Sprint 4)
 DELETE /api/jobs/{id}/umt-state/{n}              — clear UMT edits for one page (Sprint 4)
@@ -212,14 +214,22 @@ User picked **option (a)** native React canvas over iframe-embed. Done so far:
 | 4a.3 ✅ | Read-only Konva canvas mounted under each fence-page card. Page image as background, vector lines overlaid in display space. |
 | 4a.4 ✅ | Selection wired: category panel (click to set active, add/delete with color swatches), click line to assign/unassign, debounced 500ms PUT, save status indicator, "Reassign Auto-detected → \<active>" bulk action, "Reset to auto", min-line-pts filter. Stage-1 cleanup: removed `<iframe>` PDF viewer (download button kept). |
 
-**Remaining checkpoints:**
+**Recent progress:**
 
-| | What |
+| Checkpoint | Status |
 |---|---|
-| 4a.5 | Drawing mode: click-drag on canvas to add a `user_drawn_line` (PDF-space coords); pending-line preview while drawing |
-| 4a.6 | Per-page scale override (numeric input) + zoom slider |
-| 4a.7 | C8 — cross-page summary table component (per-category totals + per-page rows + grand total) above/below per-page UMT panels |
-| 4a.8 | Wire `_build_auto_export_state` to read `umt_state.json` so Measurement PDF / Excel pick up manual edits |
+| 4a.5 ✅ | Drawing mode + click-on-line popover both work in Draw mode (commit `33bad86`) |
+| 4a.6 ✅ | Zoom slider + pan mode + Ctrl/Cmd+wheel zoom-around-cursor (commit `33bad86`). Manual scale-override numeric input deferred — pipeline's auto-detected scale used for now; add when user requests it. |
+| 4a.7 ⏳ | C8 — cross-page summary table component (per-category totals + per-page rows + grand total) above per-page UMT panels |
+| 4a.8 ⏳ | Wire `_build_auto_export_state` to read `umt_state.json` so Measurement PDF / Excel pick up manual edits |
+
+**Bonus shipped on top of the original plan (commit `33bad86`):**
+- 🎯 Smart auto-assign endpoint with per-CAD-layer indicator-vote thresholds + page-rotation correction
+- Per-line popover (click any vector or drawn line → category list + unassign/delete)
+- Layers panel: row-click highlights its lines on canvas; per-row category dropdown bulk-assigns
+- Indicator-code de-dup everywhere (canvas chips + Legend Definitions table + smart-assign source)
+- Highlighted-PDF fallback when /tmp source PDF was reaped (source_missing flag; saved assignments still align)
+- Removed the over-defensive 15k line cap that was emptying canvases on dense pages
 
 ### Sprint 5 — operational (low priority)
 Plan refs: D1 / D2 / D3.
@@ -246,7 +256,7 @@ Currently SQLite-based [job_registry.py](job_registry.py) handles queueing. Migr
 
 1. **Apply migrations 003 + 004 in Supabase** (one paste in SQL Editor — both blocks above) — still pending
 2. **Trigger one fresh upload, send the new uvicorn.log** so I can diagnose the live-pages issue from the `_page_cb` log lines
-3. **Sprint 4 remaining checkpoints (4a.5–4a.8)** — drawing mode, scale override, C8 summary table, wire exports to UMT state
+3. **Sprint 4 remaining checkpoints (4a.7–4a.8)** — C8 summary table, wire exports to UMT state. (Manual scale-override numeric input deferred.)
 4. **Phase 10.1** — authorization tests
 5. **Phase 11** — Vercel + AWS deployment
 6. (later) Sprint 5 (operational/observability), S3 migration, Redis/RQ migration

@@ -13,6 +13,7 @@ import {
 } from "@/lib/eta";
 import { RowActions } from "@/components/RowActions";
 import { UMTCanvas } from "@/components/UMTCanvas";
+import { MeasurementSummary } from "@/components/MeasurementSummary";
 import {
   cleanElementKey,
   detectionLabel,
@@ -482,6 +483,11 @@ export default function DocumentDetailPage() {
             No populated element specifications were extracted. ({Object.keys(elementDetails).length}{" "}
             chunks examined; all fields empty.)
           </section>
+        )}
+
+        {/* ---------- Cross-page measurement summary (Sprint 4 / C8) ---------- */}
+        {isComplete && results && doc?.latest_job_id && fencePages.length > 0 && (
+          <MeasurementSummary jobId={doc.latest_job_id} />
         )}
 
         {/* ---------- Pages list ---------- */}

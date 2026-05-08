@@ -1398,6 +1398,205 @@ async def get_measurement_excel(
     )
 
 
+def _summary_for_page(
+    pdf_path: str,
+    page_idx: int,
+    fp: dict,
+    page_state: dict | None,
+) -> dict:
+    """Compute per-category measurement totals for one fence page.
+
+    If `page_state` (from `umt_state.json`) carries any saved
+    line_assignments or user_drawn_lines, totals are recomputed from
+    those edits. Otherwise we fall back to the pipeline's auto totals
+    (`measurements.all_fence_lines` + `layer_to_category`).
+
+    Returns: {scale, has_user_edits, per_category: {cat: {pts, ft, auto, manual}}}.
+    """
+    scale_info = (fp or {}).get("scale_info") or {}
+    page_scale_override = (page_state or {}).get("scale_override")
+    page_scale = (
+        float(page_scale_override)
+        if page_scale_override
+        else float(scale_info.get("verified_scale") or 360.0)
+    )
+    if page_scale <= 0:
+        page_scale = 360.0
+
+    per_cat: dict[str, dict] = {}
+    has_user_edits = bool(
+        (page_state or {}).get("line_assignments")
+        or (page_state or {}).get("user_drawn_lines")
+    )
+
+    if has_user_edits:
+        # Recompute from saved UMT state. Re-extract vector lines so we
+        # can map saved indices -> length_pts.
+        import fitz
+        from utils_vector import extract_vector_lines
+
+        doc = None
+        vlines = []
+        try:
+            doc = fitz.open(pdf_path)
+            if 0 <= page_idx < len(doc):
+                vlines = extract_vector_lines(doc[page_idx], apply_rotation=True)
+        finally:
+            if doc is not None:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
+
+        line_assignments = (page_state or {}).get("line_assignments") or {}
+        for idx_str, cat in line_assignments.items():
+            try:
+                i = int(idx_str)
+            except (TypeError, ValueError):
+                continue
+            if i < 0 or i >= len(vlines):
+                continue
+            ln = vlines[i]
+            entry = per_cat.setdefault(
+                cat, {"pts": 0.0, "auto": 0, "manual": 0}
+            )
+            entry["pts"] += float(ln.length_pts)
+            entry["auto"] += 1
+
+        user_drawn = (page_state or {}).get("user_drawn_lines") or []
+        for ud in user_drawn:
+            cat = ud.get("category")
+            if not cat:
+                continue
+            try:
+                sx, sy = float(ud["start"][0]), float(ud["start"][1])
+                ex, ey = float(ud["end"][0]), float(ud["end"][1])
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+            entry = per_cat.setdefault(
+                cat, {"pts": 0.0, "auto": 0, "manual": 0}
+            )
+            entry["pts"] += ((ex - sx) ** 2 + (ey - sy) ** 2) ** 0.5
+            entry["manual"] += 1
+    else:
+        # Auto-only: mirror `_build_auto_export_state` per-line bucketing
+        # so the summary matches exports.
+        measurements = (fp or {}).get("measurements") or {}
+        all_fence_lines = measurements.get("all_fence_lines") or []
+        layer_to_cat = measurements.get("layer_to_category") or {}
+        any_layer_mapped = bool(layer_to_cat)
+        FALLBACK = "Auto-detected"
+        for fl in all_fence_lines:
+            if not isinstance(fl, dict):
+                continue
+            try:
+                sx, sy = float(fl["start"][0]), float(fl["start"][1])
+                ex, ey = float(fl["end"][0]), float(fl["end"][1])
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+            layer = fl.get("layer") or ""
+            cat = layer_to_cat.get(layer)
+            if not cat and layer and any_layer_mapped:
+                for k, v in layer_to_cat.items():
+                    if k and (k in layer or layer in k):
+                        cat = v
+                        break
+            if not cat:
+                if any_layer_mapped:
+                    continue
+                cat = FALLBACK
+            length_pts = (
+                float(fl["length_pts"])
+                if isinstance(fl.get("length_pts"), (int, float))
+                else ((ex - sx) ** 2 + (ey - sy) ** 2) ** 0.5
+            )
+            entry = per_cat.setdefault(
+                cat, {"pts": 0.0, "auto": 0, "manual": 0}
+            )
+            entry["pts"] += length_pts
+            entry["auto"] += 1
+
+    for cat, entry in per_cat.items():
+        entry["ft"] = round(entry["pts"] / page_scale, 2)
+        entry["pts"] = round(entry["pts"], 1)
+
+    return {
+        "scale": page_scale,
+        "has_user_edits": has_user_edits,
+        "per_category": per_cat,
+    }
+
+
+@app.get("/api/jobs/{job_id}/measurement-summary")
+async def measurement_summary(
+    job_id: str,
+    user_id: str = Depends(get_current_user),
+):
+    """Cross-page totals by category. Falls back to auto-only on pages
+    with no UMT edits, recomputes from umt_state on pages that do."""
+    job = job_registry.get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if job["user_id"] != user_id:
+        raise HTTPException(403, "Access denied")
+
+    pdf_path = job.get("pdf_path")
+    if not pdf_path or not Path(pdf_path).exists():
+        hl = job_registry.get_highlighted_pdf_path(job_id)
+        if hl is not None and Path(hl).exists():
+            pdf_path = str(hl)
+        else:
+            raise HTTPException(404, "No PDF on disk for this job")
+
+    results = job_registry.load_results(job_id)
+    if results is None:
+        raise HTTPException(404, "Results not available")
+
+    from backend.app import umt_state
+    umt = umt_state.load(job_id)
+    pages_node = (umt or {}).get("pages") or {}
+
+    fence_pages = (results or {}).get("fence_pages") or []
+    pages_data: list[dict] = []
+    grand: dict[str, dict] = {}
+    for fp in fence_pages:
+        page_num = fp.get("page_num") or fp.get("page_number")
+        page_idx = fp.get("page_idx")
+        if page_idx is None:
+            page_idx = fp.get("page_index_in_original_doc")
+        if page_idx is None or page_num is None:
+            continue
+        page_state = pages_node.get(f"page_{page_num}")
+        ps = _summary_for_page(pdf_path, int(page_idx), fp, page_state)
+        pages_data.append({
+            "page_num": page_num,
+            "scale": ps["scale"],
+            "has_user_edits": ps["has_user_edits"],
+            "per_category": ps["per_category"],
+        })
+        for cat, entry in ps["per_category"].items():
+            g = grand.setdefault(
+                cat, {"pts": 0.0, "ft": 0.0, "auto": 0, "manual": 0}
+            )
+            g["pts"] += entry["pts"]
+            g["ft"] += entry["ft"]
+            g["auto"] += entry["auto"]
+            g["manual"] += entry["manual"]
+    for cat, g in grand.items():
+        g["pts"] = round(g["pts"], 1)
+        g["ft"] = round(g["ft"], 2)
+
+    sorted_grand = dict(
+        sorted(grand.items(), key=lambda kv: -kv[1]["ft"])
+    )
+    return {
+        "pages": pages_data,
+        "grand_total": sorted_grand,
+        "page_count": len(pages_data),
+        "category_count": len(sorted_grand),
+    }
+
+
 def _job_for_user(job_id: str, user_id: str) -> dict:
     job = job_registry.get_job(job_id)
     if job is None:
