@@ -120,6 +120,42 @@ def _noop_progress(phase: str, pct: int, message: str) -> None:
     pass
 
 
+def _line_to_dict(line: Any) -> dict:
+    """Coerce a `VectorLine` (or similar) into a JSON-friendly dict so that
+    `all_fence_lines` survives `json.dumps` to disk. Plain dicts pass
+    through; everything else gets best-effort attribute extraction."""
+    if isinstance(line, dict):
+        return line
+    if hasattr(line, "__dataclass_fields__"):
+        from dataclasses import asdict
+        try:
+            return asdict(line)
+        except Exception:
+            pass
+    out: dict[str, Any] = {}
+    for attr in ("start", "end", "length_pts", "color", "width", "dashes", "layer"):
+        if hasattr(line, attr):
+            out[attr] = getattr(line, attr)
+    return out
+
+
+def _normalize_measurements(measurements: dict) -> dict:
+    """Make a measurement payload JSON-safe before it lands in
+    `result.fence_pages` / `job_registry.save_results` / fence_cache.
+
+    Today's only offender is `all_fence_lines`, a list of `VectorLine`
+    dataclasses that `json.dumps(..., default=str)` was silently turning
+    into repr strings — defeating downstream exporters and the highlight
+    overlay that wants to read line geometry."""
+    if not isinstance(measurements, dict):
+        return measurements
+    out = dict(measurements)
+    afl = out.get("all_fence_lines")
+    if isinstance(afl, list):
+        out["all_fence_lines"] = [_line_to_dict(ln) for ln in afl]
+    return out
+
+
 def _sha256_file(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -600,7 +636,7 @@ def run_analysis(
             cached_measure = fence_cache.get("phase3_measure", pdf_hash, params,
                                             page_idx=pi, user_scope=cache_scope)
             if cached_measure is not None:
-                page_result["measurements"] = cached_measure
+                page_result["measurements"] = _normalize_measurements(cached_measure)
             elif config.enable_unified_measurement:
                 try:
                     page_obj = doc[pi]
@@ -614,9 +650,10 @@ def run_analysis(
                         ocr_text=text,
                         light_llm=llm_classifier,
                     )
-                    page_result["measurements"] = measurements or {}
+                    measurements = _normalize_measurements(measurements or {})
+                    page_result["measurements"] = measurements
                     fence_cache.put("phase3_measure", pdf_hash, params,
-                                   measurements or {}, page_idx=pi,
+                                   measurements, page_idx=pi,
                                    user_scope=cache_scope)
                 except Exception as e:
                     log.warning(f"Phase 3 measure page {pi}: {e}")
