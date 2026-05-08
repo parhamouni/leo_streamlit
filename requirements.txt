@@ -21,9 +21,10 @@ uvicorn>=0.20.0
 python-multipart>=0.0.5
 requests>=2.28.0
 
-# Web-app migration (FastAPI + Supabase JWKS auth)
+# Web-app migration (FastAPI + Supabase JWKS auth + Postgres mirror)
 PyJWT[crypto]>=2.8.0
 python-dotenv>=1.0.0
+psycopg[binary,pool]>=3.1
 
 # Test-only (install with: pip install -r requirements.txt)
 pytest>=8.0

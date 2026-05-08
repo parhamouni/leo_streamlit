@@ -33,10 +33,22 @@ except ImportError:
     pass
 
 import job_registry
+import uuid as _uuid
+from backend.app import db
 from backend.app.auth import get_current_user, require_supabase_jwt
 from config import cfg
 from pipeline import PipelineConfig, PipelineResult, run_analysis
 from secrets_loader import load_api_keys as _load_api_keys
+
+
+def _is_uuid(s: str) -> bool:
+    """True if s is a well-formed UUID (Supabase user IDs always are).
+    Legacy X-User-Id values like 'alice' or 'anonymous' return False."""
+    try:
+        _uuid.UUID(s)
+        return True
+    except Exception:
+        return False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -123,6 +135,21 @@ def _run_job(job: dict, keys: dict):
             job_registry.write_progress(job_id, phase, pct, message)
         except Exception:
             pass
+        # Best-effort Postgres mirror so the dashboard sees live progress.
+        try:
+            db.update_job_progress(
+                job_id,
+                current_phase=phase,
+                progress_percent=pct,
+            )
+        except Exception:
+            pass
+
+    # Mark Postgres jobs row as running.
+    try:
+        db.update_job_progress(job_id, status="running", started_at_now=True)
+    except Exception:
+        pass
 
     try:
         _progress("start", 0, "Analysis starting...")
@@ -155,6 +182,15 @@ def _run_job(job: dict, keys: dict):
                 completed_at=int(time.time()),
                 total_pages=result.total_pages,
             )
+            try:
+                db.update_job_progress(
+                    job_id, status="failed",
+                    error_message=result.error[:500],
+                    progress_percent=100,
+                    finished_at_now=True,
+                )
+            except Exception:
+                pass
             _progress("done", 100, f"Failed: {result.error[:100]}")
         else:
             job_registry.update_job(
@@ -164,6 +200,15 @@ def _run_job(job: dict, keys: dict):
                 fence_count=len(result.fence_pages),
                 non_fence_count=len(result.non_fence_pages),
             )
+            try:
+                db.update_job_progress(
+                    job_id, status="completed",
+                    progress_percent=100,
+                    current_phase="done",
+                    finished_at_now=True,
+                )
+            except Exception:
+                pass
             _progress("done", 100, "Analysis complete")
 
         log.info(f"Job {job_id[:8]} completed: "
@@ -176,6 +221,15 @@ def _run_job(job: dict, keys: dict):
             error_msg=str(e)[:500],
             completed_at=int(time.time()),
         )
+        try:
+            db.update_job_progress(
+                job_id, status="failed",
+                error_message=str(e)[:500],
+                progress_percent=100,
+                finished_at_now=True,
+            )
+        except Exception:
+            pass
         try:
             job_registry.write_progress(job_id, "error", 100, f"Failed: {e}")
         except Exception:
@@ -290,11 +344,39 @@ async def create_job(
         config_json=json.dumps(config_data, default=str),
     )
 
+    # Mirror to Postgres so the dashboard list survives across sessions.
+    # Only Supabase (UUID) users get a Postgres row — the legacy X-User-Id
+    # path (e.g. the existing Streamlit fast-stack client) skips this and
+    # continues to live in SQLite job_registry only.
+    document_id: str | None = None
+    if _is_uuid(user_id):
+        rel_storage_path = f"{user_id}/{pdf_filename}"
+        try:
+            document_id, _ = db.insert_document_and_job(
+                user_id=user_id,
+                original_filename=pdf.filename or "unknown.pdf",
+                storage_path=rel_storage_path,
+                total_pages=n_pages,
+                job_id=job_id,
+            )
+        except Exception as e:
+            log.exception("Postgres mirror failed for upload")
+            try:
+                job_registry.delete_job(job_id)
+            except Exception:
+                pass
+            try:
+                Path(pdf_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise HTTPException(503, f"Database unavailable: {e}")
+
     queue_pos = job_registry.queue_position(job_id)
     running = job_registry.count_running_jobs()
 
     return {
         "job_id": job_id,
+        "document_id": document_id,
         "status": "queued",
         "queue_position": queue_pos,
         "running_jobs": running,
@@ -479,6 +561,31 @@ async def me(user_id: str = Depends(require_supabase_jwt)):
     Used by the Next.js frontend to confirm the backend can verify its tokens.
     """
     return {"user_id": user_id}
+
+
+@app.get("/api/documents")
+async def list_documents(user_id: str = Depends(require_supabase_jwt)):
+    """List the user's uploaded documents (from Postgres mirror).
+
+    Each row includes the latest job's status/progress for dashboard rendering.
+    Requires a Supabase JWT — the legacy X-User-Id path doesn't have a
+    Postgres mirror.
+    """
+    return {"documents": db.list_documents(user_id)}
+
+
+@app.get("/api/documents/{document_id}")
+async def get_document(
+    document_id: str,
+    user_id: str = Depends(require_supabase_jwt),
+):
+    """Get one document, ownership-checked. Requires Supabase JWT."""
+    if not _is_uuid(document_id):
+        raise HTTPException(400, "document_id must be a UUID")
+    doc = db.get_document(document_id, user_id)
+    if doc is None:
+        raise HTTPException(404, "Document not found")
+    return doc
 
 
 @app.get("/api/healthz")
