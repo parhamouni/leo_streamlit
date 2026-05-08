@@ -5,6 +5,7 @@ import { useRouter, useParams } from "next/navigation";
 import Link from "next/link";
 import { supabase } from "@/lib/supabase";
 import { apiFetch, apiJson, ApiError } from "@/lib/api";
+import { RowActions } from "@/components/RowActions";
 
 // --- Types ---------------------------------------------------------------
 
@@ -399,15 +400,34 @@ export default function DocumentDetailPage() {
                 </div>
               )}
             </div>
-            {isComplete && (
-              <button
-                onClick={onDownload}
-                disabled={downloading}
-                className="rounded bg-black text-white px-4 py-2 text-sm hover:bg-gray-800 disabled:opacity-60 whitespace-nowrap"
-              >
-                {downloading ? "Preparing…" : "Download highlighted PDF"}
-              </button>
-            )}
+            <div className="flex items-center gap-3 whitespace-nowrap">
+              <RowActions
+                jobId={doc.latest_job_id}
+                jobStatus={doc.job_status}
+                filename={doc.original_filename}
+                onChanged={() => {
+                  // For delete, the document is gone — bounce to dashboard.
+                  // For cancel, just refresh.
+                  if (
+                    doc.job_status !== "queued" &&
+                    doc.job_status !== "running"
+                  ) {
+                    router.replace("/dashboard");
+                  } else {
+                    refresh(false);
+                  }
+                }}
+              />
+              {isComplete && (
+                <button
+                  onClick={onDownload}
+                  disabled={downloading}
+                  className="rounded bg-black text-white px-4 py-2 text-sm hover:bg-gray-800 disabled:opacity-60"
+                >
+                  {downloading ? "Preparing…" : "Download highlighted PDF"}
+                </button>
+              )}
+            </div>
           </div>
         </section>
 

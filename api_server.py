@@ -571,9 +571,14 @@ async def delete_job(
     if status in ("queued", "running"):
         job_registry.update_job(job_id, status="cancelled",
                                 completed_at=int(time.time()))
+        # Mirror to Postgres so the dashboard reflects it immediately.
+        try:
+            db.update_job_progress(job_id, status="cancelled", finished_at_now=True)
+        except Exception:
+            pass
         return {"status": "cancelled"}
 
-    # Terminal state → hard delete
+    # Terminal state → hard delete (SQLite row, disk artifacts, Postgres document).
     rdir = job.get("results_dir")
     if rdir:
         try:
@@ -587,6 +592,24 @@ async def delete_job(
         except Exception:
             pass
     job_registry.delete_job(job_id)
+
+    # Also remove the Postgres document row (cascades to its jobs row,
+    # page_results, artifacts via FK ON DELETE CASCADE). Skip silently
+    # for legacy non-UUID users or if the document was never mirrored.
+    if _is_uuid(user_id):
+        try:
+            with db.pool().connection() as conn:
+                conn.execute(
+                    """
+                    delete from documents
+                    where user_id = %s
+                      and id in (select document_id from jobs where id = %s)
+                    """,
+                    (user_id, job_id),
+                )
+        except Exception:
+            log.exception("Postgres cleanup failed for delete_job %s", job_id)
+
     return {"status": "deleted"}
 
 

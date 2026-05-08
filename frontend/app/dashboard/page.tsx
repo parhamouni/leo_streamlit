@@ -6,6 +6,7 @@ import Link from "next/link";
 import { supabase } from "@/lib/supabase";
 import { apiJson, ApiError } from "@/lib/api";
 import { UploadButton } from "@/components/UploadButton";
+import { RowActions } from "@/components/RowActions";
 
 type Document = {
   id: string;
@@ -299,6 +300,7 @@ export default function DashboardPage() {
                   <th className="text-left px-4 py-2 font-medium">Pages</th>
                   <th className="text-left px-4 py-2 font-medium">Uploaded</th>
                   <th className="text-right px-4 py-2 font-medium">Progress</th>
+                  <th className="text-right px-4 py-2 font-medium w-24"></th>
                 </tr>
               </thead>
               <tbody className="divide-y">
@@ -344,6 +346,14 @@ export default function DashboardPage() {
                     </td>
                     <td className="px-4 py-3 text-right">
                       <ProgressCell doc={d} />
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <RowActions
+                        jobId={d.latest_job_id}
+                        jobStatus={d.job_status}
+                        filename={d.original_filename}
+                        onChanged={() => refresh(false)}
+                      />
                     </td>
                   </tr>
                 ))}
