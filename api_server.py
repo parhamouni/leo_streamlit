@@ -15,7 +15,6 @@ import os
 import shutil
 import threading
 import time
-import toml
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -27,46 +26,13 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 import job_registry
 from config import cfg
 from pipeline import PipelineConfig, PipelineResult, run_analysis
+from secrets_loader import load_api_keys as _load_api_keys
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 log = logging.getLogger("api_server")
-
-# ---------------------------------------------------------------------------
-# API key loading (same source as Streamlit: secrets.toml or env vars)
-# ---------------------------------------------------------------------------
-
-def _load_api_keys() -> dict:
-    secrets: dict = {}
-    secrets_path = Path(".streamlit/secrets.toml")
-    if secrets_path.exists():
-        try:
-            secrets = toml.load(str(secrets_path))
-        except Exception as e:
-            log.warning(f"Failed to load secrets.toml: {e}")
-
-    openai_key = secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-    ade_key = secrets.get("LANDINGAI_API_KEY", os.getenv("LANDINGAI_API_KEY", ""))
-
-    google_cloud_config = None
-    try:
-        if "google_cloud" in secrets and "gcp_service_account" in secrets:
-            google_cloud_config = {
-                "project_number": secrets["google_cloud"]["project_number"],
-                "location": secrets["google_cloud"]["location"],
-                "processor_id": secrets["google_cloud"]["processor_id"],
-                "service_account_info": dict(secrets["gcp_service_account"]),
-            }
-    except Exception:
-        pass
-
-    return {
-        "openai_key": openai_key,
-        "ade_key": ade_key,
-        "google_cloud_config": google_cloud_config,
-    }
 
 
 # ---------------------------------------------------------------------------

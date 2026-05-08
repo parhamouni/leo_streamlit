@@ -737,3 +737,119 @@ def _generate_highlighted_pdf(
     except Exception as e:
         log.warning(f"Highlighted PDF generation failed: {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point: `python -m pipeline <pdf> --out <dir>`
+# ---------------------------------------------------------------------------
+
+def _cli_main(argv: list[str] | None = None) -> int:
+    import argparse
+    from dataclasses import asdict
+
+    from secrets_loader import load_api_keys
+
+    parser = argparse.ArgumentParser(
+        prog="python -m pipeline",
+        description="Run the fence detection pipeline on a PDF without Streamlit.",
+    )
+    parser.add_argument("pdf", help="Path to input PDF")
+    parser.add_argument(
+        "--out",
+        required=True,
+        help="Output directory; results.json + highlighted.pdf written here",
+    )
+    parser.add_argument(
+        "--secrets",
+        default=".streamlit/secrets.toml",
+        help="Path to secrets.toml (default: .streamlit/secrets.toml)",
+    )
+    parser.add_argument(
+        "--no-ade",
+        action="store_true",
+        help="Skip LandingAI ADE parsing (faster, lower quality)",
+    )
+    parser.add_argument(
+        "--no-measurement",
+        action="store_true",
+        help="Skip Phase 3 measurement (faster, no fence lengths)",
+    )
+    parser.add_argument(
+        "--keywords",
+        help="Comma-separated fence keywords (overrides default)",
+    )
+    parser.add_argument(
+        "--analysis-model",
+        help="Override analysis model (e.g. gpt-5.1, gpt-5)",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress phase progress output",
+    )
+    args = parser.parse_args(argv)
+
+    pdf_path = Path(args.pdf)
+    if not pdf_path.exists():
+        print(f"error: PDF not found: {pdf_path}", file=sys.stderr)
+        return 2
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    keys = load_api_keys(args.secrets)
+    if not keys["openai_key"]:
+        print("error: no OpenAI key found (set OPENAI_API_KEY or .streamlit/secrets.toml)", file=sys.stderr)
+        return 2
+
+    cfg_kwargs: dict = {
+        "openai_api_key": keys["openai_key"],
+        "ade_api_key": keys["ade_key"] or "",
+        "google_cloud_config": keys["google_cloud_config"],
+        "use_ade": not args.no_ade,
+        "enable_unified_measurement": not args.no_measurement,
+    }
+    if args.keywords:
+        cfg_kwargs["fence_keywords"] = [k.strip() for k in args.keywords.split(",") if k.strip()]
+    if args.analysis_model:
+        cfg_kwargs["analysis_model"] = args.analysis_model
+
+    pipeline_cfg = PipelineConfig(**cfg_kwargs)
+
+    def _print_progress(phase: str, pct: int, msg: str) -> None:
+        if not args.quiet:
+            print(f"[{phase:<12}] {pct:3d}%  {msg}", flush=True)
+
+    print(f"Running pipeline on {pdf_path} → {out_dir}", flush=True)
+    t0 = time.time()
+    result = run_analysis(str(pdf_path), pipeline_cfg, progress_cb=_print_progress)
+    elapsed = time.time() - t0
+
+    if result.error:
+        print(f"\nERROR: {result.error}", file=sys.stderr)
+        return 1
+
+    # Serialize result (drop bytes; write PDF separately)
+    summary = asdict(result)
+    pdf_bytes = summary.pop("highlighted_pdf_bytes", None)
+
+    summary_path = out_dir / "results.json"
+    summary_path.write_text(json.dumps(summary, indent=2, default=str))
+
+    if pdf_bytes:
+        pdf_out = out_dir / "highlighted.pdf"
+        pdf_out.write_bytes(pdf_bytes)
+
+    print(
+        f"\nDone in {elapsed:.1f}s — "
+        f"{len(result.fence_pages)} fence pages / "
+        f"{len(result.non_fence_pages)} non-fence pages. "
+        f"Results: {summary_path}"
+        + (f" + {out_dir / 'highlighted.pdf'}" if pdf_bytes else ""),
+        flush=True,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_cli_main())
