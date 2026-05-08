@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import { apiJson, ApiError } from "@/lib/api";
@@ -21,6 +21,8 @@ type Document = {
 };
 
 type DocumentList = { documents: Document[] };
+
+const POLL_MS = 3000;
 
 const STATUS_CLASSES: Record<string, string> = {
   queued: "bg-gray-100 text-gray-800",
@@ -48,6 +50,51 @@ function formatDate(iso: string): string {
   }
 }
 
+function isActive(d: Document): boolean {
+  return d.job_status === "queued" || d.job_status === "running";
+}
+
+function ProgressCell({ doc }: { doc: Document }) {
+  if (doc.job_status === "running" || doc.job_status === "queued") {
+    const pct = doc.progress_percent ?? 0;
+    return (
+      <div className="flex items-center gap-2 justify-end">
+        <div className="w-24 h-1.5 bg-gray-200 rounded overflow-hidden">
+          <div
+            className="h-full bg-blue-500 transition-all duration-700 ease-out"
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+        <span className="text-xs text-gray-500 font-mono w-9 text-right">
+          {pct}%
+        </span>
+      </div>
+    );
+  }
+  if (doc.job_status === "completed") {
+    return <span className="text-xs text-green-700">done</span>;
+  }
+  if (doc.job_status === "failed") {
+    return <span className="text-xs text-red-600">failed</span>;
+  }
+  if (doc.job_status === "cancelled") {
+    return <span className="text-xs text-yellow-700">cancelled</span>;
+  }
+  return <span className="text-xs text-gray-400">—</span>;
+}
+
+function LiveIndicator() {
+  return (
+    <span className="flex items-center gap-1.5 text-xs text-gray-500">
+      <span className="relative flex h-2 w-2">
+        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+        <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500" />
+      </span>
+      Live
+    </span>
+  );
+}
+
 export default function DashboardPage() {
   const router = useRouter();
   const [email, setEmail] = useState<string | null>(null);
@@ -55,8 +102,9 @@ export default function DashboardPage() {
   const [authReady, setAuthReady] = useState(false);
 
   const [docs, setDocs] = useState<Document[] | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [initialLoading, setInitialLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [polling, setPolling] = useState(false);
 
   // Auth gate
   useEffect(() => {
@@ -73,9 +121,6 @@ export default function DashboardPage() {
         setUserId(data.session.user.id);
         setAuthReady(true);
 
-        // Strip the OAuth #access_token=... fragment from the URL so it
-        // doesn't linger in the address bar / browser history. Supabase
-        // has already consumed it via detectSessionInUrl by this point.
         if (window.location.hash.includes("access_token")) {
           window.history.replaceState(
             null,
@@ -89,28 +134,81 @@ export default function DashboardPage() {
     };
   }, [router]);
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    setError(null);
+  const refresh = useCallback(async (silent = false) => {
+    if (!silent) setInitialLoading(true);
     try {
       const data = await apiJson<DocumentList>("/api/documents");
       setDocs(data.documents);
+      setError(null);
     } catch (e) {
-      if (e instanceof ApiError) {
-        setError(`API ${e.status}: ${typeof e.body === "string" ? e.body : JSON.stringify(e.body)}`);
-      } else {
-        setError(e instanceof Error ? e.message : String(e));
-      }
+      const msg =
+        e instanceof ApiError
+          ? `API ${e.status}: ${typeof e.body === "string" ? e.body : JSON.stringify(e.body)}`
+          : e instanceof Error
+            ? e.message
+            : String(e);
+      setError(msg);
     } finally {
-      setLoading(false);
+      if (!silent) setInitialLoading(false);
     }
   }, []);
 
-  // Fetch documents once auth is ready
+  // Initial fetch
   useEffect(() => {
     if (!authReady) return;
-    refresh();
+    refresh(false);
   }, [authReady, refresh]);
+
+  // Live polling — runs while any job is queued or running. Pauses when
+  // the tab is hidden, resumes immediately when it becomes visible again.
+  const docsRef = useRef<Document[] | null>(null);
+  docsRef.current = docs;
+
+  useEffect(() => {
+    if (!authReady || !docs) return;
+    const anyActive = docs.some(isActive);
+    if (!anyActive) {
+      setPolling(false);
+      return;
+    }
+    setPolling(true);
+
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const tick = () => {
+      if (!alive) return;
+      if (typeof document !== "undefined" && document.hidden) {
+        // Don't poll while hidden; we'll resume on visibilitychange.
+        return;
+      }
+      refresh(true).finally(() => {
+        const stillActive =
+          docsRef.current?.some(isActive) ?? false;
+        if (alive && stillActive) {
+          timer = setTimeout(tick, POLL_MS);
+        }
+      });
+    };
+
+    timer = setTimeout(tick, POLL_MS);
+
+    const onVisibility = () => {
+      if (!alive) return;
+      if (!document.hidden) {
+        if (timer) clearTimeout(timer);
+        tick();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+
+    return () => {
+      alive = false;
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+      setPolling(false);
+    };
+  }, [authReady, docs, refresh]);
 
   async function onLogout() {
     await supabase().auth.signOut();
@@ -136,11 +234,11 @@ export default function DashboardPage() {
           </div>
           <div className="flex items-center gap-3">
             <button
-              onClick={refresh}
-              disabled={loading}
+              onClick={() => refresh(false)}
+              disabled={initialLoading}
               className="text-sm px-3 py-1.5 rounded border border-gray-300 bg-white hover:bg-gray-50 disabled:opacity-50"
             >
-              {loading ? "Refreshing…" : "Refresh"}
+              {initialLoading ? "Refreshing…" : "Refresh"}
             </button>
             <button
               onClick={onLogout}
@@ -153,13 +251,16 @@ export default function DashboardPage() {
 
         {/* Upload */}
         <section className="bg-white rounded-lg shadow p-4">
-          <UploadButton onUploaded={refresh} />
+          <UploadButton onUploaded={() => refresh(false)} />
         </section>
 
         {/* Documents card */}
         <section className="bg-white rounded-lg shadow">
           <div className="flex items-center justify-between p-4 border-b">
-            <h2 className="font-medium">Your documents</h2>
+            <div className="flex items-center gap-3">
+              <h2 className="font-medium">Your documents</h2>
+              {polling && <LiveIndicator />}
+            </div>
             <span className="text-xs text-gray-400 font-mono">{userId}</span>
           </div>
 
@@ -168,7 +269,7 @@ export default function DashboardPage() {
               <div className="font-medium">Failed to load documents</div>
               <div className="font-mono text-xs mt-1 break-all">{error}</div>
               <button
-                onClick={refresh}
+                onClick={() => refresh(false)}
                 className="mt-2 text-xs underline"
               >
                 Try again
@@ -176,17 +277,15 @@ export default function DashboardPage() {
             </div>
           )}
 
-          {loading && docs === null && (
+          {initialLoading && docs === null && (
             <div className="p-8 text-center text-sm text-gray-500">
               Loading documents…
             </div>
           )}
 
-          {!loading && docs !== null && docs.length === 0 && !error && (
+          {!initialLoading && docs !== null && docs.length === 0 && !error && (
             <div className="p-8 text-center text-sm text-gray-500">
               No documents yet. Upload a PDF to get started.
-              <br />
-              <span className="text-xs">(Upload UI coming in the next checkpoint.)</span>
             </div>
           )}
 
@@ -205,15 +304,28 @@ export default function DashboardPage() {
                 {docs.map((d) => (
                   <tr key={d.id} className="hover:bg-gray-50">
                     <td className="px-4 py-3">
-                      <div className="font-medium truncate max-w-md" title={d.original_filename}>
+                      <div
+                        className="font-medium truncate max-w-md"
+                        title={d.original_filename}
+                      >
                         {d.original_filename}
                       </div>
-                      <div className="text-xs text-gray-400 font-mono">{d.id.slice(0, 8)}</div>
+                      <div className="text-xs text-gray-400 font-mono">
+                        {d.id.slice(0, 8)}
+                      </div>
                     </td>
                     <td className="px-4 py-3">
                       <StatusBadge status={d.job_status} />
+                      {d.job_status === "running" && d.current_phase && (
+                        <div className="text-xs text-gray-500 mt-1">
+                          {d.current_phase}
+                        </div>
+                      )}
                       {d.error_message && (
-                        <div className="text-xs text-red-600 mt-1 truncate max-w-xs" title={d.error_message}>
+                        <div
+                          className="text-xs text-red-600 mt-1 truncate max-w-xs"
+                          title={d.error_message}
+                        >
                           {d.error_message}
                         </div>
                       )}
@@ -224,10 +336,8 @@ export default function DashboardPage() {
                     <td className="px-4 py-3 text-gray-500">
                       {formatDate(d.created_at)}
                     </td>
-                    <td className="px-4 py-3 text-right text-gray-500 font-mono text-xs">
-                      {d.job_status === "running" || d.job_status === "queued"
-                        ? `${d.progress_percent ?? 0}%`
-                        : d.current_phase ?? "—"}
+                    <td className="px-4 py-3 text-right">
+                      <ProgressCell doc={d} />
                     </td>
                   </tr>
                 ))}
