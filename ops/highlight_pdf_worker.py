@@ -36,7 +36,8 @@ Task schema
       { "page_index_in_original_doc": 0,
         "definitions": [{"x0":..., "y0":..., "x1":..., "y1":...}, ...],
         "instances":   [{"x0":..., "y0":..., "x1":..., "y1":...}, ...],
-        "keyword_matches": [{"x0":..., "y0":..., "x1":..., "y1":...}, ...]
+        "keyword_matches": [{"x0":..., "y0":..., "x1":..., "y1":...}, ...],
+        "fence_lines": [{"start":[x, y], "end":[x, y]}, ...]
       },
       ...
   ]
@@ -145,6 +146,32 @@ def main() -> int:
                     r.normalize()
                     if not r.is_empty and r.is_valid:
                         page_out.draw_rect(r, color=(1.0, 0.65, 0), width=2.0, overlay=True)
+
+                # Fence lines — cyan strokes (matches prod's measurement
+                # overlay: app_ade_prod.py:1789-1791 width=3.0 cyan). Each
+                # line is a dict with `start: [x, y]` / `end: [x, y]` after
+                # pipeline._normalize_measurements. Pre-Sprint-3-fix runs
+                # may have these as repr strings — those are skipped here.
+                for ln in res.get("fence_lines", []) or []:
+                    if not isinstance(ln, dict):
+                        continue
+                    start = ln.get("start")
+                    end = ln.get("end")
+                    if not (
+                        isinstance(start, (list, tuple)) and len(start) == 2 and
+                        isinstance(end, (list, tuple)) and len(end) == 2
+                    ):
+                        continue
+                    try:
+                        sx, sy = float(start[0]), float(start[1])
+                        ex, ey = float(end[0]), float(end[1])
+                    except Exception:
+                        continue
+                    rx0, ry0, rx1, ry1 = reverse_rotation(sx, sy, ex, ey)
+                    page_out.draw_line(
+                        (rx0, ry0), (rx1, ry1),
+                        color=(0, 1, 1), width=3.0, overlay=True,
+                    )
             except Exception as pg_e:
                 print(f"[highlight_pdf_worker] page {page_idx + 1} draw error: {pg_e}",
                       file=sys.stderr)

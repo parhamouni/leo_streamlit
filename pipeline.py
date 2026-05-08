@@ -771,10 +771,37 @@ def _generate_highlighted_pdf(
             "ops", "highlight_pdf_worker.py",
         )
 
+        import tempfile, uuid
+        out_path = os.path.join(
+            tempfile.gettempdir(),
+            f"highlight_{uuid.uuid4().hex}.pdf",
+        )
+
         if os.path.exists(worker_script):
+            # Reshape fence_results for the worker: it expects rectangles
+            # under definitions/instances/keyword_matches and fence-line
+            # geometry on a new `fence_lines` field. The worker's task
+            # schema uses `page_index_in_original_doc` (legacy name).
+            worker_pages = []
+            for r in fence_results:
+                pi = r.get("page_idx")
+                if pi is None:
+                    continue
+                meas = r.get("measurements") or {}
+                worker_pages.append({
+                    "page_index_in_original_doc": pi,
+                    "definitions": r.get("definitions") or [],
+                    "instances": r.get("instances") or [],
+                    "keyword_matches": r.get("keyword_matches") or [],
+                    # Fence-line geometry from Phase 3. _normalize_measurements
+                    # converted VectorLine dataclasses to plain dicts so this
+                    # round-trips through JSON cleanly.
+                    "fence_lines": meas.get("all_fence_lines") or [],
+                })
             task = {
                 "pdf_path": pdf_path,
-                "fence_pages": fence_results,
+                "out_path": out_path,
+                "fence_pages": worker_pages,
                 "highlight_fence_text": config.highlight_fence_text,
             }
             proc = subprocess.run(
@@ -783,10 +810,24 @@ def _generate_highlighted_pdf(
                 capture_output=True,
                 timeout=cfg.HIGHLIGHT_PDF_TIMEOUT,
             )
-            if proc.returncode == 0 and proc.stdout:
-                return proc.stdout
-            log.warning(f"Highlight worker failed (rc={proc.returncode}): "
-                       f"{proc.stderr[:500] if proc.stderr else 'no stderr'}")
+            if proc.returncode == 0 and os.path.exists(out_path):
+                try:
+                    with open(out_path, "rb") as f:
+                        return f.read()
+                finally:
+                    try:
+                        os.unlink(out_path)
+                    except Exception:
+                        pass
+            log.warning(
+                "Highlight worker failed (rc=%s): %s",
+                proc.returncode,
+                proc.stderr[:500] if proc.stderr else "no stderr",
+            )
+            try:
+                os.unlink(out_path)
+            except Exception:
+                pass
 
         doc = fitz.open(pdf_path)
         fence_page_set = {r["page_idx"] for r in fence_results if "page_idx" in r}
@@ -805,6 +846,34 @@ def _generate_highlighted_pdf(
                     annot.set_colors(stroke=cfg.HIGHLIGHT_COLOR_UI)
                     annot.set_border(width=cfg.HIGHLIGHT_WIDTH_UI)
                     annot.update()
+
+            # Cyan fence-line strokes — draws the actual measured fence
+            # segments. Without these the highlighted PDF only shows
+            # bounding boxes around legend rows / figures, which is what
+            # the user reported as "messed up" vs prod.
+            meas = page_result.get("measurements") or {}
+            for ln in meas.get("all_fence_lines") or []:
+                if not isinstance(ln, dict):
+                    continue
+                start = ln.get("start")
+                end = ln.get("end")
+                if not (
+                    isinstance(start, (list, tuple)) and len(start) == 2 and
+                    isinstance(end, (list, tuple)) and len(end) == 2
+                ):
+                    continue
+                try:
+                    sx, sy = float(start[0]), float(start[1])
+                    ex, ey = float(end[0]), float(end[1])
+                except Exception:
+                    continue
+                try:
+                    page.draw_line(
+                        (sx, sy), (ex, ey),
+                        color=(0, 1, 1), width=3.0, overlay=True,
+                    )
+                except Exception:
+                    pass
 
             for inst in page_result.get("instances", []):
                 bbox = inst.get("bbox")
