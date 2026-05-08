@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -570,6 +571,31 @@ async def get_results(
     return results if full else _slim_results(results)
 
 
+# Subprocess worker for safe PDF page rasterization. Some PDFs (especially
+# those with very dense vector content) can crash MuPDF at the C level,
+# which would take down the entire API server if rendered in-process.
+# Running the render in a short-lived child means the worst case is a
+# failed image, not a dead backend.
+_PAGE_RENDER_SCRIPT = r"""
+import sys, fitz
+try:
+    fitz.TOOLS.mupdf_display_errors(False)
+except Exception:
+    pass
+pdf_path, page_num_str, dpi_str = sys.argv[1], sys.argv[2], sys.argv[3]
+page_num = int(page_num_str)
+dpi = int(dpi_str)
+with fitz.open(pdf_path) as doc:
+    if page_num < 1 or page_num > doc.page_count:
+        sys.stderr.write(f'PAGE_OUT_OF_RANGE 1..{doc.page_count}')
+        sys.exit(2)
+    page = doc.load_page(page_num - 1)
+    zoom = dpi / 72.0
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    sys.stdout.buffer.write(pix.tobytes('png'))
+"""
+
+
 @app.get("/api/jobs/{job_id}/page-image/{page_num}")
 async def get_page_image(
     job_id: str,
@@ -582,8 +608,9 @@ async def get_page_image(
     user can see the colored fence overlays inline without scrolling the
     whole embedded PDF.
 
-    DPI defaults to 110 (fast) — matches the "Low-DPI preview" toggle in
-    app_ade_prod.py:2077-2081. Cap at 200 to avoid render-bombs.
+    Renders in a subprocess (with timeout) so a MuPDF crash on a dense
+    vector page doesn't kill the API. DPI defaults to 110 (fast) — matches
+    the "Low-DPI preview" toggle in app_ade_prod.py:2077-2081.
     """
     if dpi < 50 or dpi > 200:
         raise HTTPException(400, "dpi must be between 50 and 200")
@@ -597,27 +624,39 @@ async def get_page_image(
     if hl_path is None:
         raise HTTPException(404, "Highlighted PDF not available")
 
+    import subprocess
     try:
-        import fitz as _fitz
-        with _fitz.open(str(hl_path)) as doc:
-            if page_num < 1 or page_num > doc.page_count:
-                raise HTTPException(
-                    404,
-                    f"Page {page_num} out of range (1..{doc.page_count})",
-                )
-            page = doc.load_page(page_num - 1)
-            zoom = dpi / 72.0
-            mat = _fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            png_bytes = pix.tobytes("png")
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.exception("page-image render failed")
-        raise HTTPException(500, f"Page rasterization failed: {e}")
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _PAGE_RENDER_SCRIPT,
+                str(hl_path),
+                str(page_num),
+                str(dpi),
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            504,
+            f"Page {page_num} took longer than 30s to render — likely a "
+            "dense / damaged page. Try a lower DPI or skip this page.",
+        )
+
+    if proc.returncode == 2:
+        raise HTTPException(404, proc.stderr.decode("utf-8", "ignore"))
+    if proc.returncode != 0 or not proc.stdout:
+        err = proc.stderr.decode("utf-8", "ignore")[:200] or "unknown error"
+        log.warning(
+            "page-image render failed for job=%s page=%s rc=%s err=%s",
+            job_id[:8], page_num, proc.returncode, err,
+        )
+        raise HTTPException(500, f"Page render failed: {err}")
 
     return Response(
-        content=png_bytes,
+        content=proc.stdout,
         media_type="image/png",
         headers={
             "Cache-Control": "private, max-age=3600",
