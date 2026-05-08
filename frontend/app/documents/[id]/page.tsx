@@ -597,11 +597,12 @@ export default function DocumentDetailPage() {
             ) : (
               <div className="divide-y">
                 {pagesSoFar.map((row) => (
-                  <LivePageRow
-                    key={row.page_number}
-                    row={row}
-                    jobId={doc.latest_job_id}
-                  />
+                  // jobId intentionally omitted while running — the
+                  // highlighted PDF doesn't exist yet, so the "Load page
+                  // image" button would be misleading. It comes back as
+                  // soon as the job completes and the regular render
+                  // path takes over below.
+                  <LivePageRow key={row.page_number} row={row} />
                 ))}
               </div>
             )}
