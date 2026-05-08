@@ -340,6 +340,37 @@ def get_document_id_by_job(job_id: str) -> str | None:
 # page_results — live per-page rows the worker upserts as the pipeline runs
 # ---------------------------------------------------------------------------
 
+def _json_safe(obj: Any) -> Any:
+    """Make a pipeline result_json acceptable to Postgres JSONB.
+
+    Two fixes:
+      * Strip NUL (\\u0000) from any text — Postgres TEXT/JSONB rejects it
+        outright (errors as 'unsupported Unicode escape sequence'). Some
+        PDFs have null bytes embedded in their extracted page text.
+      * Coerce non-JSON-serializable types (e.g. pipeline's VectorLine
+        dataclass) by falling back to vars() / str() recursively.
+    """
+    if obj is None or isinstance(obj, (bool, int, float)):
+        return obj
+    if isinstance(obj, str):
+        # Strip NUL — Postgres TEXT/JSONB cannot store \x00.
+        return obj.replace("\x00", "") if "\x00" in obj else obj
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    # Custom dataclass / object: prefer __dict__ if available, else stringify.
+    if hasattr(obj, "__dict__"):
+        try:
+            return _json_safe(vars(obj))
+        except Exception:
+            pass
+    try:
+        return str(obj)
+    except Exception:
+        return None
+
+
 def upsert_page_result(
     document_id: str,
     page_number: int,
@@ -352,7 +383,8 @@ def upsert_page_result(
     Phase 1c emits a stub; Phase 3 overwrites it with the enriched payload
     via ON CONFLICT — only fence pages get a second emission."""
     from psycopg.types.json import Json
-    payload = Json(result_json) if result_json is not None else None
+    cleaned = _json_safe(result_json) if result_json is not None else None
+    payload = Json(cleaned) if cleaned is not None else None
     with pool().connection() as conn:
         conn.execute(
             """
