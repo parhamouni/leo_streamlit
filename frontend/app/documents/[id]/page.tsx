@@ -6,8 +6,23 @@ import Link from "next/link";
 import { supabase } from "@/lib/supabase";
 import { apiFetch, apiJson, ApiError } from "@/lib/api";
 import { RowActions } from "@/components/RowActions";
+import {
+  cleanElementKey,
+  detectionLabel,
+  detectionMethod,
+  specHasContent,
+  type DimensionMeasurement,
+  type ElementSpec,
+  type FencePage,
+  type LayerMeasurement,
+  type LegendEntry,
+  type NonFencePage,
+  type PipelineResults,
+} from "@/lib/results";
 
-// --- Types ---------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Types specific to this page
+// ---------------------------------------------------------------------------
 
 type DashboardDoc = {
   id: string;
@@ -24,78 +39,11 @@ type DashboardDoc = {
   error_message: string | null;
 };
 
-type ScaleInfo = {
-  success?: boolean;
-  verified_scale?: number;
-  scale_text?: string;
-  confidence?: "low" | "medium" | "high";
-  message?: string;
-  method?: string;
-};
-
-type Measurements = {
-  proximity_totals?: {
-    total_segments?: number;
-    total_length_feet?: number;
-    total_length_pts?: number;
-  };
-  totals?: {
-    total_layers?: number;
-    total_segments?: number;
-    total_length_feet?: number;
-  };
-  measurement_method?: string;
-  fence_layers?: unknown[];
-  layer_measurements?: Record<string, unknown>;
-};
-
-type LegendEntry = {
-  indicator?: string;
-  description?: string;
-  bbox?: number[];
-  [k: string]: unknown;
-};
-
-type Instance = {
-  indicator?: string;
-  bbox?: number[];
-  page_num?: number;
-  [k: string]: unknown;
-};
-
-type FencePage = {
-  page_idx: number;
-  page_num: number;
-  width?: number;
-  height?: number;
-  rotation?: number;
-  fence_text?: string;
-  ade_chunks?: unknown[];
-  definitions?: LegendEntry[];
-  instances?: Instance[];
-  keyword_matches?: unknown[];
-  legend_entries?: LegendEntry[];
-  scale_info?: ScaleInfo;
-  measurements?: Measurements;
-};
-
-type NonFencePage = {
-  page_idx: number;
-  page_num: number;
-  fence_text?: string;
-};
-
-type PipelineResults = {
-  fence_pages?: FencePage[];
-  non_fence_pages?: NonFencePage[];
-  total_pages?: number;
-  timings?: Record<string, number>;
-  error?: string | null;
-};
-
 const POLL_MS = 3000;
 
-// --- Helpers -------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function formatDate(iso: string): string {
   try {
@@ -107,7 +55,7 @@ function formatDate(iso: string): string {
 
 function formatDuration(timings?: Record<string, number>): string | null {
   if (!timings) return null;
-  const total = Object.values(timings).reduce((a, b) => a + b, 0);
+  const total = timings.total ?? Object.values(timings).reduce((a, b) => a + b, 0);
   if (!total) return null;
   if (total < 60) return `${total.toFixed(1)}s`;
   const m = Math.floor(total / 60);
@@ -127,15 +75,15 @@ function StatusBadge({ status }: { status: string | null }) {
   const label = status ?? "—";
   const cls = STATUS_CLASSES[label] ?? "bg-gray-100 text-gray-800";
   return (
-    <span
-      className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${cls}`}
-    >
+    <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${cls}`}>
       {label}
     </span>
   );
 }
 
-// --- Page ----------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Page component
+// ---------------------------------------------------------------------------
 
 export default function DocumentDetailPage() {
   const router = useRouter();
@@ -148,10 +96,10 @@ export default function DocumentDetailPage() {
   const [pdfBlobUrl, setPdfBlobUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<"fence" | "all">("fence");
+  const [filter, setFilter] = useState<"fence" | "all" | "nonfence">("fence");
   const [downloading, setDownloading] = useState(false);
 
-  // Auth gate
+  // Auth
   useEffect(() => {
     let active = true;
     supabase()
@@ -169,14 +117,12 @@ export default function DocumentDetailPage() {
     };
   }, [router]);
 
-  // Fetch document + (if completed) results
+  // Fetch document + (when completed) results
   const refresh = useCallback(
     async (silent = false) => {
       if (!silent) setLoading(true);
       try {
-        const found = await apiJson<DashboardDoc>(
-          `/api/documents/${docId}`,
-        );
+        const found = await apiJson<DashboardDoc>(`/api/documents/${docId}`);
         setDoc(found);
         setError(null);
 
@@ -249,13 +195,10 @@ export default function DocumentDetailPage() {
     };
   }, [authReady, doc, refresh]);
 
-  // Fetch the highlighted PDF blob once, when job completes
+  // Highlighted PDF blob for the embedded viewer
   useEffect(() => {
-    if (!doc || doc.job_status !== "completed" || !doc.latest_job_id) {
-      return;
-    }
-    if (pdfBlobUrl) return; // already loaded
-
+    if (!doc || doc.job_status !== "completed" || !doc.latest_job_id) return;
+    if (pdfBlobUrl) return;
     let active = true;
     let url: string | null = null;
     apiFetch(`/api/jobs/${doc.latest_job_id}/highlighted-pdf`)
@@ -265,15 +208,12 @@ export default function DocumentDetailPage() {
         url = URL.createObjectURL(blob);
         setPdfBlobUrl(url);
       })
-      .catch(() => {
-        // Highlighted PDF may not exist if pipeline didn't generate one
-      });
-
+      .catch(() => {});
     return () => {
       active = false;
       if (url) URL.revokeObjectURL(url);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [doc?.job_status, doc?.latest_job_id]);
 
   async function onDownload() {
@@ -298,8 +238,6 @@ export default function DocumentDetailPage() {
     }
   }
 
-  // --- Render ---
-
   if (!authReady || (loading && !doc)) {
     return (
       <main className="min-h-screen flex items-center justify-center text-gray-500">
@@ -312,10 +250,7 @@ export default function DocumentDetailPage() {
     return (
       <main className="min-h-screen bg-gray-50 p-8">
         <div className="max-w-3xl mx-auto bg-white rounded-lg shadow p-8 space-y-3">
-          <Link
-            href="/dashboard"
-            className="text-sm text-blue-600 hover:underline"
-          >
+          <Link href="/dashboard" className="text-sm text-blue-600 hover:underline">
             ← Back to dashboard
           </Link>
           <div className="text-red-700">{error}</div>
@@ -323,16 +258,16 @@ export default function DocumentDetailPage() {
       </main>
     );
   }
-
   if (!doc) return null;
 
+  // ---- derived ----
   const fencePages = (results?.fence_pages ?? []).filter(
     (p): p is FencePage => p && typeof p === "object",
   );
-  const nonFencePages = results?.non_fence_pages ?? [];
+  const nonFencePages = (results?.non_fence_pages ?? []).filter(
+    (p): p is NonFencePage => p && typeof p === "object",
+  );
   const totalCount = fencePages.length + nonFencePages.length;
-
-  // Sum total fence length across all fence pages
   const totalLengthFt = fencePages.reduce((acc, p) => {
     const ft =
       p.measurements?.proximity_totals?.total_length_feet ??
@@ -340,30 +275,26 @@ export default function DocumentDetailPage() {
       0;
     return acc + (ft || 0);
   }, 0);
+  const elementDetails = results?.element_details ?? {};
+  const populatedSpecs = Object.entries(elementDetails).filter(([, spec]) =>
+    specHasContent(spec),
+  );
 
-  const isActive =
-    doc.job_status === "queued" || doc.job_status === "running";
+  const isActive = doc.job_status === "queued" || doc.job_status === "running";
   const isComplete = doc.job_status === "completed";
 
   return (
     <main className="min-h-screen bg-gray-50 p-6 sm:p-8">
       <div className="max-w-6xl mx-auto space-y-6">
-        {/* Back link */}
-        <Link
-          href="/dashboard"
-          className="inline-block text-sm text-blue-600 hover:underline"
-        >
+        <Link href="/dashboard" className="inline-block text-sm text-blue-600 hover:underline">
           ← Back to dashboard
         </Link>
 
-        {/* Header card */}
+        {/* ---------- Header ---------- */}
         <section className="bg-white rounded-lg shadow p-6">
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0 flex-1">
-              <h1
-                className="text-xl font-semibold truncate"
-                title={doc.original_filename}
-              >
+              <h1 className="text-xl font-semibold truncate" title={doc.original_filename}>
                 {doc.original_filename}
               </h1>
               <div className="mt-2 flex flex-wrap items-center gap-3 text-sm text-gray-600">
@@ -406,12 +337,7 @@ export default function DocumentDetailPage() {
                 jobStatus={doc.job_status}
                 filename={doc.original_filename}
                 onChanged={() => {
-                  // For delete, the document is gone — bounce to dashboard.
-                  // For cancel, just refresh.
-                  if (
-                    doc.job_status !== "queued" &&
-                    doc.job_status !== "running"
-                  ) {
+                  if (doc.job_status !== "queued" && doc.job_status !== "running") {
                     router.replace("/dashboard");
                   } else {
                     refresh(false);
@@ -431,23 +357,46 @@ export default function DocumentDetailPage() {
           </div>
         </section>
 
-        {/* Summary stats */}
+        {/* ---------- Summary stats ---------- */}
         {isComplete && results && (
           <section className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-            <StatCard label="Total pages" value={String(totalCount || results.total_pages || doc.total_pages || "—")} />
+            <StatCard
+              label="Total pages"
+              value={String(totalCount || results.total_pages || doc.total_pages || "—")}
+            />
             <StatCard label="Fence pages" value={String(fencePages.length)} accent="green" />
             <StatCard label="Non-fence pages" value={String(nonFencePages.length)} accent="gray" />
-            <StatCard label="Total fence length" value={totalLengthFt > 0 ? `${totalLengthFt.toFixed(1)} ft` : "—"} accent={totalLengthFt > 0 ? "green" : "gray"} />
+            <StatCard
+              label="Total fence length"
+              value={totalLengthFt > 0 ? `${totalLengthFt.toFixed(1)} ft` : "—"}
+              accent={totalLengthFt > 0 ? "green" : "gray"}
+            />
           </section>
         )}
 
-        {/* Embedded highlighted PDF viewer */}
+        {/* ---------- Phase timings ---------- */}
+        {isComplete && results?.timings && (
+          <section className="bg-white rounded-lg shadow p-4">
+            <h2 className="font-medium mb-2 text-sm">Phase timings</h2>
+            <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 text-xs">
+              {Object.entries(results.timings).map(([phase, secs]) => (
+                <div key={phase} className="bg-gray-50 rounded p-2">
+                  <div className="text-[10px] uppercase text-gray-500">{phase}</div>
+                  <div className="font-mono font-medium">{secs.toFixed(1)}s</div>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* ---------- Embedded PDF viewer ---------- */}
         {isComplete && pdfBlobUrl && (
           <section className="bg-white rounded-lg shadow overflow-hidden">
             <div className="flex items-center justify-between p-4 border-b">
               <h2 className="font-medium">Highlighted PDF</h2>
               <span className="text-xs text-gray-500">
-                green = legend definitions • purple = fence indicators • orange = keyword matches • cyan = measured fence lines
+                green = legend defs · purple = indicators · orange = keyword matches · cyan =
+                measured fence lines
               </span>
             </div>
             <iframe
@@ -458,44 +407,72 @@ export default function DocumentDetailPage() {
           </section>
         )}
 
-        {/* Per-page details */}
+        {/* ---------- Element specifications (Sprint 1: A1, A2) ---------- */}
+        {isComplete && populatedSpecs.length > 0 && (
+          <section className="bg-white rounded-lg shadow">
+            <div className="flex items-center justify-between p-4 border-b">
+              <h2 className="font-medium">
+                Element specifications ({populatedSpecs.length})
+              </h2>
+              <span className="text-xs text-gray-500">
+                LLM-extracted material / construction details per legend entry
+              </span>
+            </div>
+            <ElementSpecsTable specs={populatedSpecs} />
+          </section>
+        )}
+        {isComplete && populatedSpecs.length === 0 && Object.keys(elementDetails).length > 0 && (
+          <section className="bg-white rounded-lg shadow p-4 text-sm text-gray-500">
+            No populated element specifications were extracted. ({Object.keys(elementDetails).length}{" "}
+            chunks examined; all fields empty.)
+          </section>
+        )}
+
+        {/* ---------- Pages list ---------- */}
         {isComplete && results && (
           <section className="bg-white rounded-lg shadow">
             <div className="flex items-center justify-between p-4 border-b">
               <h2 className="font-medium">Pages</h2>
               <div className="flex gap-1 text-xs">
-                <FilterChip
-                  active={filter === "fence"}
-                  onClick={() => setFilter("fence")}
-                >
+                <FilterChip active={filter === "fence"} onClick={() => setFilter("fence")}>
                   Fence ({fencePages.length})
                 </FilterChip>
-                <FilterChip
-                  active={filter === "all"}
-                  onClick={() => setFilter("all")}
-                >
+                <FilterChip active={filter === "nonfence"} onClick={() => setFilter("nonfence")}>
+                  Non-fence ({nonFencePages.length})
+                </FilterChip>
+                <FilterChip active={filter === "all"} onClick={() => setFilter("all")}>
                   All ({totalCount})
                 </FilterChip>
               </div>
             </div>
 
             <div className="divide-y">
-              {filter === "fence" ? (
-                fencePages.length === 0 ? (
-                  <div className="p-6 text-sm text-gray-500 text-center">
-                    No fence pages detected.
-                  </div>
+              {filter === "fence" &&
+                (fencePages.length === 0 ? (
+                  <Empty msg="No fence pages detected." />
                 ) : (
                   fencePages.map((p) => <FencePageCard key={p.page_num} page={p} />)
-                )
-              ) : (
-                <NonFenceList nonFence={nonFencePages} fence={fencePages} />
+                ))}
+              {filter === "nonfence" &&
+                (nonFencePages.length === 0 ? (
+                  <Empty msg="No non-fence pages." />
+                ) : (
+                  nonFencePages.map((p) => <NonFencePageCard key={p.page_num} page={p} />)
+                ))}
+              {filter === "all" && (
+                <>
+                  {fencePages.map((p) => (
+                    <FencePageCard key={`f-${p.page_num}`} page={p} />
+                  ))}
+                  {nonFencePages.map((p) => (
+                    <NonFencePageCard key={`n-${p.page_num}`} page={p} />
+                  ))}
+                </>
               )}
             </div>
           </section>
         )}
 
-        {/* Status messages while incomplete */}
         {!isComplete && !doc.error_message && (
           <section className="bg-white rounded-lg shadow p-6 text-sm text-gray-600">
             {isActive
@@ -508,7 +485,13 @@ export default function DocumentDetailPage() {
   );
 }
 
-// --- Sub-components ------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Sub-components
+// ---------------------------------------------------------------------------
+
+function Empty({ msg }: { msg: string }) {
+  return <div className="p-6 text-sm text-gray-500 text-center">{msg}</div>;
+}
 
 function StatCard({
   label,
@@ -546,9 +529,7 @@ function FilterChip({
     <button
       onClick={onClick}
       className={`px-2.5 py-1 rounded ${
-        active
-          ? "bg-blue-100 text-blue-700"
-          : "text-gray-600 hover:bg-gray-100"
+        active ? "bg-blue-100 text-blue-700" : "text-gray-600 hover:bg-gray-100"
       }`}
     >
       {children}
@@ -567,16 +548,26 @@ function FencePageCard({ page }: { page: FencePage }) {
     null;
   const totalPts = page.measurements?.proximity_totals?.total_length_pts;
   const scale = page.scale_info;
-  const definitions = page.definitions ?? page.legend_entries ?? [];
+  const definitions = page.definitions ?? [];
   const instances = page.instances ?? [];
+  const legend = page.legend_entries ?? [];
+  const adeChunkCount = (definitions.length ?? 0) + (instances.length ?? 0);
+  const skipReason = page.measurements?.skip_reason;
+
+  const method = detectionMethod(page);
+  const m = detectionLabel(method);
 
   return (
     <details className="group" open>
       <summary className="flex items-center justify-between gap-3 px-4 py-3 cursor-pointer hover:bg-gray-50">
         <div className="flex items-center gap-3 min-w-0">
           <span className="font-mono text-gray-700">Page {page.page_num}</span>
-          <span className="inline-flex items-center gap-1 text-xs text-green-700">
-            ✓ fence
+          <span
+            className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded ${m.className}`}
+            title={m.label}
+          >
+            <span>{m.icon}</span>
+            <span>{m.label}</span>
           </span>
           {scale?.verified_scale && (
             <span className="text-xs text-gray-500">
@@ -589,25 +580,34 @@ function FencePageCard({ page }: { page: FencePage }) {
           {totalFt != null && totalFt > 0 && (
             <span className="font-mono">{totalFt.toFixed(1)} ft</span>
           )}
-          {definitions.length > 0 && (
-            <span>{definitions.length} legend</span>
-          )}
-          {instances.length > 0 && (
-            <span>{instances.length} instances</span>
-          )}
+          {legend.length > 0 && <span>{legend.length} legend</span>}
+          {instances.length > 0 && <span>{instances.length} instances</span>}
         </div>
       </summary>
 
       <div className="px-4 pb-4 space-y-4">
-        {/* Fence text */}
+        {/* ADE chunks metrics (Sprint 1: A6) */}
+        {adeChunkCount > 0 && (
+          <div className="grid grid-cols-3 gap-3">
+            <Metric label="ADE chunks" value={String(adeChunkCount)} />
+            <Metric label="Legend" value={String(definitions.length)} />
+            <Metric label="Figures" value={String(instances.length)} />
+          </div>
+        )}
+
+        {/* Skip-reason warning */}
+        {skipReason && (
+          <div className="text-xs bg-yellow-50 border border-yellow-200 rounded p-2 text-yellow-800">
+            <span className="font-medium">Measurement skipped:</span> {skipReason}
+          </div>
+        )}
+
+        {/* Detected text */}
         {page.fence_text && (
           <div>
-            <div className="text-xs uppercase text-gray-500 mb-1">
-              Detected text
-            </div>
-            <div className="text-sm bg-gray-50 border rounded p-3 whitespace-pre-wrap font-mono text-xs">
-              {page.fence_text.slice(0, 800)}
-              {page.fence_text.length > 800 ? "…" : ""}
+            <div className="text-xs uppercase text-gray-500 mb-1">Detected text</div>
+            <div className="text-sm bg-gray-50 border rounded p-3 whitespace-pre-wrap font-mono text-xs max-h-48 overflow-y-auto">
+              {page.fence_text}
             </div>
           </div>
         )}
@@ -621,93 +621,175 @@ function FencePageCard({ page }: { page: FencePage }) {
             {totalPts != null && (
               <Metric label="Length (points)" value={totalPts.toLocaleString()} />
             )}
-            {totalSeg != null && (
-              <Metric label="Segments" value={String(totalSeg)} />
-            )}
+            {totalSeg != null && <Metric label="Segments" value={String(totalSeg)} />}
           </div>
         )}
 
-        {/* Scale details */}
-        {scale && (scale.scale_text || scale.message) && (
-          <div className="text-xs text-gray-600 bg-gray-50 border rounded p-2">
-            <div className="font-medium text-gray-700">Scale: {scale.scale_text ?? "—"}</div>
-            {scale.method && <div>method: {scale.method}</div>}
-            {scale.message && (
-              <div className="mt-1 italic">{scale.message}</div>
-            )}
-          </div>
+        {/* Scale details with debug expander (Sprint 1: B3) */}
+        {scale && (scale.scale_text || scale.message || scale.method) && (
+          <details className="text-xs bg-gray-50 border rounded">
+            <summary className="cursor-pointer px-3 py-2 font-medium text-gray-700 hover:bg-gray-100">
+              Scale: {scale.scale_text ?? "—"}
+              {scale.method && (
+                <span className="text-gray-500"> · method: {scale.method}</span>
+              )}
+              {scale.confidence && (
+                <span className="text-gray-500"> · {scale.confidence} confidence</span>
+              )}
+            </summary>
+            <div className="px-3 pb-3 pt-1 space-y-1 text-gray-600">
+              {scale.message && <div className="italic">{scale.message}</div>}
+              {scale.page_size && (
+                <div>
+                  Page size:{" "}
+                  {scale.page_size.detected_size ??
+                    `${scale.page_size.width_pts}×${scale.page_size.height_pts} pts`}
+                </div>
+              )}
+              {scale.raw_response && (
+                <details>
+                  <summary className="cursor-pointer hover:underline">
+                    Raw LLM response
+                  </summary>
+                  <pre className="mt-1 whitespace-pre-wrap font-mono text-[10px] max-h-32 overflow-y-auto">
+                    {scale.raw_response}
+                  </pre>
+                </details>
+              )}
+            </div>
+          </details>
         )}
 
-        {/* Legend definitions */}
-        {definitions.length > 0 && (
-          <DataTable
-            title="Legend definitions"
-            rows={definitions.map((d) => ({
-              indicator: String(d.indicator ?? ""),
-              description: String(d.description ?? ""),
-            }))}
-            columns={["indicator", "description"]}
-          />
-        )}
+        {/* Layer-Based Breakdown (Sprint 1: B1) */}
+        <LayerBreakdown layerMeasurements={page.measurements?.layer_measurements} />
 
-        {/* Instances */}
+        {/* Dimension Line Measurements (Sprint 1: B2) */}
+        <DimensionLines dims={page.measurements?.dimension_measurements} />
+
+        {/* Legend definitions (rich, with descriptions) */}
+        {legend.length > 0 && <LegendTable rows={legend} />}
+
+        {/* Detected instances */}
         {instances.length > 0 && (
-          <DataTable
-            title="Detected instances"
-            rows={instances.map((i) => ({
-              indicator: String(i.indicator ?? ""),
-              location: i.bbox
-                ? `[${i.bbox.map((n) => Math.round(n)).join(", ")}]`
-                : "—",
-            }))}
-            columns={["indicator", "location"]}
-          />
+          <div>
+            <div className="text-xs uppercase text-gray-500 mb-1">
+              Detected instances ({instances.length})
+            </div>
+            <div className="overflow-x-auto border rounded">
+              <table className="w-full text-sm">
+                <thead className="bg-gray-50 text-gray-500 text-xs uppercase">
+                  <tr>
+                    <th className="text-left px-3 py-1.5 font-medium">Indicator</th>
+                    <th className="text-left px-3 py-1.5 font-medium">Location (bbox)</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y">
+                  {instances.slice(0, 50).map((i, idx) => (
+                    <tr key={idx} className="hover:bg-gray-50">
+                      <td className="px-3 py-1.5 align-top">
+                        {i.indicator || (i.text ? i.text.slice(0, 60) + "…" : "—")}
+                      </td>
+                      <td className="px-3 py-1.5 text-gray-500 font-mono text-xs">
+                        {i.bbox ? `[${i.bbox.map((n) => Math.round(n)).join(", ")}]` : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                  {instances.length > 50 && (
+                    <tr>
+                      <td colSpan={2} className="px-3 py-2 text-xs text-gray-500 italic">
+                        … {instances.length - 50} more
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* Classification reasoning (when keyword fallback) */}
+        {page.classification?.reasoning && (
+          <div className="text-xs bg-blue-50 border border-blue-200 rounded p-2">
+            <div className="font-medium text-blue-900">
+              Classification ({page.classification.confidence != null
+                ? `${Math.round((page.classification.confidence ?? 0) * 100)}%`
+                : "—"}{" "}
+              confidence)
+            </div>
+            <div className="italic text-blue-800 mt-1">{page.classification.reasoning}</div>
+          </div>
         )}
       </div>
     </details>
   );
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
+function NonFencePageCard({ page }: { page: NonFencePage }) {
+  const reasoning = page.classification?.reasoning ?? page.reason;
+  const method = page.classification?.method ?? page.method;
+  const conf = page.classification?.confidence;
   return (
-    <div className="bg-gray-50 border rounded p-2">
-      <div className="text-[10px] uppercase text-gray-500">{label}</div>
-      <div className="font-mono font-medium text-gray-900">{value}</div>
-    </div>
+    <details className="group">
+      <summary className="flex items-center justify-between gap-3 px-4 py-3 cursor-pointer hover:bg-gray-50">
+        <div className="flex items-center gap-3">
+          <span className="font-mono text-gray-700">Page {page.page_num}</span>
+          <span className="text-gray-500 text-xs">non-fence</span>
+          {method && <span className="text-xs text-gray-400">via {method}</span>}
+          {conf != null && (
+            <span className="text-xs text-gray-400">
+              {Math.round(conf * 100)}% confidence
+            </span>
+          )}
+        </div>
+      </summary>
+      <div className="px-4 pb-4 space-y-2">
+        {reasoning && (
+          <div className="text-sm text-gray-700">
+            <div className="text-xs uppercase text-gray-500 mb-1">Why excluded</div>
+            <div className="bg-gray-50 border rounded p-3 italic">{reasoning}</div>
+          </div>
+        )}
+        {page.keywords_found && page.keywords_found.length > 0 && (
+          <div className="text-xs text-gray-600">
+            Keywords found: {page.keywords_found.join(", ")}
+          </div>
+        )}
+        {page.fence_text && (
+          <div>
+            <div className="text-xs uppercase text-gray-500 mb-1">Page text</div>
+            <div className="bg-gray-50 border rounded p-3 whitespace-pre-wrap font-mono text-xs max-h-32 overflow-y-auto">
+              {page.fence_text}
+            </div>
+          </div>
+        )}
+      </div>
+    </details>
   );
 }
 
-function DataTable({
-  title,
-  rows,
-  columns,
-}: {
-  title: string;
-  rows: Record<string, string>[];
-  columns: string[];
-}) {
+function LegendTable({ rows }: { rows: LegendEntry[] }) {
   return (
     <div>
-      <div className="text-xs uppercase text-gray-500 mb-1">{title}</div>
+      <div className="text-xs uppercase text-gray-500 mb-1">
+        Legend definitions ({rows.length})
+      </div>
       <div className="overflow-x-auto border rounded">
         <table className="w-full text-sm">
           <thead className="bg-gray-50 text-gray-500 text-xs uppercase">
             <tr>
-              {columns.map((c) => (
-                <th key={c} className="text-left px-3 py-1.5 font-medium">
-                  {c}
-                </th>
-              ))}
+              <th className="text-left px-3 py-1.5 font-medium w-24">Indicator</th>
+              <th className="text-left px-3 py-1.5 font-medium w-40">Keyword</th>
+              <th className="text-left px-3 py-1.5 font-medium">Description</th>
             </tr>
           </thead>
           <tbody className="divide-y">
             {rows.map((r, i) => (
               <tr key={i} className="hover:bg-gray-50">
-                {columns.map((c) => (
-                  <td key={c} className="px-3 py-1.5 text-gray-800 align-top">
-                    {r[c]}
-                  </td>
-                ))}
+                <td className="px-3 py-1.5 align-top font-mono text-xs">
+                  {r.indicator || "—"}
+                </td>
+                <td className="px-3 py-1.5 align-top text-gray-700">{r.keyword || "—"}</td>
+                <td className="px-3 py-1.5 align-top text-gray-700">{r.description || "—"}</td>
               </tr>
             ))}
           </tbody>
@@ -717,41 +799,155 @@ function DataTable({
   );
 }
 
-function NonFenceList({
-  nonFence,
-  fence,
+function LayerBreakdown({
+  layerMeasurements,
 }: {
-  nonFence: NonFencePage[];
-  fence: FencePage[];
+  layerMeasurements?: Record<string, LayerMeasurement>;
 }) {
-  const fenceNums = new Set(fence.map((f) => f.page_num));
-  const all = [
-    ...fence.map((f) => ({ page_num: f.page_num, isFence: true })),
-    ...nonFence.map((n) => ({ page_num: n.page_num, isFence: false })),
-  ].sort((a, b) => a.page_num - b.page_num);
+  if (!layerMeasurements) return null;
+  const entries = Object.entries(layerMeasurements);
+  if (entries.length === 0) return null;
 
   return (
-    <table className="w-full text-sm">
-      <thead className="bg-gray-50 text-gray-500 text-xs uppercase">
-        <tr>
-          <th className="text-left px-4 py-2 font-medium w-20">Page</th>
-          <th className="text-left px-4 py-2 font-medium">Classification</th>
-        </tr>
-      </thead>
-      <tbody className="divide-y">
-        {all.map((p) => (
-          <tr key={p.page_num} className="hover:bg-gray-50">
-            <td className="px-4 py-2 font-mono">{p.page_num}</td>
-            <td className="px-4 py-2">
-              {fenceNums.has(p.page_num) ? (
-                <span className="text-green-700">✓ fence</span>
-              ) : (
-                <span className="text-gray-500">non-fence</span>
-              )}
-            </td>
+    <details className="text-xs bg-gray-50 border rounded">
+      <summary className="cursor-pointer px-3 py-2 font-medium text-gray-700 hover:bg-gray-100">
+        Layer-based breakdown ({entries.length} layer{entries.length === 1 ? "" : "s"})
+      </summary>
+      <div className="px-3 pb-3 pt-1 overflow-x-auto">
+        <table className="w-full">
+          <thead className="text-gray-500 text-[10px] uppercase">
+            <tr>
+              <th className="text-left py-1 font-medium">Layer</th>
+              <th className="text-right py-1 font-medium">Segments</th>
+              <th className="text-right py-1 font-medium">Length (ft)</th>
+              <th className="text-right py-1 font-medium">Connected runs</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-200">
+            {entries.map(([layerName, lm]) => (
+              <tr key={layerName}>
+                <td className="py-1 font-mono">{lm.layer_name ?? layerName}</td>
+                <td className="py-1 text-right">{lm.segment_count ?? 0}</td>
+                <td className="py-1 text-right">
+                  {lm.total_length_feet != null
+                    ? lm.total_length_feet.toFixed(1)
+                    : "—"}
+                </td>
+                <td className="py-1 text-right">{lm.connected_runs ?? "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  );
+}
+
+function DimensionLines({ dims }: { dims?: DimensionMeasurement[] }) {
+  if (!dims || dims.length === 0) return null;
+  const top = dims.slice(0, 10);
+  return (
+    <details className="text-xs bg-gray-50 border rounded">
+      <summary className="cursor-pointer px-3 py-2 font-medium text-gray-700 hover:bg-gray-100">
+        Dimension lines ({dims.length}
+        {dims.length > 10 ? `, top 10 shown` : ""})
+      </summary>
+      <div className="px-3 pb-3 pt-1 overflow-x-auto">
+        <table className="w-full">
+          <thead className="text-gray-500 text-[10px] uppercase">
+            <tr>
+              <th className="text-left py-1 font-medium">Text</th>
+              <th className="text-right py-1 font-medium">Measured (ft)</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-200">
+            {top.map((d, idx) => (
+              <tr key={idx}>
+                <td className="py-1 max-w-md truncate" title={d.text ?? ""}>
+                  {d.text ?? "—"}
+                </td>
+                <td className="py-1 text-right font-mono">
+                  {d.measured_length_feet != null
+                    ? d.measured_length_feet.toFixed(1)
+                    : "—"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  );
+}
+
+function ElementSpecsTable({ specs }: { specs: [string, ElementSpec][] }) {
+  const cols: Array<{ key: keyof ElementSpec; label: string }> = [
+    { key: "height", label: "Height" },
+    { key: "post_type", label: "Post type" },
+    { key: "post_spacing", label: "Spacing" },
+    { key: "material", label: "Material" },
+    { key: "gauge", label: "Gauge" },
+    { key: "mesh_size", label: "Mesh" },
+    { key: "detail_page", label: "Detail page" },
+  ];
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead className="bg-gray-50 text-gray-500 text-xs uppercase">
+          <tr>
+            <th className="text-left px-4 py-2 font-medium w-72">Element</th>
+            {cols.map((c) => (
+              <th key={String(c.key)} className="text-left px-3 py-2 font-medium">
+                {c.label}
+              </th>
+            ))}
+            <th className="px-3 py-2 font-medium text-right w-20">Details</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody className="divide-y">
+          {specs.map(([key, spec], idx) => {
+            const fullDetails = spec.full_details || spec.notes;
+            return (
+              <tr key={idx} className="hover:bg-gray-50 align-top">
+                <td className="px-4 py-2 text-xs text-gray-700 max-w-xs">
+                  <span className="font-mono break-all" title={key}>
+                    {cleanElementKey(key, 100)}
+                  </span>
+                </td>
+                {cols.map((c) => (
+                  <td key={String(c.key)} className="px-3 py-2 text-gray-700">
+                    {(spec[c.key] as string) || "—"}
+                  </td>
+                ))}
+                <td className="px-3 py-2 text-right">
+                  {fullDetails ? (
+                    <details className="group">
+                      <summary className="text-xs text-blue-600 hover:underline cursor-pointer">
+                        view
+                      </summary>
+                      <div className="absolute right-4 mt-1 max-w-md bg-white border rounded shadow-lg p-3 text-xs whitespace-pre-wrap text-gray-700 z-10">
+                        {fullDetails}
+                      </div>
+                    </details>
+                  ) : (
+                    <span className="text-gray-300 text-xs">—</span>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="bg-gray-50 border rounded p-2">
+      <div className="text-[10px] uppercase text-gray-500">{label}</div>
+      <div className="font-mono font-medium text-gray-900">{value}</div>
+    </div>
   );
 }
