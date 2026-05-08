@@ -146,6 +146,29 @@ def _run_job(job: dict, keys: dict):
         except Exception:
             pass
 
+    # Resolve the document this job belongs to so page_cb can stream
+    # per-page rows as Phase 1c / Phase 3 finish each page. Legacy
+    # X-User-Id jobs have no Postgres row → document_id stays None and
+    # page_cb is a no-op.
+    document_id: str | None = None
+    try:
+        document_id = db.get_document_id_by_job(job_id)
+    except Exception:
+        log.exception(f"Job {job_id[:8]}: document lookup failed; live page updates disabled")
+
+    def _page_cb(page: dict) -> None:
+        if not document_id:
+            return
+        try:
+            db.upsert_page_result(
+                document_id=document_id,
+                page_number=int(page["page_number"]),
+                is_fence_page=bool(page.get("is_fence_page", False)),
+                result_json=page.get("result_json"),
+            )
+        except Exception:
+            log.exception(f"Job {job_id[:8]}: upsert_page_result failed")
+
     # Mark Postgres jobs row as running.
     try:
         db.update_job_progress(job_id, status="running", started_at_now=True)
@@ -154,7 +177,7 @@ def _run_job(job: dict, keys: dict):
 
     try:
         _progress("start", 0, "Analysis starting...")
-        result = run_analysis(pdf_path, config, progress_cb=_progress)
+        result = run_analysis(pdf_path, config, progress_cb=_progress, page_cb=_page_cb)
 
         results_dir = Path(job.get("results_dir") or str(Path("~/.leo/results").expanduser() / job_id))
         results_dir.mkdir(parents=True, exist_ok=True)
@@ -646,6 +669,21 @@ async def get_document(
     if doc is None:
         raise HTTPException(404, "Document not found")
     return doc
+
+
+@app.get("/api/documents/{document_id}/pages")
+async def list_document_pages(
+    document_id: str,
+    user_id: str = Depends(require_supabase_jwt),
+):
+    """Stream per-page results as the worker writes them. Used by the detail
+    page to render pages incrementally while a job runs (Sprint 2 / A7)."""
+    if not _is_uuid(document_id):
+        raise HTTPException(400, "document_id must be a UUID")
+    # Confirm ownership before listing — prevents existence-leak via empty []
+    if db.get_document(document_id, user_id) is None:
+        raise HTTPException(404, "Document not found")
+    return {"pages": db.list_page_results(document_id, user_id)}
 
 
 @app.get("/api/healthz")

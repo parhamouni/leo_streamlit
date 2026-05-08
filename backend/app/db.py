@@ -307,6 +307,66 @@ def get_job(job_id: str, user_id: str) -> dict[str, Any] | None:
     return _row_to_dict(row) if row else None
 
 
+def get_document_id_by_job(job_id: str) -> str | None:
+    """Look up the document_id a job belongs to. Returns None for legacy
+    `X-User-Id` jobs that never landed in Postgres."""
+    with pool().connection() as conn:
+        row = conn.execute(
+            "select document_id from jobs where id = %s",
+            (job_id,),
+        ).fetchone()
+    return str(row["document_id"]) if row else None
+
+
+# ---------------------------------------------------------------------------
+# page_results — live per-page rows the worker upserts as the pipeline runs
+# ---------------------------------------------------------------------------
+
+def upsert_page_result(
+    document_id: str,
+    page_number: int,
+    is_fence_page: bool,
+    result_json: dict | None,
+) -> None:
+    """Insert or update a per-page row for a document. Called from the
+    pipeline `page_cb` so the frontend sees pages stream in.
+
+    Phase 1c emits a stub; Phase 3 overwrites it with the enriched payload
+    via ON CONFLICT — only fence pages get a second emission."""
+    from psycopg.types.json import Json
+    payload = Json(result_json) if result_json is not None else None
+    with pool().connection() as conn:
+        conn.execute(
+            """
+            insert into page_results
+              (document_id, page_number, is_fence_page, result_json)
+            values (%s, %s, %s, %s)
+            on conflict (document_id, page_number) do update set
+              is_fence_page = excluded.is_fence_page,
+              result_json   = excluded.result_json
+            """,
+            (document_id, page_number, is_fence_page, payload),
+        )
+
+
+def list_page_results(document_id: str, user_id: str) -> list[dict[str, Any]]:
+    """Return all page_results rows for a document the user owns. The
+    join through documents enforces ownership — non-owners see []."""
+    with pool().connection() as conn:
+        rows = conn.execute(
+            """
+            select pr.page_number, pr.is_fence_page, pr.result_json,
+                   pr.created_at
+            from page_results pr
+            join documents d on d.id = pr.document_id
+            where pr.document_id = %s and d.user_id = %s
+            order by pr.page_number asc
+            """,
+            (document_id, user_id),
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------

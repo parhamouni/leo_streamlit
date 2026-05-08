@@ -53,6 +53,19 @@ log = logging.getLogger("pipeline")
 
 ProgressCallback = Callable[[str, int, str], None]
 
+# Fired once per page when classification is known (Phase 1c) and again per
+# fence page when full enrichment is available (Phase 3). The dict carries:
+#   page_number   — 1-indexed page (matches the page_results schema)
+#   is_fence_page — bool from classification
+#   result_json   — partial or full per-page payload, or None for the
+#                   minimal Phase 1c stub
+# Workers can upsert this straight into Postgres `page_results`.
+PageCallback = Callable[[dict], None]
+
+
+def _noop_page(_page: dict) -> None:
+    pass
+
 
 @dataclass
 class PipelineConfig:
@@ -159,6 +172,7 @@ def run_analysis(
     pdf_path: str,
     config: PipelineConfig,
     progress_cb: ProgressCallback | None = None,
+    page_cb: PageCallback | None = None,
 ) -> PipelineResult:
     """Run the full fence detection pipeline on a PDF.
 
@@ -166,6 +180,7 @@ def run_analysis(
     Returns a PipelineResult with all analysis data.
     """
     progress = progress_cb or _noop_progress
+    emit_page = page_cb or _noop_page
     result = PipelineResult()
     timings: dict[str, float] = {}
     t_start = time.perf_counter()
@@ -403,6 +418,29 @@ def run_analysis(
         fence_page_indices.sort()
         non_fence_page_indices.sort()
 
+        # Emit Phase 1c stubs so the frontend can render placeholder rows
+        # (and the dashboard's "pages so far" counter) before Phase 3
+        # finishes enriching them. Fence pages get overwritten with the full
+        # payload below; non-fence pages keep their stub.
+        for pi in fence_page_indices:
+            try:
+                emit_page({
+                    "page_number": pi + 1,
+                    "is_fence_page": True,
+                    "result_json": {"page_idx": pi, "page_num": pi + 1, "phase": "phase1c"},
+                })
+            except Exception:
+                log.exception("page_cb (phase1c fence) failed")
+        for pi in non_fence_page_indices:
+            try:
+                emit_page({
+                    "page_number": pi + 1,
+                    "is_fence_page": False,
+                    "result_json": {"page_idx": pi, "page_num": pi + 1, "phase": "phase1c"},
+                })
+            except Exception:
+                log.exception("page_cb (phase1c non-fence) failed")
+
         timings["phase1c"] = time.perf_counter() - t1c
         progress("phase1c", 45, f"Phase 1c done: {len(fence_page_indices)} fence, "
                  f"{len(non_fence_page_indices)} non-fence ({timings['phase1c']:.1f}s)")
@@ -603,13 +641,24 @@ def run_analysis(
                         per_page_measurements[str(pi)] = page_result["measurements"]
                 except Exception as e:
                     log.warning(f"Phase 3 page {pi} failed: {e}")
-                    fence_results.append({
+                    page_result = {
                         "page_idx": pi, "page_num": pi + 1,
                         "error": str(e),
-                    })
+                    }
+                    fence_results.append(page_result)
                 completed_count += 1
                 pct = 63 + int(30 * completed_count / max(len(fence_page_indices), 1))
                 progress("phase3", pct, f"Phase 3: {completed_count}/{len(fence_page_indices)} pages")
+                # Stream the enriched page row out so the frontend can render
+                # measurements / scale / legends as soon as each page finishes.
+                try:
+                    emit_page({
+                        "page_number": pi + 1,
+                        "is_fence_page": True,
+                        "result_json": page_result,
+                    })
+                except Exception:
+                    log.exception(f"page_cb (phase3 fence pi={pi}) failed")
 
         fence_results.sort(key=lambda x: x.get("page_idx", 0))
 

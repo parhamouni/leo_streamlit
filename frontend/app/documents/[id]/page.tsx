@@ -39,7 +39,22 @@ type DashboardDoc = {
   error_message: string | null;
 };
 
+type PageRow = {
+  page_number: number;
+  is_fence_page: boolean;
+  result_json: (Partial<FencePage> & { phase?: string }) | null;
+  created_at: string;
+};
+
 const POLL_MS = 3000;
+
+function isPhase1cStub(row: PageRow): boolean {
+  const r = row.result_json;
+  if (!r) return true;
+  if (r.phase === "phase1c") return true;
+  // Heuristic for older rows: nothing rich populated yet.
+  return !r.measurements && !r.definitions && !r.scale_info && !r.fence_text;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -98,6 +113,7 @@ export default function DocumentDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<"fence" | "all" | "nonfence">("fence");
   const [downloading, setDownloading] = useState(false);
+  const [pagesSoFar, setPagesSoFar] = useState<PageRow[]>([]);
 
   // Auth
   useEffect(() => {
@@ -194,6 +210,48 @@ export default function DocumentDetailPage() {
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [authReady, doc, refresh]);
+
+  // Live per-page rows (Sprint 2 / A7). Polls the new pages endpoint while
+  // a job is queued/running so pages appear in the detail view as the
+  // worker writes them. Stops polling once the job leaves an active state;
+  // the existing results-JSON render then takes over.
+  useEffect(() => {
+    if (!authReady || !doc) return;
+    const active = doc.job_status === "queued" || doc.job_status === "running";
+    if (!active) return;
+
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const fetchPages = async () => {
+      try {
+        const resp = await apiJson<{ pages: PageRow[] }>(
+          `/api/documents/${docId}/pages`,
+        );
+        if (alive) setPagesSoFar(resp.pages ?? []);
+      } catch {
+        // best-effort; the next tick may succeed
+      }
+    };
+
+    const tick = () => {
+      if (!alive) return;
+      if (typeof document !== "undefined" && document.hidden) return;
+      fetchPages().finally(() => {
+        const stillActive =
+          docRef.current?.job_status === "queued" ||
+          docRef.current?.job_status === "running";
+        if (alive && stillActive) timer = setTimeout(tick, POLL_MS);
+      });
+    };
+
+    fetchPages();
+    timer = setTimeout(tick, POLL_MS);
+    return () => {
+      alive = false;
+      if (timer) clearTimeout(timer);
+    };
+  }, [authReady, doc, docId]);
 
   // Highlighted PDF blob for the embedded viewer
   useEffect(() => {
@@ -473,11 +531,35 @@ export default function DocumentDetailPage() {
           </section>
         )}
 
-        {!isComplete && !doc.error_message && (
+        {/* Live "Pages so far" while a job runs (Sprint 2 / A7) */}
+        {isActive && (
+          <section className="bg-white rounded-lg shadow">
+            <div className="flex items-center justify-between p-4 border-b">
+              <h2 className="font-medium">
+                Pages so far ({pagesSoFar.length}
+                {doc.total_pages ? ` / ${doc.total_pages}` : ""})
+              </h2>
+              <span className="text-xs text-gray-500">
+                Auto-refreshes every {POLL_MS / 1000}s
+              </span>
+            </div>
+            {pagesSoFar.length === 0 ? (
+              <div className="p-6 text-sm text-gray-500">
+                Classifying pages… results appear here as each page finishes.
+              </div>
+            ) : (
+              <div className="divide-y">
+                {pagesSoFar.map((row) => (
+                  <LivePageRow key={row.page_number} row={row} />
+                ))}
+              </div>
+            )}
+          </section>
+        )}
+
+        {!isComplete && !isActive && !doc.error_message && (
           <section className="bg-white rounded-lg shadow p-6 text-sm text-gray-600">
-            {isActive
-              ? "Analyzing… this page auto-refreshes."
-              : `Job is ${doc.job_status}. No results to show.`}
+            Job is {doc.job_status}. No results to show.
           </section>
         )}
       </div>
@@ -534,6 +616,31 @@ function FilterChip({
     >
       {children}
     </button>
+  );
+}
+
+function LivePageRow({ row }: { row: PageRow }) {
+  const stub = isPhase1cStub(row);
+  if (!stub && row.is_fence_page && row.result_json) {
+    // Phase 3 enrichment is in — render with the existing rich card.
+    return <FencePageCard page={row.result_json as FencePage} />;
+  }
+
+  // Phase 1c stub — minimal placeholder.
+  const label = row.is_fence_page ? "fence" : "non-fence";
+  const labelCls = row.is_fence_page
+    ? "bg-blue-100 text-blue-700"
+    : "bg-gray-100 text-gray-600";
+  return (
+    <div className="flex items-center justify-between gap-3 px-4 py-3">
+      <div className="flex items-center gap-3 min-w-0">
+        <span className="font-mono text-gray-700">Page {row.page_number}</span>
+        <span className={`text-xs px-2 py-0.5 rounded ${labelCls}`}>{label}</span>
+      </div>
+      {row.is_fence_page && (
+        <span className="text-xs text-gray-400 italic">analyzing…</span>
+      )}
+    </div>
   );
 }
 
