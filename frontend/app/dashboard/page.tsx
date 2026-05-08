@@ -7,6 +7,10 @@ import { supabase } from "@/lib/supabase";
 import { apiJson, ApiError } from "@/lib/api";
 import { etaSeconds, formatEta } from "@/lib/eta";
 import { UploadButton } from "@/components/UploadButton";
+import {
+  AnalysisSettingsPanel,
+  useAnalysisSettings,
+} from "@/components/AnalysisSettings";
 import { RowActions } from "@/components/RowActions";
 
 type Document = {
@@ -116,6 +120,9 @@ export default function DashboardPage() {
   const [initialLoading, setInitialLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [polling, setPolling] = useState(false);
+
+  // Sprint 3 / A9 — analysis settings persisted to localStorage
+  const { settings, setSettings, configJson } = useAnalysisSettings();
 
   // Auth gate
   useEffect(() => {
@@ -260,9 +267,15 @@ export default function DashboardPage() {
           </div>
         </div>
 
+        {/* Analysis settings */}
+        <AnalysisSettingsPanel settings={settings} setSettings={setSettings} />
+
         {/* Upload */}
         <section className="bg-white rounded-lg shadow p-4">
-          <UploadButton onUploaded={() => refresh(false)} />
+          <UploadButton
+            onUploaded={() => refresh(false)}
+            configJson={configJson}
+          />
         </section>
 
         {/* Documents card */}

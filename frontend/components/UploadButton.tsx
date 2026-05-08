@@ -45,6 +45,7 @@ function uploadOne(
   file: File,
   onProgress: (pct: number) => void,
   token: string | null,
+  configJson: string,
 ): Promise<UploadResponse> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -85,15 +86,27 @@ function uploadOne(
 
     const form = new FormData();
     form.append("pdf", file);
+    form.append("config", configJson);
     xhr.send(form);
   });
 }
 
-export function UploadButton({ onUploaded }: { onUploaded: () => void }) {
+export function UploadButton({
+  onUploaded,
+  configJson = "{}",
+}: {
+  onUploaded: () => void;
+  configJson?: string;
+}) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [queue, setQueue] = useState<Entry[]>([]);
   const [busy, setBusy] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+
+  // Pin the latest configJson in a ref so the upload effect doesn't have to
+  // re-fire when the user toggles a setting mid-upload.
+  const configRef = useRef(configJson);
+  configRef.current = configJson;
 
   // Drive the queue: when not busy, pick the next queued entry and upload it.
   useEffect(() => {
@@ -120,6 +133,7 @@ export function UploadButton({ onUploaded }: { onUploaded: () => void }) {
               ),
             ),
           token,
+          configRef.current,
         );
         const wasDeduped = resp.status === "deduped";
         setQueue((q) =>
