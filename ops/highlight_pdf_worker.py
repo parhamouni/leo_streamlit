@@ -105,8 +105,13 @@ def main() -> int:
 
                 def reverse_rotation(x0, y0, x1, y1,
                                      _rot=rotation, _w=mediabox_w, _h=mediabox_h):
-                    """Display-space → MediaBox-space (same logic as the
-                    inline version in app_ade_fast.py)."""
+                    """Display-space rectangle → MediaBox-space rectangle.
+                    The formula assumes (x0,y0)=top-left, (x1,y1)=bottom-right
+                    and returns a rect whose bounds are normalised to that
+                    same (top-left, bottom-right) shape — fine for axis-
+                    aligned boxes but WRONG for arbitrary lines (the y
+                    components of the two endpoints get swapped). For lines,
+                    use `reverse_rotation_point` per endpoint instead."""
                     if _rot == 0:
                         return x0, y0, x1, y1
                     if _rot == 90:
@@ -116,6 +121,22 @@ def main() -> int:
                     if _rot == 270:
                         return _w - y1, x0, _w - y0, x1
                     return x0, y0, x1, y1
+
+                def reverse_rotation_point(x, y,
+                                           _rot=rotation, _w=mediabox_w, _h=mediabox_h):
+                    """Inverse of utils_vector.transform_coords_for_rotation
+                    (display → MediaBox), one point at a time. Use this for
+                    line endpoints — each endpoint maps independently, so
+                    the rect-style helper above doesn't work."""
+                    if _rot == 0:
+                        return x, y
+                    if _rot == 90:
+                        return y, _h - x
+                    if _rot == 180:
+                        return _w - x, _h - y
+                    if _rot == 270:
+                        return _w - y, x
+                    return x, y
 
                 # Definitions — green rectangles.
                 for d in res.get("definitions", []) or []:
@@ -148,10 +169,14 @@ def main() -> int:
                         page_out.draw_rect(r, color=(1.0, 0.65, 0), width=2.0, overlay=True)
 
                 # Fence lines — cyan strokes (matches prod's measurement
-                # overlay: app_ade_prod.py:1789-1791 width=3.0 cyan). Each
-                # line is a dict with `start: [x, y]` / `end: [x, y]` after
-                # pipeline._normalize_measurements. Pre-Sprint-3-fix runs
-                # may have these as repr strings — those are skipped here.
+                # overlay: app_ade_prod.py:1789-1791 width=3.0). Each line
+                # is a dict with `start: [x, y]` / `end: [x, y]` in
+                # *display space* (utils_vector.extract_vector_lines uses
+                # apply_rotation=True). We transform each endpoint
+                # independently — the rect-style transform mis-pairs the y
+                # components of the two endpoints on rotated pages.
+                # Pre-Sprint-3-fix runs may store lines as repr strings —
+                # those are skipped here.
                 for ln in res.get("fence_lines", []) or []:
                     if not isinstance(ln, dict):
                         continue
@@ -167,9 +192,10 @@ def main() -> int:
                         ex, ey = float(end[0]), float(end[1])
                     except Exception:
                         continue
-                    rx0, ry0, rx1, ry1 = reverse_rotation(sx, sy, ex, ey)
+                    msx, msy = reverse_rotation_point(sx, sy)
+                    mex, mey = reverse_rotation_point(ex, ey)
                     page_out.draw_line(
-                        (rx0, ry0), (rx1, ry1),
+                        (msx, msy), (mex, mey),
                         color=(0, 1, 1), width=3.0, overlay=True,
                     )
             except Exception as pg_e:

@@ -847,11 +847,23 @@ def _generate_highlighted_pdf(
                     annot.set_border(width=cfg.HIGHLIGHT_WIDTH_UI)
                     annot.update()
 
-            # Cyan fence-line strokes — draws the actual measured fence
-            # segments. Without these the highlighted PDF only shows
-            # bounding boxes around legend rows / figures, which is what
-            # the user reported as "messed up" vs prod.
+            # Cyan fence-line strokes. Lines come from
+            # extract_vector_lines(apply_rotation=True), so coords are in
+            # *display space* — we map each endpoint back to MediaBox space
+            # independently (a rectangle-style transform mis-pairs the y
+            # components of the two endpoints on rotated pages).
             meas = page_result.get("measurements") or {}
+            rotation = page.rotation
+            mw = page.mediabox.width
+            mh = page.mediabox.height
+
+            def _to_mbox(x, y, _r=rotation, _w=mw, _h=mh):
+                if _r == 0:   return x, y
+                if _r == 90:  return y, _h - x
+                if _r == 180: return _w - x, _h - y
+                if _r == 270: return _w - y, x
+                return x, y
+
             for ln in meas.get("all_fence_lines") or []:
                 if not isinstance(ln, dict):
                     continue
@@ -867,9 +879,11 @@ def _generate_highlighted_pdf(
                     ex, ey = float(end[0]), float(end[1])
                 except Exception:
                     continue
+                msx, msy = _to_mbox(sx, sy)
+                mex, mey = _to_mbox(ex, ey)
                 try:
                     page.draw_line(
-                        (sx, sy), (ex, ey),
+                        (msx, msy), (mex, mey),
                         color=(0, 1, 1), width=3.0, overlay=True,
                     )
                 except Exception:
