@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 # Load .env.local before importing config so SUPABASE_*, AUTH_MODE, etc.
@@ -282,6 +283,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Leo Fence Detection API", lifespan=lifespan)
+
+
+# Allow the Next.js frontend (Vercel + local dev) to call us across origins.
+# Comma-separated env override; defaults to local dev origins.
+_default_origins = "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001"
+_cors_origins = [o.strip() for o in os.environ.get("FENCE_CORS_ORIGINS", _default_origins).split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-User-Id"],
+    expose_headers=["Content-Disposition"],
+)
 
 
 # ---------------------------------------------------------------------------
