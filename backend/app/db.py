@@ -22,6 +22,7 @@ import os
 import threading
 from typing import Any, Optional
 
+from psycopg import Connection
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -39,6 +40,21 @@ def _database_url() -> str:
     return url
 
 
+def _check_connection(conn: Connection) -> None:
+    """psycopg-pool `check` callback. Run a trivial round-trip before
+    handing a pooled connection back to the caller, so we don't reuse a
+    corrupted/desynced one. Stale connections raise here, the pool drops
+    them, and the next `getconn()` opens a fresh one.
+
+    This is the fix for the long-running-job hang we saw in production:
+    a Supabase pooler statement_timeout cancel left the connection's
+    application-layer state out of sync (54 bytes in recv-q, never read),
+    and the next user of the connection blocked forever waiting for a
+    response that wasn't coming.
+    """
+    conn.execute("select 1").fetchone()
+
+
 def pool() -> ConnectionPool:
     global _pool
     if _pool is None:
@@ -49,9 +65,16 @@ def pool() -> ConnectionPool:
                     min_size=1,
                     max_size=8,
                     kwargs={"row_factory": dict_row},
+                    # Run `check` on each getconn() to detect stale conns.
+                    check=_check_connection,
+                    # Recycle connections every 30 min so a slow leak in
+                    # the upstream pooler doesn't accumulate forever.
+                    max_lifetime=1800,
+                    # If a connection sits idle 10 min, prefer to close it.
+                    max_idle=600,
                     open=True,
                 )
-                log.info("Postgres pool opened")
+                log.info("Postgres pool opened (with check-on-getconn)")
     return _pool
 
 
