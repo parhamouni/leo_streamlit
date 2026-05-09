@@ -87,93 +87,100 @@ async function authToken(): Promise<string | null> {
 
 export function UploadProvider({ children }: { children: React.ReactNode }) {
   const [queue, setQueue] = useState<UploadEntry[]>([]);
-  const [busy, setBusy] = useState(false);
   const [successCount, setSuccessCount] = useState(0);
 
   // The XHR objects can't live in React state — they're not serializable
   // and we don't want re-renders to recreate them. A ref keyed by entry id
   // is the natural fit. `configByIdRef` keeps the config snapshot at
   // enqueue time so a settings change mid-upload doesn't apply
-  // retroactively.
+  // retroactively. `fileByIdRef` stashes the actual File objects (not
+  // safely serializable into React state).
   const xhrByIdRef = useRef(new Map<string, XMLHttpRequest>());
   const configByIdRef = useRef(new Map<string, string>());
+  const fileByIdRef = useRef(new Map<string, File>());
 
-  // Drive the queue: when not busy, pick the next queued entry and upload
-  // it. Same single-flight model as the old UploadButton, just hoisted.
-  useEffect(() => {
-    if (busy) return;
-    const next = queue.find((e) => e.status === "queued");
+  // Single-flight queue driver. Critical to avoid a `useEffect([queue,busy])`
+  // pattern: `setQueue` to mark "uploading" would re-fire the effect,
+  // its cleanup would set cancelled=true, and the async block would bail
+  // out *before* marking the entry done — leaving it stuck at "uploading"
+  // forever. Refs are immune to React's render lifecycle.
+  const busyRef = useRef(false);
+  const queueRef = useRef<UploadEntry[]>([]);
+  queueRef.current = queue;
+
+  const drive = useCallback(async () => {
+    if (busyRef.current) return;
+    const next = queueRef.current.find((e) => e.status === "queued");
     if (!next) return;
+    busyRef.current = true;
 
-    setBusy(true);
     setQueue((q) =>
       q.map((x) =>
         x.id === next.id ? { ...x, status: "uploading", progress: 0 } : x,
       ),
     );
 
-    let cancelled = false;
-    (async () => {
-      try {
-        const token = await authToken();
-        const configJson = configByIdRef.current.get(next.id) ?? "{}";
-        const resp = await uploadOne(
-          next.id,
-          next,
-          token,
-          configJson,
-          (pct) =>
-            setQueue((q) =>
-              q.map((x) =>
-                x.id === next.id ? { ...x, progress: pct } : x,
-              ),
+    try {
+      const token = await authToken();
+      const configJson = configByIdRef.current.get(next.id) ?? "{}";
+      const resp = await uploadOne(
+        next.id,
+        token,
+        configJson,
+        (pct) =>
+          setQueue((q) =>
+            q.map((x) =>
+              x.id === next.id ? { ...x, progress: pct } : x,
             ),
-          xhrByIdRef.current,
-        );
-        if (cancelled) return;
-        const wasDeduped = resp.status === "deduped";
-        setQueue((q) =>
-          q.map((x) =>
-            x.id === next.id
-              ? {
-                  ...x,
-                  status: wasDeduped ? "deduped" : "done",
-                  progress: 100,
-                  jobId: resp.job_id ?? null,
-                  documentId: resp.document_id ?? null,
-                  dedupedExistingStatus: resp.existing_status,
-                  completedAt: Date.now(),
-                }
-              : x,
           ),
-        );
-        setSuccessCount((n) => n + 1);
-      } catch (e) {
-        if (cancelled) return;
-        const msg = e instanceof Error ? e.message : String(e);
-        const aborted = msg === "Upload aborted";
-        setQueue((q) =>
-          q.map((x) =>
-            x.id === next.id
-              ? {
-                  ...x,
-                  status: aborted ? "cancelled" : "failed",
-                  error: aborted ? undefined : msg,
-                }
-              : x,
-          ),
-        );
-      } finally {
-        xhrByIdRef.current.delete(next.id);
-        configByIdRef.current.delete(next.id);
-        setBusy(false);
-      }
-    })();
+        xhrByIdRef.current,
+      );
+      const wasDeduped = resp.status === "deduped";
+      setQueue((q) =>
+        q.map((x) =>
+          x.id === next.id
+            ? {
+                ...x,
+                status: wasDeduped ? "deduped" : "done",
+                progress: 100,
+                jobId: resp.job_id ?? null,
+                documentId: resp.document_id ?? null,
+                dedupedExistingStatus: resp.existing_status,
+                completedAt: Date.now(),
+              }
+            : x,
+        ),
+      );
+      setSuccessCount((n) => n + 1);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const aborted = msg === "Upload aborted";
+      setQueue((q) =>
+        q.map((x) =>
+          x.id === next.id
+            ? {
+                ...x,
+                status: aborted ? "cancelled" : "failed",
+                error: aborted ? undefined : msg,
+              }
+            : x,
+        ),
+      );
+    } finally {
+      xhrByIdRef.current.delete(next.id);
+      configByIdRef.current.delete(next.id);
+      busyRef.current = false;
+      // After this upload finishes, see if anything else queued up while
+      // we were busy.
+      drive();
+    }
+  }, []);
 
-    return () => {
-      cancelled = true;
-    };
-  }, [queue, busy]);
+  // Kick the driver whenever the queue changes — covers `enqueue` adding
+  // new items. The driver itself is idempotent thanks to busyRef.
+  useEffect(() => {
+    drive();
+  }, [queue, drive]);
 
   const enqueue = useCallback(
     (filesIn: FileList | File[], configJson: string = "{}") => {
@@ -234,14 +241,9 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
     );
   }, []);
 
-  // We need real File objects to feed XHR's FormData, but File is not
-  // serializable into our React state. Stash by id in a ref.
-  const fileByIdRef = useRef(new Map<string, File>());
-
-  // Read fileByIdRef inside the upload helper.
+  // Read fileByIdRef (declared above) inside the upload helper.
   function uploadOne(
     id: string,
-    entry: UploadEntry,
     token: string | null,
     configJson: string,
     onProgress: (pct: number) => void,
