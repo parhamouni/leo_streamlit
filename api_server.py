@@ -639,15 +639,46 @@ async def get_page_image(
 
     hl_path = job_registry.get_highlighted_pdf_path(job_id)
     orig_path = job.get("pdf_path")
-    if source == "original":
+
+    # The highlighted PDF only contains FENCE pages (renumbered sequentially).
+    # Build an original-page-num → highlighted-page-index map so we can
+    # render the correct page when serving from the highlighted PDF; without
+    # this, requesting page 7 of the highlighted PDF would return the 7th
+    # fence page in order, not the user's original page 7. For non-fence
+    # pages there's nothing in the highlighted PDF — fall back to original.
+    fence_page_pos: dict[int, int] = {}
+    if hl_path is not None:
+        results = job_registry.load_results(job_id)
+        if results:
+            fence_pages = sorted(
+                (results.get("fence_pages") or []),
+                key=lambda fp: fp.get("page_idx", fp.get("page_index_in_original_doc", 0)),
+            )
+            for i, fp in enumerate(fence_pages):
+                pn = fp.get("page_num") or fp.get("page_number")
+                if pn is not None:
+                    fence_page_pos[int(pn)] = i
+
+    if source == "highlighted":
+        if hl_path is not None and page_num in fence_page_pos:
+            src_pdf = hl_path
+            page_in_pdf = fence_page_pos[page_num] + 1  # 1-indexed for renderer
+        else:
+            raise HTTPException(
+                404,
+                f"Page {page_num} is not in the highlighted PDF "
+                "(only fence-classified pages have a highlighted version).",
+            )
+    elif source == "original":
         src_pdf = orig_path
-        is_highlighted = False
-    elif source == "highlighted":
-        src_pdf = hl_path
-        is_highlighted = src_pdf is not None
-    else:  # "auto" — prefer highlighted, fall back to original
-        src_pdf = hl_path if hl_path is not None else orig_path
-        is_highlighted = hl_path is not None
+        page_in_pdf = page_num
+    else:  # "auto"
+        if hl_path is not None and page_num in fence_page_pos:
+            src_pdf = hl_path
+            page_in_pdf = fence_page_pos[page_num] + 1
+        else:
+            src_pdf = orig_path
+            page_in_pdf = page_num
 
     if not src_pdf or not Path(src_pdf).exists():
         raise HTTPException(
@@ -664,7 +695,7 @@ async def get_page_image(
                 "-c",
                 _PAGE_RENDER_SCRIPT,
                 str(src_pdf),
-                str(page_num),
+                str(page_in_pdf),
                 str(dpi),
             ],
             capture_output=True,
@@ -687,18 +718,19 @@ async def get_page_image(
         )
         raise HTTPException(500, f"Page render failed: {err}")
 
+    served_highlighted = src_pdf == hl_path
     return Response(
         content=proc.stdout,
         media_type="image/png",
         headers={
-            # Don't cache long while the job is running — we want the
-            # highlighted version once it lands. After completion the
-            # response is stable so an hour is fine.
+            # Don't cache long while the job is still running so the user
+            # picks up the highlighted PDF once it lands. After completion
+            # the response is stable so an hour is fine.
             "Cache-Control": (
-                "private, max-age=3600" if is_highlighted else "private, max-age=10"
+                "private, max-age=3600" if served_highlighted else "private, max-age=10"
             ),
             "X-Page-Number": str(page_num),
-            "X-Image-Source": "highlighted" if is_highlighted else "original",
+            "X-Image-Source": "highlighted" if served_highlighted else "original",
         },
     )
 
