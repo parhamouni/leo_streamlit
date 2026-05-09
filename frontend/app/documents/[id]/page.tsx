@@ -525,7 +525,13 @@ export default function DocumentDetailPage() {
                 (nonFencePages.length === 0 ? (
                   <Empty msg="No non-fence pages." />
                 ) : (
-                  nonFencePages.map((p) => <NonFencePageCard key={p.page_num} page={p} />)
+                  nonFencePages.map((p) => (
+                    <NonFencePageCard
+                      key={p.page_num}
+                      page={p}
+                      jobId={doc.latest_job_id}
+                    />
+                  ))
                 ))}
               {filter === "all" && (
                 <>
@@ -537,7 +543,11 @@ export default function DocumentDetailPage() {
                     />
                   ))}
                   {nonFencePages.map((p) => (
-                    <NonFencePageCard key={`n-${p.page_num}`} page={p} />
+                    <NonFencePageCard
+                      key={`n-${p.page_num}`}
+                      page={p}
+                      jobId={doc.latest_job_id}
+                    />
                   ))}
                 </>
               )}
@@ -720,7 +730,17 @@ function LivePageRow({ row, jobId }: { row: PageRow; jobId?: string | null }) {
   );
 }
 
-function PageImage({ jobId, pageNum }: { jobId: string; pageNum: number }) {
+function PageImage({
+  jobId,
+  pageNum,
+  source = "auto",
+  altText,
+}: {
+  jobId: string;
+  pageNum: number;
+  source?: "auto" | "original" | "highlighted";
+  altText?: string;
+}) {
   const [open, setOpen] = useState(false);
   const [url, setUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -742,8 +762,9 @@ function PageImage({ jobId, pageNum }: { jobId: string; pageNum: number }) {
     setLoading(true);
     setError(null);
     try {
+      const qs = `?dpi=110${source !== "auto" ? `&source=${source}` : ""}`;
       const resp = await apiFetch(
-        `/api/jobs/${jobId}/page-image/${pageNum}?dpi=110`,
+        `/api/jobs/${jobId}/page-image/${pageNum}${qs}`,
       );
       const blob = await resp.blob();
       setUrl(URL.createObjectURL(blob));
@@ -753,6 +774,11 @@ function PageImage({ jobId, pageNum }: { jobId: string; pageNum: number }) {
       setLoading(false);
     }
   }
+
+  const fallbackAlt =
+    source === "original"
+      ? `Page ${pageNum} (original, no highlights)`
+      : `Page ${pageNum} with fence highlights`;
 
   return (
     <div>
@@ -777,7 +803,7 @@ function PageImage({ jobId, pageNum }: { jobId: string; pageNum: number }) {
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
             src={url}
-            alt={`Page ${pageNum} with fence highlights`}
+            alt={altText ?? fallbackAlt}
             className="w-full h-auto block"
           />
         </div>
@@ -948,29 +974,55 @@ function FencePageCard({
   );
 }
 
-function NonFencePageCard({ page }: { page: NonFencePage }) {
+function NonFencePageCard({
+  page,
+  jobId,
+}: {
+  page: NonFencePage;
+  jobId?: string | null;
+}) {
   const reasoning = page.classification?.reasoning ?? page.reason;
   const method = page.classification?.method ?? page.method;
   const conf = page.classification?.confidence;
+  // One-line teaser shown on the closed summary so the user can scan
+  // many non-fence pages without expanding each. Strip newlines, clip
+  // to ~110 chars.
+  const teaser = reasoning
+    ? reasoning.replace(/\s+/g, " ").trim().slice(0, 110) +
+      (reasoning.length > 110 ? "…" : "")
+    : null;
   return (
     <details className="group">
       <summary className="flex items-center justify-between gap-3 px-4 py-3 cursor-pointer hover:bg-gray-50">
-        <div className="flex items-center gap-3">
-          <span className="font-mono text-gray-700">Page {page.page_num}</span>
-          <span className="text-gray-500 text-xs">non-fence</span>
-          {method && <span className="text-xs text-gray-400">via {method}</span>}
+        <div className="flex items-center gap-3 min-w-0">
+          <span className="font-mono text-gray-700 shrink-0">
+            Page {page.page_num}
+          </span>
+          <span className="text-gray-500 text-xs shrink-0">non-fence</span>
+          {method && (
+            <span className="text-xs text-gray-400 shrink-0">via {method}</span>
+          )}
           {conf != null && (
-            <span className="text-xs text-gray-400">
+            <span className="text-xs text-gray-400 shrink-0">
               {Math.round(conf * 100)}% confidence
+            </span>
+          )}
+          {teaser && (
+            <span className="text-xs text-gray-500 italic truncate">
+              — {teaser}
             </span>
           )}
         </div>
       </summary>
-      <div className="px-4 pb-4 space-y-2">
+      <div className="px-4 pb-4 space-y-3">
         {reasoning && (
           <div className="text-sm text-gray-700">
-            <div className="text-xs uppercase text-gray-500 mb-1">Why excluded</div>
-            <div className="bg-gray-50 border rounded p-3 italic">{reasoning}</div>
+            <div className="text-xs uppercase text-gray-500 mb-1">
+              Why excluded
+            </div>
+            <div className="bg-gray-50 border rounded p-3 italic">
+              {reasoning}
+            </div>
           </div>
         )}
         {page.keywords_found && page.keywords_found.length > 0 && (
@@ -978,9 +1030,20 @@ function NonFencePageCard({ page }: { page: NonFencePage }) {
             Keywords found: {page.keywords_found.join(", ")}
           </div>
         )}
+        {/* Render the original page (no highlights) on demand so the user
+            can sanity-check the classification visually. */}
+        {jobId && (
+          <PageImage
+            jobId={jobId}
+            pageNum={page.page_num}
+            source="original"
+          />
+        )}
         {page.fence_text && (
           <div>
-            <div className="text-xs uppercase text-gray-500 mb-1">Page text</div>
+            <div className="text-xs uppercase text-gray-500 mb-1">
+              Page text
+            </div>
             <div className="bg-gray-50 border rounded p-3 whitespace-pre-wrap font-mono text-xs max-h-32 overflow-y-auto">
               {page.fence_text}
             </div>

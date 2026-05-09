@@ -612,36 +612,48 @@ async def get_page_image(
     job_id: str,
     page_num: int,
     dpi: int = 110,
+    source: str = "auto",
     user_id: str = Depends(get_current_user),
 ):
-    """Rasterize page `page_num` (1-indexed) from the job's highlighted PDF
-    and return it as a PNG. Used by the detail page's per-page cards so the
-    user can see the colored fence overlays inline without scrolling the
-    whole embedded PDF.
+    """Rasterize page `page_num` (1-indexed) and return it as a PNG.
+
+    `source` selects which PDF to render from:
+      - "auto" (default): highlighted PDF if the job has finished writing
+        one, otherwise the original. Used by fence-page cards.
+      - "original": always use the original uploaded PDF. Used by non-fence
+        cards so the user sees the unannotated page.
+      - "highlighted": always use the highlighted PDF (404 if missing).
 
     Renders in a subprocess (with timeout) so a MuPDF crash on a dense
-    vector page doesn't kill the API. DPI defaults to 110 (fast) — matches
-    the "Low-DPI preview" toggle in app_ade_prod.py:2077-2081.
+    vector page doesn't kill the API.
     """
     if dpi < 50 or dpi > 200:
         raise HTTPException(400, "dpi must be between 50 and 200")
+    if source not in ("auto", "original", "highlighted"):
+        raise HTTPException(400, "source must be one of: auto, original, highlighted")
     job = job_registry.get_job(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
     if job["user_id"] != user_id:
         raise HTTPException(403, "Access denied")
 
-    # Prefer the highlighted PDF (with overlays). It's only written at the
-    # very end of run_analysis(), so during a running/queued job we fall
-    # back to the original uploaded PDF — the user can still see the page,
-    # just without the colored boxes yet. Once the job completes the same
-    # endpoint serves the highlighted version automatically.
     hl_path = job_registry.get_highlighted_pdf_path(job_id)
-    src_pdf = hl_path if hl_path is not None else job.get("pdf_path")
+    orig_path = job.get("pdf_path")
+    if source == "original":
+        src_pdf = orig_path
+        is_highlighted = False
+    elif source == "highlighted":
+        src_pdf = hl_path
+        is_highlighted = src_pdf is not None
+    else:  # "auto" — prefer highlighted, fall back to original
+        src_pdf = hl_path if hl_path is not None else orig_path
+        is_highlighted = hl_path is not None
+
     if not src_pdf or not Path(src_pdf).exists():
         raise HTTPException(
             404,
-            "Source PDF not available — try again once upload finishes",
+            f"PDF not available for source={source!r}"
+            + (" — try again once upload finishes" if source == "auto" else ""),
         )
 
     import subprocess
@@ -675,7 +687,6 @@ async def get_page_image(
         )
         raise HTTPException(500, f"Page render failed: {err}")
 
-    is_highlighted = hl_path is not None
     return Response(
         content=proc.stdout,
         media_type="image/png",
