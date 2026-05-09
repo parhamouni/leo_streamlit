@@ -337,6 +337,8 @@ def run_analysis(
 
             if pages_needing_ocr:
                 batch_size = cfg.OCR_BATCH_SIZE
+                total_ocr = max(len(pages_needing_ocr), 1)
+                processed_ocr = 0
                 for batch_start in range(0, len(pages_needing_ocr), batch_size):
                     batch = pages_needing_ocr[batch_start:batch_start + batch_size]
                     try:
@@ -362,6 +364,13 @@ def run_analysis(
                             fence_cache.put("phase1b_v2", pdf_hash, params,
                                            {"ocr_text": text, "lines": lines},
                                            page_idx=pi, user_scope=cache_scope)
+                        processed_ocr += len(batch)
+                        # Phase 1b spans 18% → 30% on the overall bar.
+                        # Bump per batch so the user sees movement during
+                        # Google DocAI work.
+                        pct = 18 + int(12 * processed_ocr / total_ocr)
+                        progress("phase1b", pct,
+                                 f"Phase 1b: OCR {processed_ocr}/{total_ocr} pages")
                     except Exception as e:
                         log.warning(f"Phase 1b batch OCR failed: {e}")
                         for pi in batch:
@@ -603,6 +612,8 @@ def run_analysis(
                 with ThreadPoolExecutor(max_workers=cfg.WORKERS_PHASE2) as pool:
                     futures = {pool.submit(_ade_single_page, pi): pi
                                for pi in pages_needing_ade}
+                    completed = 0
+                    total = max(len(pages_needing_ade), 1)
                     for fut in as_completed(futures):
                         try:
                             pi, chunks = fut.result(timeout=120)
@@ -611,6 +622,30 @@ def run_analysis(
                             pi = futures[fut]
                             log.warning(f"Phase 2 ADE future {pi}: {e}")
                             ade_chunks_by_page[pi] = []
+                        completed += 1
+                        # Phase 2 spans 48% → 60% on the overall bar.
+                        # Interpolate so the dashboard sees movement
+                        # instead of a 12-min freeze between Phase 1c
+                        # and Phase 3.
+                        pct = 48 + int(12 * completed / total)
+                        progress("phase2", pct,
+                                 f"Phase 2: {completed}/{total} pages")
+                        # Also emit a page_cb stub so the per-page ticker
+                        # on the detail page shows the page transitioning
+                        # through Phase 2. Phase 3 will overwrite with
+                        # the rich payload.
+                        try:
+                            emit_page({
+                                "page_number": pi + 1,
+                                "is_fence_page": True,
+                                "result_json": {
+                                    "page_idx": pi,
+                                    "page_num": pi + 1,
+                                    "phase": "phase2",
+                                },
+                            })
+                        except Exception:
+                            log.exception(f"page_cb (phase2 pi={pi}) failed")
 
         timings["phase2"] = time.perf_counter() - t2
         progress("phase2", 60, f"Phase 2 done ({timings['phase2']:.1f}s)")
