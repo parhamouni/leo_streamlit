@@ -89,19 +89,46 @@ def _extract_one(doc, page_idx: int) -> dict:
 
 
 def _extract_one_phase1a(doc, page_idx: int) -> dict:
-    """Phase 1a payload: plain page text + page dimensions.
+    """Phase 1a payload: plain page text + page dimensions, AND a
+    comprehensive damage probe in the same subprocess pass.
 
-    Same contract as _extract_one (probe-then-extract, returns ok+error
-    on damaged pages) but tailored to what pipeline.py's Phase 1a needs.
+    Beyond capturing text + dims, this also exercises every other
+    MuPDF call later phases will perform — get_text("words"),
+    get_text("dict"), get_drawings() — and discards their results.
+    Each is a separate MuPDF C-level code path that can hit a recovery
+    loop on a different damage class than get_text("text") catches; a
+    page that survives "text" extraction can still hang Phase 3 on
+    "words" or get_drawings(). By probing all of them here, in this
+    subprocess (whose SIGKILL hard-stop already protects against
+    hangs), we guarantee that any page reported ok=True is safe for
+    every later phase to touch in-process. broken_pages then filters
+    the rest out cleanly via existing `if pi in broken_pages: continue`
+    guards.
+
     Kept separate from _extract_one so the legacy line-extraction
     callers (app_ade_prod) keep their exact response shape.
+
+    `get_pixmap()` is deliberately NOT exercised — it's heavy and only
+    used by verify_scale_with_bar_fast on a non-critical path. Add it
+    if a future hang is traced there.
     """
     ok, reason = _page_health_probe(doc, page_idx)
     if not ok:
         return {"page_idx": page_idx, "ok": False, "error": f"damaged: {reason}"}
+    op = ""
     try:
         page = doc[page_idx]
+        op = "get_text(text)"
         text = page.get_text("text") or ""
+        # Probe-only ops below — discard results, just verify they don't
+        # throw or get SIGKILL'd. Order matches frequency-of-failure.
+        op = "get_text(words)"
+        _ = page.get_text("words")
+        op = "get_text(dict)"
+        _ = page.get_text("dict")
+        op = "get_drawings"
+        _ = page.get_drawings()
+        op = "dims"
         rect = page.rect
         return {
             "page_idx": page_idx,
@@ -114,59 +141,19 @@ def _extract_one_phase1a(doc, page_idx: int) -> dict:
             },
         }
     except Exception as e:
-        return {"page_idx": page_idx, "ok": False, "error": f"extract failed: {e}"}
-
-
-def _damage_probe_one(doc, page_idx: int) -> dict:
-    """Comprehensive damage probe — exercises every MuPDF call later
-    pipeline phases will perform. ok=True only if every operation
-    completes; otherwise ok=False with the failing operation in `error`.
-
-    Subtly-damaged pages can pass the cheap dim/contents probe but trip
-    `get_text("words")`, `get_text("dict")`, or `get_drawings()` —
-    different MuPDF code paths than `get_text("text")`. Once the parent
-    filters those pages out before Phase 1a, the rest of the pipeline
-    can run them concurrently with no subprocess overhead.
-
-    `get_pixmap()` is deliberately NOT exercised — it's heavy and only
-    used by verify_scale_with_bar_fast on a non-critical path. Add it
-    if a future hang is traced there.
-    """
-    ok, reason = _page_health_probe(doc, page_idx)
-    if not ok:
-        return {"page_idx": page_idx, "ok": False, "error": f"damaged: {reason}"}
-    page = doc[page_idx]
-    op = ""
-    try:
-        op = "mediabox"
-        _ = page.mediabox.width, page.mediabox.height
-        op = "rotation"
-        _ = page.rotation
-        op = "get_text(text)"
-        _ = page.get_text("text")
-        op = "get_text(words)"
-        _ = page.get_text("words")
-        op = "get_text(dict)"
-        _ = page.get_text("dict")
-        op = "get_drawings"
-        _ = page.get_drawings()
-        return {"page_idx": page_idx, "ok": True}
-    except Exception as e:
         return {"page_idx": page_idx, "ok": False,
-                "error": f"probe {op} failed: {e}"}
+                "error": f"{op} failed: {e}"}
 
 
 def main() -> int:
     """Usage forms:
-        page_extractor.py PDF_PATH PAGE_INDEX                       (single page, legacy)
-        page_extractor.py PDF_PATH --pages 3,5,7,9,11               (batch, line extraction)
-        page_extractor.py PDF_PATH --phase1a-batch 3,5,7,9          (batch, text+dims)
-        page_extractor.py PDF_PATH --damage-probe-batch 3,5,7,9     (batch, health probe only)
+        page_extractor.py PDF_PATH PAGE_INDEX                  (single page, legacy)
+        page_extractor.py PDF_PATH --pages 3,5,7,9,11          (batch, line extraction)
+        page_extractor.py PDF_PATH --phase1a-batch 3,5,7,9     (batch, text+dims+broader-probe)
 
     Legacy output (single-page): {"ok": bool, "lines": [...]} or {"ok": false, "error": ...}
-    --pages output:               streams {"page_result": {..., "lines": [...]}} per page, then {"done": true}
-    --phase1a-batch output:       streams {"page_result": {..., "text": "...", "dims": {...}}} per page, then {"done": true}
-    --damage-probe-batch output:  streams {"page_result": {"page_idx": N, "ok": bool, "error": "..."}} per page, then {"done": true}
+    --pages output:        streams {"page_result": {..., "lines": [...]}} per page, then {"done": true}
+    --phase1a-batch output: streams {"page_result": {..., "text": "...", "dims": {...}}} per page, then {"done": true}
 
     The streaming forms exist so the parent can recover any pages that
     finished before a SIGKILL'd subprocess (e.g. on MuPDF C-level hang)
@@ -177,22 +164,18 @@ def main() -> int:
         sys.stdout.write(json.dumps({"ok": False,
                                      "error": "usage: page_extractor.py PDF_PATH PAGE_INDEX "
                                               "| PDF_PATH --pages N,N,N "
-                                              "| PDF_PATH --phase1a-batch N,N,N "
-                                              "| PDF_PATH --damage-probe-batch N,N,N"}))
+                                              "| PDF_PATH --phase1a-batch N,N,N"}))
         return 2
     pdf_path = args[0]
 
     # Parse mode + page indices.
-    batch_mode = None  # None = legacy single, "lines" = --pages, "phase1a" = --phase1a-batch, "probe" = --damage-probe-batch
+    batch_mode = None  # None = legacy single, "lines" = --pages, "phase1a" = --phase1a-batch
     page_indices = []
     if args[1] == "--pages" and len(args) >= 3:
         batch_mode = "lines"
         list_str = args[2]
     elif args[1] == "--phase1a-batch" and len(args) >= 3:
         batch_mode = "phase1a"
-        list_str = args[2]
-    elif args[1] == "--damage-probe-batch" and len(args) >= 3:
-        batch_mode = "probe"
         list_str = args[2]
     else:
         try:
@@ -218,12 +201,7 @@ def main() -> int:
 
     try:
         if batch_mode is not None:
-            if batch_mode == "lines":
-                extractor = _extract_one
-            elif batch_mode == "phase1a":
-                extractor = _extract_one_phase1a
-            else:
-                extractor = _damage_probe_one
+            extractor = _extract_one if batch_mode == "lines" else _extract_one_phase1a
             for pi in page_indices:
                 r = extractor(doc, pi)
                 sys.stdout.write(json.dumps({"page_result": r}) + "\n")

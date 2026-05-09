@@ -261,107 +261,6 @@ def _phase1a_extract_one(pdf_path: str, page_idx: int, timeout_s: float) -> dict
             f"worker produced no page_result (rc={proc.returncode}): {(proc.stderr or '')[:200]}"}
 
 
-def _damage_probe_one(pdf_path: str, page_idx: int, timeout_s: float) -> dict:
-    """Single-page comprehensive damage probe in a subprocess.
-
-    Returns:
-        {"ok": True} when every MuPDF call later phases need succeeds
-        {"ok": False, "error": str} on probe failure / timeout / damage
-
-    Always returns within ~timeout_s + a small overhead, regardless of
-    what MuPDF does internally — same SIGKILL escape-hatch as Phase 1a.
-    """
-    if not os.path.exists(pdf_path):
-        return {"ok": False, "error": "PDF disk file missing"}
-    try:
-        proc = subprocess.run(
-            [sys.executable, _PAGE_EXTRACTOR_SCRIPT, pdf_path,
-             "--damage-probe-batch", str(page_idx)],
-            capture_output=True, text=True, timeout=timeout_s,
-        )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error":
-                f"damage probe exceeded {timeout_s}s — MuPDF recovery loop on damaged page"}
-    except Exception as e:
-        return {"ok": False, "error": f"subprocess launch failed: {e}"}
-    for line in (proc.stdout or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
-        pr = obj.get("page_result")
-        if pr and pr.get("page_idx") == page_idx:
-            if pr.get("ok"):
-                return {"ok": True}
-            return {"ok": False, "error": pr.get("error", "probe failed")}
-    return {"ok": False, "error":
-            f"worker produced no page_result (rc={proc.returncode}): {(proc.stderr or '')[:200]}"}
-
-
-def _damage_probe_batch(pdf_path: str, page_indices: list[int],
-                        per_page_timeout_s: float) -> dict[int, dict]:
-    """Batch comprehensive damage probe. Returns {page_idx: result_dict}
-    for pages the subprocess reported on; missing entries mean the
-    subprocess hung on that page (caller should retry per-page).
-
-    Mirrors `_phase1a_extract_batch`: subprocess streams one JSON line
-    per page so partial progress survives a SIGKILL on a later hung
-    page. Result dicts have the same shape as `_damage_probe_one`.
-    """
-    if not os.path.exists(pdf_path) or not page_indices:
-        return {}
-    pages_csv = ",".join(str(pi) for pi in page_indices)
-    batch_timeout = 3 + per_page_timeout_s * len(page_indices)
-    proc = subprocess.Popen(
-        [sys.executable, _PAGE_EXTRACTOR_SCRIPT, pdf_path,
-         "--damage-probe-batch", pages_csv],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
-    collected: dict[int, dict] = {}
-
-    import threading
-
-    def _drain():
-        try:
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                pr = obj.get("page_result")
-                if pr and pr.get("page_idx") is not None:
-                    pi = pr["page_idx"]
-                    if pr.get("ok"):
-                        collected[pi] = {"ok": True}
-                    else:
-                        collected[pi] = {"ok": False,
-                                         "error": pr.get("error", "probe failed")}
-        except Exception:
-            pass
-
-    drain_thread = threading.Thread(target=_drain, daemon=True)
-    drain_thread.start()
-    try:
-        proc.wait(timeout=batch_timeout)
-    except subprocess.TimeoutExpired:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            pass
-    drain_thread.join(timeout=1)
-    return collected
-
-
 def _phase1a_extract_batch(pdf_path: str, page_indices: list[int],
                            per_page_timeout_s: float) -> dict[int, dict]:
     """Batch Phase 1a extraction. Returns {page_idx: result_dict} for
@@ -464,54 +363,28 @@ def run_analysis(
         total_pages = doc.page_count
         result.total_pages = total_pages
 
-        # Comprehensive upfront damage probe: run every MuPDF call later
-        # phases will perform, in a subprocess, with SIGKILL on timeout.
-        # Pages that fail are filtered out at the source — Phase 1a/2/3
-        # then run their full concurrency without any per-call subprocess
-        # overhead, because every page they see is guaranteed safe.
+        # No separate upfront damage-probe pass. Phase 1a's subprocess
+        # already exercises every MuPDF call later phases need
+        # (get_text "text"/"words"/"dict", get_drawings, dims) under
+        # SIGKILL-on-timeout — see _extract_one_phase1a in
+        # ops/page_extractor.py. Pages where any of those throw or
+        # hang get marked damaged in the same single pass and added to
+        # broken_pages below; downstream guards filter them out.
         broken_pages: set[int] = set()
-        all_indices = list(range(total_pages))
-        probe_batches = [
-            all_indices[i:i + _PHASE1A_BATCH_SIZE]
-            for i in range(0, total_pages, _PHASE1A_BATCH_SIZE)
-        ]
-        probed = 0
-        for batch in probe_batches:
-            results = _damage_probe_batch(
-                pdf_path_str, batch, _PHASE1A_PAGE_TIMEOUT
-            )
-            missing = [pi for pi in batch if pi not in results]
-            for pi in missing:
-                results[pi] = _damage_probe_one(
-                    pdf_path_str, pi, _PHASE1A_PAGE_TIMEOUT
-                )
-            for pi in batch:
-                r = results.get(pi) or {"ok": False, "error": "no result"}
-                if not r.get("ok"):
-                    log.warning(
-                        f"Damage probe page {pi}: {r.get('error')} — "
-                        f"marking damaged and skipping"
-                    )
-                    broken_pages.add(pi)
-            probed += len(batch)
-            # Probe spans 2% → 5% on the overall bar so the dashboard
-            # shows movement during long upfront scans.
-            pct = 2 + int(3 * probed / max(total_pages, 1))
-            progress("init", pct,
-                     f"Probing pages for damage… {probed}/{total_pages}")
+        valid_pages = list(range(total_pages))
 
-        valid_pages = [i for i in range(total_pages) if i not in broken_pages]
-        if not valid_pages:
-            result.error = "No readable pages found in PDF"
-            return result
-
-        progress("init", 5, f"PDF loaded: {total_pages} pages ({len(broken_pages)} damaged)")
+        progress("init", 5, f"PDF loaded: {total_pages} pages")
 
         # ---- Phase 1a: Native text extraction ----
         t1a = time.perf_counter()
         progress("phase1a", 8, "Phase 1a: Extracting native text...")
 
-        cached_1a = fence_cache.get("phase1a", pdf_hash, params, user_scope=cache_scope)
+        # Cache key bumped to phase1a_v2 with the broader-probe rollout:
+        # old entries were built when Phase 1a only proved get_text("text")
+        # was safe, so a hit could let a get_drawings()-damaged page slip
+        # through to Phase 3. v2 entries are written only after every
+        # probe op succeeds in _extract_one_phase1a.
+        cached_1a = fence_cache.get("phase1a_v2", pdf_hash, params, user_scope=cache_scope)
         if cached_1a:
             page_texts = cached_1a.get("page_texts", {})
             page_dims = cached_1a.get("page_dims", {})
@@ -557,7 +430,7 @@ def run_analysis(
                 "page_texts": page_texts,
                 "page_dims": page_dims,
             }
-            fence_cache.put("phase1a", pdf_hash, params, cache_data, user_scope=cache_scope)
+            fence_cache.put("phase1a_v2", pdf_hash, params, cache_data, user_scope=cache_scope)
 
         timings["phase1a"] = time.perf_counter() - t1a
         progress("phase1a", 15, f"Phase 1a done ({timings['phase1a']:.1f}s)")
