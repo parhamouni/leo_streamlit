@@ -62,19 +62,35 @@ def pool() -> ConnectionPool:
             if _pool is None:
                 _pool = ConnectionPool(
                     conninfo=_database_url(),
-                    min_size=1,
-                    max_size=8,
+                    # Pool was exhausting at max_size=8 under realistic
+                    # load: 1 pipeline worker doing rapid per-page
+                    # upserts during Phase 3 + 3 Vercel edge IPs polling
+                    # /api/documents and /pages every 3 s. Each conn
+                    # round-trip also runs the `check` callback's
+                    # SELECT 1, adding latency. Bumped to 20 — Supabase
+                    # session-mode pooler allows up to 60 connections
+                    # on free tier, plenty of headroom.
+                    min_size=2,
+                    max_size=20,
                     kwargs={"row_factory": dict_row},
                     # Run `check` on each getconn() to detect stale conns.
                     check=_check_connection,
-                    # Recycle connections every 30 min so a slow leak in
-                    # the upstream pooler doesn't accumulate forever.
-                    max_lifetime=1800,
-                    # If a connection sits idle 10 min, prefer to close it.
-                    max_idle=600,
+                    # Recycle connections every 15 min so slow drift in
+                    # the upstream pooler doesn't accumulate, AND so the
+                    # check doesn't repeatedly re-validate the same
+                    # already-flaky socket.
+                    max_lifetime=900,
+                    # If a connection sits idle 5 min, close it. Reduces
+                    # the chance of NAT-timed-out sockets piling up in
+                    # the pool.
+                    max_idle=300,
+                    # When all conns are busy, fail fast at 5 s instead
+                    # of waiting 30 s — clients can retry sooner and we
+                    # spot the issue in logs immediately.
+                    timeout=5,
                     open=True,
                 )
-                log.info("Postgres pool opened (with check-on-getconn)")
+                log.info("Postgres pool opened (max_size=20, check-on-getconn)")
     return _pool
 
 
