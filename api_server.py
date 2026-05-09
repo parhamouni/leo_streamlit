@@ -1987,8 +1987,40 @@ async def me(user_id: str = Depends(require_supabase_jwt)):
     return {"user_id": user_id}
 
 
+def _slim_page_result(row: dict) -> dict:
+    """Strip the heaviest arrays from `result_json` before sending to the
+    frontend. The dashboard's live "Pages so far" ticker only needs
+    summary metrics; the line-level arrays balloon /pages responses to
+    8-12 MB and block the event loop while psycopg streams them.
+    Pages with full detail are still available via
+    `/api/jobs/{id}/results?full=1` when the user opens the document.
+    """
+    rj = row.get("result_json")
+    if not isinstance(rj, dict):
+        return row
+    # Don't mutate the caller's dict.
+    rj_slim = dict(rj)
+    measurements = rj_slim.get("measurements")
+    if isinstance(measurements, dict):
+        m_slim = dict(measurements)
+        # `all_fence_lines` is the dominant size — thousands of {start,end,
+        # length_pts,layer} dicts per dense page.
+        m_slim.pop("all_fence_lines", None)
+        m_slim.pop("layer_measurements", None)
+        rj_slim["measurements"] = m_slim
+    # Keep `legend_entries` (needed for chips) but drop these heavy ones:
+    rj_slim.pop("keyword_matches", None)
+    rj_slim.pop("ade_chunks", None)
+    return {**row, "result_json": rj_slim}
+
+
+# NOTE: these three routes are *sync* (def, not async def). They call into
+# psycopg synchronously, which would block the asyncio event loop when
+# declared async — every other request (including /api/healthz) queues
+# behind a slow query. FastAPI dispatches sync handlers to a worker
+# thread-pool (via anyio), so the event loop stays free.
 @app.get("/api/documents")
-async def list_documents(user_id: str = Depends(require_supabase_jwt)):
+def list_documents(user_id: str = Depends(require_supabase_jwt)):
     """List the user's uploaded documents (from Postgres mirror).
 
     Each row includes the latest job's status/progress for dashboard rendering.
@@ -1999,7 +2031,7 @@ async def list_documents(user_id: str = Depends(require_supabase_jwt)):
 
 
 @app.get("/api/documents/{document_id}")
-async def get_document(
+def get_document(
     document_id: str,
     user_id: str = Depends(require_supabase_jwt),
 ):
@@ -2013,18 +2045,27 @@ async def get_document(
 
 
 @app.get("/api/documents/{document_id}/pages")
-async def list_document_pages(
+def list_document_pages(
     document_id: str,
     user_id: str = Depends(require_supabase_jwt),
+    slim: bool = True,
 ):
     """Stream per-page results as the worker writes them. Used by the detail
-    page to render pages incrementally while a job runs (Sprint 2 / A7)."""
+    page to render pages incrementally while a job runs (Sprint 2 / A7).
+
+    `slim=true` (default) drops heavy line-level arrays from result_json
+    so the response stays small enough that polling every 3 s doesn't
+    saturate the network or block other requests.
+    """
     if not _is_uuid(document_id):
         raise HTTPException(400, "document_id must be a UUID")
     # Confirm ownership before listing — prevents existence-leak via empty []
     if db.get_document(document_id, user_id) is None:
         raise HTTPException(404, "Document not found")
-    return {"pages": db.list_page_results(document_id, user_id)}
+    rows = db.list_page_results(document_id, user_id)
+    if slim:
+        rows = [_slim_page_result(r) for r in rows]
+    return {"pages": rows}
 
 
 @app.get("/api/healthz")
