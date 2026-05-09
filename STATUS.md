@@ -7,7 +7,7 @@
 **Plan file:** `/home/ubuntu/.claude/plans/yes-i-get-you-refactored-hummingbird.md`
 **Stage-1 highlighting plan (now superseded — work below is done):** `/home/ubuntu/.claude/plans/fuck-you-you-are-splendid-beacon.md`
 **Decision log:** UMT confirmed **critical-path** (customers always correct measurements manually).
-**Last updated:** 2026-05-09 — **🚀 LIVE in staging: full end-to-end deploy.** Vercel frontend at https://leo-streamlit.vercel.app, AWS backend at `3.144.148.83` (no TLS — Vercel rewrite proxy bridges HTTPS browser ↔ HTTP backend). Sprint 4 UMT complete (4a.5 drawing, 4a.6 zoom+pan+wheel-zoom, 4a.7 C8 summary, 4a.8 exports honor UMT edits). UX bonuses: per-line popover, layer highlight + per-layer dropdown, 🎯 smart auto-assign, indicator-code dedup, /tmp eviction fallbacks, classifier-reasoning persistence, page-image misalignment fix. Phase 10.1: 19 cross-user authorization tests, 54/54 suite green. Phase 11 shipped: `fence-api-v2.service` on port 8513 (legacy `fence-api`/`fence-fast`/`stale-restart`/`watchdog` disabled), nginx as default_server on :80, Supabase JWT auth, Postgres pooler, worker tuning (`FENCE_WORKERS_PHASE3=8`, `MemoryMax=32G`). **Next:** comprehensive upfront damaged-page detection (see "Open issue: damaged-page hang in Phase 3" below — handoff doc at `.claude/plans/damaged-page-handling.md`), then Phase 10.2 (upload limits + metadata logging) and final-cutover obligations (TLS via real domain, secret rotation, S3 storage migration).
+**Last updated:** 2026-05-09 — **🚀 LIVE in staging: full end-to-end deploy.** Vercel frontend at https://leo-streamlit.vercel.app, AWS backend at `3.144.148.83` (no TLS — Vercel rewrite proxy bridges HTTPS browser ↔ HTTP backend). Sprint 4 UMT complete (4a.5 drawing, 4a.6 zoom+pan+wheel-zoom, 4a.7 C8 summary, 4a.8 exports honor UMT edits). UX bonuses: per-line popover, layer highlight + per-layer dropdown, 🎯 smart auto-assign, indicator-code dedup, /tmp eviction fallbacks, classifier-reasoning persistence, page-image misalignment fix. Phase 10.1: 19 cross-user authorization tests, 61/61 suite green. Phase 11 shipped: `fence-api-v2.service` on port 8513 (legacy `fence-api`/`fence-fast`/`stale-restart`/`watchdog` disabled), nginx as default_server on :80, Supabase JWT auth, Postgres pooler, worker tuning (`FENCE_WORKERS_PHASE3=8`, `MemoryMax=32G`). **Damaged-page hang resolved (`df199cd`)**: comprehensive upfront probe replaces today's whack-a-mole subprocess wrappers — Phase 3 inline call restored, `FENCE_API_WORKER_COUNT` back to 2. **Next:** Phase 10.2 (upload limits + metadata logging) and final-cutover obligations (TLS via real domain, secret rotation, S3 storage migration).
 
 ### 2026-05-09 afternoon session — five fixes shipped, one issue open
 
@@ -18,26 +18,28 @@
 | DB connection-leak fix: explicit `conn.close()` on `_check_connection` failure + `_LeakSafePool.putconn` to close UNKNOWN-status conns. Fixes the 15-session leak that wedged Supabase pooler. 4 mock-driven tests in `tests/test_db_leak_safe.py`. | [`827ea17`](https://github.com/parhamouni/leo_streamlit/commit/827ea17) | Live on `main` |
 | Auto-clear done uploads from the queue widget (1 s flash then vanish; failed/cancelled persist) | [`3b94942`](https://github.com/parhamouni/leo_streamlit/commit/3b94942) | Live on `main` |
 | **Local-Postgres adapter migrations** — `000_local_pre.sql` (auth schema stub + pgcrypto) + `999_local_post.sql` (`auth.users` lazy-create trigger). Lets vanilla Postgres host the operational data while Supabase keeps owning auth. | [`6a3206b`](https://github.com/parhamouni/leo_streamlit/commit/6a3206b) | Live on `main` |
-| Phase 3 partial subprocess fix — `_phase3_extract_lines` for `get_native_pdf_lines` only | [`163afb5`](https://github.com/parhamouni/leo_streamlit/commit/163afb5) | Live on `main` (insufficient — see below) |
+| Phase 3 partial subprocess fix — `_phase3_extract_lines` for `get_native_pdf_lines` only | [`163afb5`](https://github.com/parhamouni/leo_streamlit/commit/163afb5) | **Reverted** by `df199cd` once comprehensive probe landed |
+| **Comprehensive upfront damage probe** — `--damage-probe-batch` in `ops/page_extractor.py` + `_damage_probe_one`/`_damage_probe_batch` in `pipeline.py`. One subprocess per page exercises every MuPDF call later phases will perform; damaged pages filtered out before Phase 1a. Replaces the cheap `rect.width` probe and reverts today's `_phase3_extract_lines` mitigation. 7 new tests; suite 61/61. | [`df199cd`](https://github.com/parhamouni/leo_streamlit/commit/df199cd) | Live on `main` |
 
 **Infra changes applied directly to EC2 (not in git)**:
 - Switched `DATABASE_URL` from Supabase pooler to local Postgres 16 (`postgresql://fence_api@127.0.0.1:5432/fence_api`). Supabase usage limits + cross-region latency were causing 500s and dashboard hangs. Auth still uses Supabase (JWKS verification only — no DB calls). Old env file backed up at `/etc/fence-api-v2/env.bak.20260509-162630`.
-- Dropped `FENCE_API_WORKER_COUNT` from 2 → 1 to mitigate Phase 3 GIL-starvation (see below). Backup at `/etc/fence-api-v2/env.bak.worker-count.20260509-…`.
+- ~~Dropped `FENCE_API_WORKER_COUNT` from 2 → 1 to mitigate Phase 3 GIL-starvation~~ — **reverted to 2** once `df199cd` shipped the upfront damage probe. Backup at `/etc/fence-api-v2/env.bak.worker-count.20260509-…`.
 - Local Postgres 16 installed via `apt`; migrations `000_local_pre.sql` → 001-004 → `999_local_post.sql` applied to fresh DB.
 - DB password generated with `openssl rand -hex 24`, lives in `/etc/fence-api-v2/env` only. Temp copy at `/tmp/.fence-db-pass` — **rotate / move to 1Password before tearing this temp file down**.
 
-### Open issue: damaged-page hang in Phase 3 (handoff doc: `.claude/plans/damaged-page-handling.md`)
+### Damaged-page hang in Phase 3 — RESOLVED 2026-05-09 (commit `df199cd`)
 
-**Symptom**: when two jobs ran Phase 3 simultaneously (max_concurrent=2), one fence-page worker got stuck inside PyMuPDF's C-level recovery loop on a damaged page, holding the GIL for 12+ minutes. The Postgres I/O thread (which needs the GIL only briefly) couldn't read 40 bytes of COMMIT response sitting in our recv buffer; HTTP handlers blocked too. Dashboard stuck at "Loading documents…" until the worker was forcibly killed.
+**Original symptom**: when two jobs ran Phase 3 simultaneously (max_concurrent=2), one fence-page worker got stuck inside PyMuPDF's C-level recovery loop on a damaged page, holding the GIL for 12+ minutes. The Postgres I/O thread (which needs the GIL only briefly) couldn't read 40 bytes of COMMIT response sitting in our recv buffer; HTTP handlers blocked too. Dashboard stuck at "Loading documents…" until the worker was forcibly killed.
 
 **Root cause**: Phase 1a's subprocess isolation only probes `get_text("text")`. Phase 3 calls `get_text("words")`, `get_text("dict")`, `get_drawings()`, and `extract_vector_lines()` — *different* MuPDF code paths that can hang on a different damage class than what Phase 1a catches.
 
-**Today's mitigation (not a real fix)**:
-- Subprocessed the one specific hot call py-spy caught (`get_native_pdf_lines` at [pipeline.py:820](pipeline.py#L820)) — `_phase3_extract_lines`.
-- Dropped `FENCE_API_WORKER_COUNT` to 1, halving cumulative GIL contention.
-- Three inline fitz calls in Phase 3 remain unprotected ([pipeline.py:916, 958, 980](pipeline.py)). A single damaged page on a single job could still hang.
+**Fix shipped (`df199cd`)**: comprehensive upfront damage probe — one subprocess per page, run *before* Phase 1a, exercises every MuPDF call later phases will perform (`get_text("text"|"words"|"dict")`, `get_drawings()`, mediabox/rotation). Pages that timeout/throw go into `broken_pages` and are filtered out by the existing `if pi in broken_pages: continue` guards in every later phase. New `--damage-probe-batch` mode in `ops/page_extractor.py` mirrors the `--phase1a-batch` protocol. The Phase 3 `_phase3_extract_lines` mitigation was reverted; the inline `pdf_lines = ade.get_native_pdf_lines(doc[pi])` call is back. Pre-1a probe spans 2% → 5% on the overall progress bar.
 
-**Proper fix (next session)**: comprehensive upfront damage probe — one subprocess per page, run *before* Phase 1a, exercises every MuPDF operation any later phase will perform. Pages that timeout/throw go into `broken_pages` and are filtered from every subsequent phase. Once that's in, the Phase 3 inline subprocess wrapper can be **reverted** and `FENCE_API_WORKER_COUNT` can be **restored to 2**. Full design + implementation steps in [.claude/plans/damaged-page-handling.md](.claude/plans/damaged-page-handling.md).
+**Mitigations reverted with this fix**:
+- Phase 3 inline `_phase3_extract_lines` subprocess wrapper deleted.
+- `FENCE_API_WORKER_COUNT=2` restored on EC2 (was temporarily dropped to 1 this afternoon).
+
+**Verification**: full pytest suite 61/61 green (54 prior + 7 new probe tests). Smoke run on `subset_gold/selected_pages_no_annotations.pdf` shows the probe firing at 5%, 0/5 damaged, Phase 3 cached re-run in 0.4s with the inline call working again. Live re-uploads of the two jobs that hung this afternoon (`251124 100%_Lone Mountain Park UPDATE (1).pdf` 179p + `Construction Documents (1).pdf` concurrent) are the validation at scale.
 
 ---
 

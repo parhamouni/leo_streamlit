@@ -261,52 +261,105 @@ def _phase1a_extract_one(pdf_path: str, page_idx: int, timeout_s: float) -> dict
             f"worker produced no page_result (rc={proc.returncode}): {(proc.stderr or '')[:200]}"}
 
 
-def _phase3_extract_lines(pdf_path: str, page_idx: int,
-                          timeout_s: float) -> tuple[list, str | None]:
-    """Subprocess-isolated `get_native_pdf_lines` call for a single
-    fence page. Returns (lines, error_or_None).
+def _damage_probe_one(pdf_path: str, page_idx: int, timeout_s: float) -> dict:
+    """Single-page comprehensive damage probe in a subprocess.
 
-    Same root cause as the Phase 1a hang we already isolated: PyMuPDF's
-    text/line extraction can hold the GIL inside C code on certain
-    pages, starving every other thread in the process — including the
-    Postgres I/O thread that's trying to read a COMMIT response from
-    the local DB. Verified live: 40 bytes from PG sat unread in our
-    recv buffer for 12+ minutes while ThreadPoolExecutor-4 burned the
-    GIL inside `get_native_pdf_lines`. The whole API stopped serving
-    HTTP requests until we forcibly killed the worker.
+    Returns:
+        {"ok": True} when every MuPDF call later phases need succeeds
+        {"ok": False, "error": str} on probe failure / timeout / damage
 
-    Routing the call through ops/page_extractor.py's existing legacy
-    single-page mode means each fence page's heavy fitz call lives in
-    its own OS process — its GIL is irrelevant to ours, and a SIGKILL
-    after `timeout_s` is the hard-stop on damaged pages.
+    Always returns within ~timeout_s + a small overhead, regardless of
+    what MuPDF does internally — same SIGKILL escape-hatch as Phase 1a.
     """
     if not os.path.exists(pdf_path):
-        return [], "PDF disk file missing"
+        return {"ok": False, "error": "PDF disk file missing"}
     try:
         proc = subprocess.run(
-            [sys.executable, _PAGE_EXTRACTOR_SCRIPT, pdf_path, str(page_idx)],
+            [sys.executable, _PAGE_EXTRACTOR_SCRIPT, pdf_path,
+             "--damage-probe-batch", str(page_idx)],
             capture_output=True, text=True, timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
-        return [], (
-            f"page extraction exceeded {timeout_s}s — "
-            f"MuPDF recovery loop on damaged page"
-        )
+        return {"ok": False, "error":
+                f"damage probe exceeded {timeout_s}s — MuPDF recovery loop on damaged page"}
     except Exception as e:
-        return [], f"subprocess launch failed: {e}"
-    if not proc.stdout:
-        return [], (
-            f"worker produced no output (rc={proc.returncode}): "
-            f"{(proc.stderr or '')[:200]}"
-        )
+        return {"ok": False, "error": f"subprocess launch failed: {e}"}
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        pr = obj.get("page_result")
+        if pr and pr.get("page_idx") == page_idx:
+            if pr.get("ok"):
+                return {"ok": True}
+            return {"ok": False, "error": pr.get("error", "probe failed")}
+    return {"ok": False, "error":
+            f"worker produced no page_result (rc={proc.returncode}): {(proc.stderr or '')[:200]}"}
+
+
+def _damage_probe_batch(pdf_path: str, page_indices: list[int],
+                        per_page_timeout_s: float) -> dict[int, dict]:
+    """Batch comprehensive damage probe. Returns {page_idx: result_dict}
+    for pages the subprocess reported on; missing entries mean the
+    subprocess hung on that page (caller should retry per-page).
+
+    Mirrors `_phase1a_extract_batch`: subprocess streams one JSON line
+    per page so partial progress survives a SIGKILL on a later hung
+    page. Result dicts have the same shape as `_damage_probe_one`.
+    """
+    if not os.path.exists(pdf_path) or not page_indices:
+        return {}
+    pages_csv = ",".join(str(pi) for pi in page_indices)
+    batch_timeout = 3 + per_page_timeout_s * len(page_indices)
+    proc = subprocess.Popen(
+        [sys.executable, _PAGE_EXTRACTOR_SCRIPT, pdf_path,
+         "--damage-probe-batch", pages_csv],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    collected: dict[int, dict] = {}
+
+    import threading
+
+    def _drain():
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                pr = obj.get("page_result")
+                if pr and pr.get("page_idx") is not None:
+                    pi = pr["page_idx"]
+                    if pr.get("ok"):
+                        collected[pi] = {"ok": True}
+                    else:
+                        collected[pi] = {"ok": False,
+                                         "error": pr.get("error", "probe failed")}
+        except Exception:
+            pass
+
+    drain_thread = threading.Thread(target=_drain, daemon=True)
+    drain_thread.start()
     try:
-        # Legacy single-page mode emits one JSON object on stdout.
-        obj = json.loads(proc.stdout.strip().splitlines()[-1])
-    except Exception as e:
-        return [], f"could not parse worker output: {e}"
-    if obj.get("ok"):
-        return obj.get("lines", []) or [], None
-    return [], obj.get("error", "extract failed")
+        proc.wait(timeout=batch_timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+    drain_thread.join(timeout=1)
+    return collected
 
 
 def _phase1a_extract_batch(pdf_path: str, page_indices: list[int],
@@ -411,12 +464,41 @@ def run_analysis(
         total_pages = doc.page_count
         result.total_pages = total_pages
 
+        # Comprehensive upfront damage probe: run every MuPDF call later
+        # phases will perform, in a subprocess, with SIGKILL on timeout.
+        # Pages that fail are filtered out at the source — Phase 1a/2/3
+        # then run their full concurrency without any per-call subprocess
+        # overhead, because every page they see is guaranteed safe.
         broken_pages: set[int] = set()
-        for pi in range(total_pages):
-            try:
-                _ = doc[pi].rect.width
-            except Exception:
-                broken_pages.add(pi)
+        all_indices = list(range(total_pages))
+        probe_batches = [
+            all_indices[i:i + _PHASE1A_BATCH_SIZE]
+            for i in range(0, total_pages, _PHASE1A_BATCH_SIZE)
+        ]
+        probed = 0
+        for batch in probe_batches:
+            results = _damage_probe_batch(
+                pdf_path_str, batch, _PHASE1A_PAGE_TIMEOUT
+            )
+            missing = [pi for pi in batch if pi not in results]
+            for pi in missing:
+                results[pi] = _damage_probe_one(
+                    pdf_path_str, pi, _PHASE1A_PAGE_TIMEOUT
+                )
+            for pi in batch:
+                r = results.get(pi) or {"ok": False, "error": "no result"}
+                if not r.get("ok"):
+                    log.warning(
+                        f"Damage probe page {pi}: {r.get('error')} — "
+                        f"marking damaged and skipping"
+                    )
+                    broken_pages.add(pi)
+            probed += len(batch)
+            # Probe spans 2% → 5% on the overall bar so the dashboard
+            # shows movement during long upfront scans.
+            pct = 2 + int(3 * probed / max(total_pages, 1))
+            progress("init", pct,
+                     f"Probing pages for damage… {probed}/{total_pages}")
 
         valid_pages = [i for i in range(total_pages) if i not in broken_pages]
         if not valid_pages:
@@ -864,15 +946,11 @@ def run_analysis(
             # the same geometry source prod uses, so highlights render
             # correctly on scanned pages whose native PDF text is missing
             # or unmappable (CID fonts without ToUnicode CMap).
-            # Subprocess-isolated to avoid GIL starvation under
-            # concurrent Phase 3 workers — see _phase3_extract_lines
-            # for the full rationale. SIGKILL on damaged pages instead
-            # of wedging the whole event loop.
-            pdf_lines, _err = _phase3_extract_lines(
-                pdf_path_str, pi, _PHASE1A_PAGE_TIMEOUT
-            )
-            if _err:
-                log.warning(f"Phase 3 native pdf lines page {pi}: {_err}")
+            try:
+                pdf_lines = ade.get_native_pdf_lines(doc[pi])
+            except Exception as e:
+                log.warning(f"Phase 3 native pdf lines page {pi}: {e}")
+                pdf_lines = []
             ocr_lines = ocr_lines_by_page.get(pi, []) or []
 
             # Legend entries — one dict per legend row, tight bbox around the
