@@ -17,9 +17,27 @@ export class ApiError extends Error {
   }
 }
 
+// Status codes that are usually transient (Postgres pool timeout under
+// burst load, momentary upstream blip, Vercel cold start, etc.) — worth
+// silently retrying once or twice before surfacing the error to the user.
+// 500/502/503/504 fit that profile; 4xx do not (those are real client
+// errors and we don't want to mask them).
+const TRANSIENT_STATUSES = new Set([500, 502, 503, 504]);
+const RETRY_METHODS = new Set(["GET", "HEAD"]);
+
+function sleep(ms: number) {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
 /**
  * Fetch wrapper that auto-attaches the current Supabase access token as
  * `Authorization: Bearer …`. Throws ApiError on non-2xx.
+ *
+ * For idempotent reads (GET/HEAD) it transparently retries on 5xx with
+ * exponential backoff (300 ms, 800 ms, 2 s = 4 attempts total). The
+ * backend's Postgres pool sometimes 500s under burst load and recovers
+ * within a second; without retries the dashboard would flash a scary
+ * "API 500: Internal Server Error" banner during normal operation.
  */
 export async function apiFetch(
   path: string,
@@ -34,20 +52,33 @@ export async function apiFetch(
   }
 
   const url = path.startsWith("http") ? path : `${apiBase}${path}`;
-  const resp = await fetch(url, { ...init, headers });
+  const method = (init.method ?? "GET").toUpperCase();
+  const canRetry = RETRY_METHODS.has(method);
+  const backoffsMs = canRetry ? [300, 800, 2000] : [];
 
-  if (!resp.ok) {
-    let body: unknown = null;
-    try {
-      body = await resp.clone().json();
-    } catch {
-      try {
-        body = await resp.clone().text();
-      } catch {}
+  let lastResp: Response | null = null;
+  for (let attempt = 0; attempt <= backoffsMs.length; attempt++) {
+    const resp = await fetch(url, { ...init, headers });
+    if (resp.ok) return resp;
+    lastResp = resp;
+    if (!canRetry || !TRANSIENT_STATUSES.has(resp.status)) break;
+    if (attempt < backoffsMs.length) {
+      await sleep(backoffsMs[attempt]);
+      continue;
     }
-    throw new ApiError(resp.status, body, `API ${resp.status} for ${path}`);
   }
-  return resp;
+
+  // Out of retries — surface the most recent error.
+  const resp = lastResp!;
+  let body: unknown = null;
+  try {
+    body = await resp.clone().json();
+  } catch {
+    try {
+      body = await resp.clone().text();
+    } catch {}
+  }
+  throw new ApiError(resp.status, body, `API ${resp.status} for ${path}`);
 }
 
 export async function apiJson<T = unknown>(

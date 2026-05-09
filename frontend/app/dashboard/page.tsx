@@ -75,21 +75,25 @@ function ProgressCell({
     const pct = doc.progress_percent ?? 0;
     const eta = formatEta(etaSeconds(doc.job_started_at, pct));
     return (
-      <div className="flex items-center gap-2 justify-end">
-        <div className="w-24 h-1.5 bg-gray-200 rounded overflow-hidden">
-          <div
-            className="h-full bg-blue-500 transition-all duration-700 ease-out"
-            style={{ width: `${pct}%` }}
-          />
-        </div>
-        <span className="text-xs text-gray-500 font-mono w-9 text-right">
-          {pct}%
-        </span>
-        {eta && (
-          <span className="text-[10px] text-gray-400 font-mono w-12 text-right">
-            {eta}
+      // Left column = progress indicator (sits directly under the
+      // "Progress" header). Right column = Cancel button.
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="w-24 h-1.5 bg-gray-200 rounded overflow-hidden shrink-0">
+            <div
+              className="h-full bg-blue-500 transition-all duration-700 ease-out"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          <span className="text-xs text-gray-500 font-mono w-9 text-right">
+            {pct}%
           </span>
-        )}
+          {eta && (
+            <span className="text-[10px] text-gray-400 font-mono w-12 text-right">
+              {eta}
+            </span>
+          )}
+        </div>
         <button
           type="button"
           onClick={(e) => {
@@ -97,7 +101,7 @@ function ProgressCell({
             e.preventDefault();
             onCancel();
           }}
-          className="text-xs text-yellow-700 hover:underline ml-1"
+          className="text-xs text-yellow-700 hover:underline shrink-0"
           title="Stop this job"
         >
           Cancel
@@ -105,8 +109,8 @@ function ProgressCell({
       </div>
     );
   }
-  // Terminal states: status word inline with the Delete button so
-  // there isn't a giant empty gap between "done" and "Delete" anymore.
+  // Terminal states: status on the left (under "Progress" header),
+  // Delete on the right (matches Cancel's position on running rows).
   const statusEl =
     doc.job_status === "completed" ? (
       <span className="text-xs text-green-700">done</span>
@@ -118,7 +122,7 @@ function ProgressCell({
       <span className="text-xs text-gray-400">—</span>
     );
   return (
-    <div className="flex items-center gap-3 justify-end">
+    <div className="flex items-center justify-between gap-2">
       {statusEl}
       {doc.job_status && doc.latest_job_id && (
         <button
@@ -128,7 +132,7 @@ function ProgressCell({
             e.preventDefault();
             onDelete();
           }}
-          className="text-xs text-red-700 hover:underline"
+          className="text-xs text-red-700 hover:underline shrink-0"
           title="Remove the document and all artifacts permanently"
         >
           Delete
@@ -361,7 +365,7 @@ export default function DashboardPage() {
                   <th className="text-left px-4 py-2 font-medium">Status</th>
                   <th className="text-left px-4 py-2 font-medium">Pages</th>
                   <th className="text-left px-4 py-2 font-medium">Uploaded</th>
-                  <th className="text-right px-4 py-2 font-medium">Progress</th>
+                  <th className="text-left px-4 py-2 font-medium">Progress</th>
                 </tr>
               </thead>
               <tbody className="divide-y">

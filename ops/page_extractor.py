@@ -88,38 +88,81 @@ def _extract_one(doc, page_idx: int) -> dict:
         return {"page_idx": page_idx, "ok": False, "error": f"extract failed: {e}"}
 
 
+def _extract_one_phase1a(doc, page_idx: int) -> dict:
+    """Phase 1a payload: plain page text + page dimensions.
+
+    Same contract as _extract_one (probe-then-extract, returns ok+error
+    on damaged pages) but tailored to what pipeline.py's Phase 1a needs.
+    Kept separate from _extract_one so the legacy line-extraction
+    callers (app_ade_prod) keep their exact response shape.
+    """
+    ok, reason = _page_health_probe(doc, page_idx)
+    if not ok:
+        return {"page_idx": page_idx, "ok": False, "error": f"damaged: {reason}"}
+    try:
+        page = doc[page_idx]
+        text = page.get_text("text") or ""
+        rect = page.rect
+        return {
+            "page_idx": page_idx,
+            "ok": True,
+            "text": text,
+            "dims": {
+                "width": rect.width,
+                "height": rect.height,
+                "rotation": page.rotation,
+            },
+        }
+    except Exception as e:
+        return {"page_idx": page_idx, "ok": False, "error": f"extract failed: {e}"}
+
+
 def main() -> int:
     """Usage forms:
         page_extractor.py PDF_PATH PAGE_INDEX                  (single page, legacy)
-        page_extractor.py PDF_PATH --pages 3,5,7,9,11          (batch)
+        page_extractor.py PDF_PATH --pages 3,5,7,9,11          (batch, line extraction)
+        page_extractor.py PDF_PATH --phase1a-batch 3,5,7,9     (batch, text+dims)
 
     Legacy output (single-page): {"ok": bool, "lines": [...]} or {"ok": false, "error": ...}
-    Batch output: {"ok": true, "results": [{"page_idx": N, "ok": bool, "lines": [...]/"error": ...}, ...]}
+    --pages output:        streams {"page_result": {..., "lines": [...]}} per page, then {"done": true}
+    --phase1a-batch output: streams {"page_result": {..., "text": "...", "dims": {...}}} per page, then {"done": true}
+
+    The streaming forms exist so the parent can recover any pages that
+    finished before a SIGKILL'd subprocess (e.g. on MuPDF C-level hang)
+    without losing them.
     """
     args = sys.argv[1:]
     if len(args) < 2:
         sys.stdout.write(json.dumps({"ok": False,
-                                     "error": "usage: page_extractor.py PDF_PATH PAGE_INDEX | PDF_PATH --pages N,N,N"}))
+                                     "error": "usage: page_extractor.py PDF_PATH PAGE_INDEX "
+                                              "| PDF_PATH --pages N,N,N "
+                                              "| PDF_PATH --phase1a-batch N,N,N"}))
         return 2
     pdf_path = args[0]
 
-    # Parse page indices (legacy single-int form OR --pages list form)
-    batch_mode = False
+    # Parse mode + page indices.
+    batch_mode = None  # None = legacy single, "lines" = --pages, "phase1a" = --phase1a-batch
     page_indices = []
     if args[1] == "--pages" and len(args) >= 3:
-        batch_mode = True
-        try:
-            page_indices = [int(x) for x in args[2].split(",") if x.strip() != ""]
-        except ValueError:
-            sys.stdout.write(json.dumps({"ok": False,
-                                         "error": f"invalid --pages list: {args[2]!r}"}))
-            return 2
+        batch_mode = "lines"
+        list_str = args[2]
+    elif args[1] == "--phase1a-batch" and len(args) >= 3:
+        batch_mode = "phase1a"
+        list_str = args[2]
     else:
         try:
             page_indices = [int(args[1])]
         except ValueError:
             sys.stdout.write(json.dumps({"ok": False,
                                          "error": f"invalid page index: {args[1]!r}"}))
+            return 2
+
+    if batch_mode is not None:
+        try:
+            page_indices = [int(x) for x in list_str.split(",") if x.strip() != ""]
+        except ValueError:
+            sys.stdout.write(json.dumps({"ok": False,
+                                         "error": f"invalid page list: {list_str!r}"}))
             return 2
 
     try:
@@ -129,13 +172,10 @@ def main() -> int:
         return 1
 
     try:
-        if batch_mode:
-            # Stream one JSON line per page so the parent can recover any
-            # pages that finished before the subprocess got SIGKILL'd on
-            # a MuPDF hang. Each line is complete JSON on its own; a final
-            # "done" line signals clean finish.
+        if batch_mode is not None:
+            extractor = _extract_one if batch_mode == "lines" else _extract_one_phase1a
             for pi in page_indices:
-                r = _extract_one(doc, pi)
+                r = extractor(doc, pi)
                 sys.stdout.write(json.dumps({"page_result": r}) + "\n")
                 sys.stdout.flush()
             sys.stdout.write(json.dumps({"done": True}) + "\n")

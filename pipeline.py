@@ -43,7 +43,6 @@ from utils_vector import (
     measure_lines_in_selection,
     measure_at_click_point,
     infer_scale_from_page,
-    extract_vector_lines,
     verify_scale_with_bar,
     verify_scale_with_bar_fast,
     transform_coords_for_rotation,
@@ -205,6 +204,125 @@ def _text_to_lines(text: str, source: str = "pdf") -> list[dict]:
     ]
 
 
+# Phase 1a hard-timeout per page (seconds). Healthy pages finish in <100 ms;
+# subtly-damaged pages can drive MuPDF into an internal C-level recovery
+# loop that holds the GIL and never returns. The only escape hatch is to
+# run extraction in a subprocess and SIGKILL on timeout.
+_PHASE1A_PAGE_TIMEOUT = 20
+
+# Subprocess startup is ~300 ms (Python import + fitz.open). Batching
+# amortises this; one bad page in a batch hangs the whole subprocess but
+# we recover via per-page fallback. Matches the legacy app_ade_prod cap.
+_PHASE1A_BATCH_SIZE = 5
+
+_PAGE_EXTRACTOR_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "ops", "page_extractor.py"
+)
+
+
+def _phase1a_extract_one(pdf_path: str, page_idx: int, timeout_s: float) -> dict:
+    """Single-page Phase 1a extraction in a subprocess. SIGKILL on timeout.
+
+    Returns one of:
+        {"ok": True, "text": str, "dims": {"width": ..., "height": ..., "rotation": ...}}
+        {"ok": False, "error": str}
+    Always returns within ~timeout_s + a small overhead, regardless of
+    what MuPDF does internally.
+    """
+    if not os.path.exists(pdf_path):
+        return {"ok": False, "error": "PDF disk file missing"}
+    try:
+        proc = subprocess.run(
+            [sys.executable, _PAGE_EXTRACTOR_SCRIPT, pdf_path,
+             "--phase1a-batch", str(page_idx)],
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error":
+                f"page extraction exceeded {timeout_s}s — MuPDF recovery loop on damaged page"}
+    except Exception as e:
+        return {"ok": False, "error": f"subprocess launch failed: {e}"}
+    # The phase1a-batch protocol streams JSON lines; the page result is
+    # one line, followed by {"done": true}. Pick out the page_result.
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        pr = obj.get("page_result")
+        if pr and pr.get("page_idx") == page_idx:
+            if pr.get("ok"):
+                return {"ok": True, "text": pr.get("text", ""), "dims": pr.get("dims", {})}
+            return {"ok": False, "error": pr.get("error", "extract failed")}
+    return {"ok": False, "error":
+            f"worker produced no page_result (rc={proc.returncode}): {(proc.stderr or '')[:200]}"}
+
+
+def _phase1a_extract_batch(pdf_path: str, page_indices: list[int],
+                           per_page_timeout_s: float) -> dict[int, dict]:
+    """Batch Phase 1a extraction. Returns {page_idx: result_dict} for
+    pages that finished before SIGKILL; missing entries mean the
+    subprocess hung on that page (caller should retry per-page).
+
+    The subprocess streams one JSON line per page so partial progress
+    survives a kill on a later hung page.
+    """
+    if not os.path.exists(pdf_path) or not page_indices:
+        return {}
+    pages_csv = ",".join(str(pi) for pi in page_indices)
+    # 3s startup budget + per-page slack.
+    batch_timeout = 3 + per_page_timeout_s * len(page_indices)
+    proc = subprocess.Popen(
+        [sys.executable, _PAGE_EXTRACTOR_SCRIPT, pdf_path,
+         "--phase1a-batch", pages_csv],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    collected: dict[int, dict] = {}
+
+    import threading
+
+    def _drain():
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                pr = obj.get("page_result")
+                if pr and pr.get("page_idx") is not None:
+                    pi = pr["page_idx"]
+                    if pr.get("ok"):
+                        collected[pi] = {"ok": True, "text": pr.get("text", ""),
+                                         "dims": pr.get("dims", {})}
+                    else:
+                        collected[pi] = {"ok": False,
+                                         "error": pr.get("error", "extract failed")}
+        except Exception:
+            pass
+
+    drain_thread = threading.Thread(target=_drain, daemon=True)
+    drain_thread.start()
+    try:
+        proc.wait(timeout=batch_timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+    drain_thread.join(timeout=1)
+    return collected
+
+
 def run_analysis(
     pdf_path: str,
     config: PipelineConfig,
@@ -269,39 +387,45 @@ def run_analysis(
             page_dims = cached_1a.get("page_dims", {})
             log.info("Phase 1a: cache hit")
         else:
+            # Phase 1a runs in a subprocess per batch with hard SIGKILL on
+            # timeout. Subtly-damaged PDFs can drive MuPDF into a C-level
+            # recovery loop that holds the GIL forever — see legacy
+            # app_ade_prod.py for the original rationale. In-process
+            # try/except never catches that; only OS-level kill does.
             page_texts = {}
             page_dims = {}
-            for pi in valid_pages:
-                try:
-                    page = doc[pi]
-                    page_texts[str(pi)] = page.get_text("text") or ""
-                    rect = page.rect
-                    page_dims[str(pi)] = {
-                        "width": rect.width,
-                        "height": rect.height,
-                        "rotation": page.rotation,
-                    }
-                except Exception as e:
-                    log.warning(f"Phase 1a page {pi}: {e}")
-                    broken_pages.add(pi)
-
-            try:
-                vector_lines_by_page = {}
-                for pi in valid_pages:
-                    if pi in broken_pages:
-                        continue
-                    try:
-                        lines = extract_vector_lines(doc, pi)
-                        vector_lines_by_page[str(pi)] = lines
-                    except Exception:
-                        vector_lines_by_page[str(pi)] = []
-            except Exception:
-                vector_lines_by_page = {}
+            batches = [
+                valid_pages[i:i + _PHASE1A_BATCH_SIZE]
+                for i in range(0, len(valid_pages), _PHASE1A_BATCH_SIZE)
+            ]
+            for batch in batches:
+                results = _phase1a_extract_batch(
+                    pdf_path_str, batch, _PHASE1A_PAGE_TIMEOUT
+                )
+                # Pages the batch subprocess never reported on (most
+                # likely it hung on one of them and got SIGKILL'd) are
+                # retried single-page so one bad page can't poison the
+                # rest of the batch.
+                missing = [pi for pi in batch if pi not in results]
+                for pi in missing:
+                    results[pi] = _phase1a_extract_one(
+                        pdf_path_str, pi, _PHASE1A_PAGE_TIMEOUT
+                    )
+                for pi in batch:
+                    r = results.get(pi) or {"ok": False, "error": "no result"}
+                    if r.get("ok"):
+                        page_texts[str(pi)] = r.get("text", "") or ""
+                        page_dims[str(pi)] = r.get("dims", {})
+                    else:
+                        log.warning(
+                            f"Phase 1a page {pi}: {r.get('error')} — "
+                            f"marking damaged and skipping"
+                        )
+                        broken_pages.add(pi)
 
             cache_data = {
                 "page_texts": page_texts,
                 "page_dims": page_dims,
-                "vector_lines": vector_lines_by_page,
             }
             fence_cache.put("phase1a", pdf_hash, params, cache_data, user_scope=cache_scope)
 

@@ -23,6 +23,7 @@ import threading
 from typing import Any, Optional
 
 from psycopg import Connection
+from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -40,6 +41,40 @@ def _database_url() -> str:
     return url
 
 
+class _LeakSafePool(ConnectionPool):
+    """ConnectionPool that closes the underlying socket of broken
+    connections instead of silently dropping them.
+
+    Background: psycopg-pool's _return_connection treats a connection
+    in TransactionStatus.UNKNOWN as already-closed and just schedules
+    a replacement. It does NOT call conn.close() on the broken one.
+    libpq's TCP socket can stay ESTABLISHED for hours after the
+    protocol layer goes UNKNOWN — and Supabase's session-mode pooler
+    counts every ESTABLISHED socket against its 15-session per-project
+    limit, so each leaked conn permanently consumes one slot until the
+    process restarts.
+
+    We catch the UNKNOWN-on-putconn case here and call close() ourselves
+    before delegating to the parent. close() runs PQfinish which sends
+    a Terminate (best-effort) and closes the file descriptor — that's
+    what tells Supabase's pooler to free the session slot.
+
+    The check-callback failure path is handled separately in
+    _check_connection (which raises after closing).
+    """
+
+    def putconn(self, conn: Connection) -> None:  # type: ignore[override]
+        try:
+            if conn.pgconn.transaction_status == TransactionStatus.UNKNOWN:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        super().putconn(conn)
+
+
 def _check_connection(conn: Connection) -> None:
     """psycopg-pool `check` callback. Run a trivial round-trip before
     handing a pooled connection back to the caller, so we don't reuse a
@@ -51,8 +86,28 @@ def _check_connection(conn: Connection) -> None:
     application-layer state out of sync (54 bytes in recv-q, never read),
     and the next user of the connection blocked forever waiting for a
     response that wasn't coming.
+
+    On failure we explicitly call conn.close() before re-raising. This
+    looks redundant — the pool catches the exception and discards the
+    conn — but psycopg-pool's discard path for `from_getconn=True` +
+    UNKNOWN-status connections (pool.py _return_connection lines 713-
+    719) schedules a replacement task but never calls conn.close() on
+    the failed connection. With Supabase's session-mode pooler the
+    underlying TCP socket can stay ESTABLISHED for hours after the
+    libpq-level state goes bad, so each check failure leaks one socket
+    against the pooler's per-project session cap (15 on free tier). At
+    16 leaks the whole project goes "max clients reached" and every
+    new query times out. Closing the conn here forces the kernel to
+    actually FIN the socket so it stops counting against the cap.
     """
-    conn.execute("select 1").fetchone()
+    try:
+        conn.execute("select 1").fetchone()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
 
 
 def pool() -> ConnectionPool:
@@ -60,7 +115,7 @@ def pool() -> ConnectionPool:
     if _pool is None:
         with _pool_lock:
             if _pool is None:
-                _pool = ConnectionPool(
+                _pool = _LeakSafePool(
                     conninfo=_database_url(),
                     # Pool was exhausting at max_size=8 under realistic
                     # load: 1 pipeline worker doing rapid per-page

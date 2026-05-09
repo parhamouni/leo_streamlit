@@ -241,6 +241,24 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
     );
   }, []);
 
+  // Auto-remove successful uploads from the queue ~1s after they
+  // complete. The dashboard's document list already shows the file
+  // (the same successCount bump that fires this useEffect drives the
+  // list refresh), so leaving "✓ done" rows in the upload widget is
+  // just dead duplicate info. Failed/cancelled entries are kept
+  // indefinitely so the user can read the error.
+  useEffect(() => {
+    const terminal = queue.filter(
+      (x) => x.status === "done" || x.status === "deduped",
+    );
+    if (terminal.length === 0) return;
+    const ids = new Set(terminal.map((x) => x.id));
+    const t = setTimeout(() => {
+      setQueue((q) => q.filter((x) => !ids.has(x.id)));
+    }, 1000);
+    return () => clearTimeout(t);
+  }, [queue]);
+
   // Read fileByIdRef (declared above) inside the upload helper.
   function uploadOne(
     id: string,
