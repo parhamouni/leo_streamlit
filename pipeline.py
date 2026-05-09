@@ -261,6 +261,54 @@ def _phase1a_extract_one(pdf_path: str, page_idx: int, timeout_s: float) -> dict
             f"worker produced no page_result (rc={proc.returncode}): {(proc.stderr or '')[:200]}"}
 
 
+def _phase3_extract_lines(pdf_path: str, page_idx: int,
+                          timeout_s: float) -> tuple[list, str | None]:
+    """Subprocess-isolated `get_native_pdf_lines` call for a single
+    fence page. Returns (lines, error_or_None).
+
+    Same root cause as the Phase 1a hang we already isolated: PyMuPDF's
+    text/line extraction can hold the GIL inside C code on certain
+    pages, starving every other thread in the process — including the
+    Postgres I/O thread that's trying to read a COMMIT response from
+    the local DB. Verified live: 40 bytes from PG sat unread in our
+    recv buffer for 12+ minutes while ThreadPoolExecutor-4 burned the
+    GIL inside `get_native_pdf_lines`. The whole API stopped serving
+    HTTP requests until we forcibly killed the worker.
+
+    Routing the call through ops/page_extractor.py's existing legacy
+    single-page mode means each fence page's heavy fitz call lives in
+    its own OS process — its GIL is irrelevant to ours, and a SIGKILL
+    after `timeout_s` is the hard-stop on damaged pages.
+    """
+    if not os.path.exists(pdf_path):
+        return [], "PDF disk file missing"
+    try:
+        proc = subprocess.run(
+            [sys.executable, _PAGE_EXTRACTOR_SCRIPT, pdf_path, str(page_idx)],
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return [], (
+            f"page extraction exceeded {timeout_s}s — "
+            f"MuPDF recovery loop on damaged page"
+        )
+    except Exception as e:
+        return [], f"subprocess launch failed: {e}"
+    if not proc.stdout:
+        return [], (
+            f"worker produced no output (rc={proc.returncode}): "
+            f"{(proc.stderr or '')[:200]}"
+        )
+    try:
+        # Legacy single-page mode emits one JSON object on stdout.
+        obj = json.loads(proc.stdout.strip().splitlines()[-1])
+    except Exception as e:
+        return [], f"could not parse worker output: {e}"
+    if obj.get("ok"):
+        return obj.get("lines", []) or [], None
+    return [], obj.get("error", "extract failed")
+
+
 def _phase1a_extract_batch(pdf_path: str, page_indices: list[int],
                            per_page_timeout_s: float) -> dict[int, dict]:
     """Batch Phase 1a extraction. Returns {page_idx: result_dict} for
@@ -816,11 +864,15 @@ def run_analysis(
             # the same geometry source prod uses, so highlights render
             # correctly on scanned pages whose native PDF text is missing
             # or unmappable (CID fonts without ToUnicode CMap).
-            try:
-                pdf_lines = ade.get_native_pdf_lines(doc[pi])
-            except Exception as e:
-                log.warning(f"Phase 3 native pdf lines page {pi}: {e}")
-                pdf_lines = []
+            # Subprocess-isolated to avoid GIL starvation under
+            # concurrent Phase 3 workers — see _phase3_extract_lines
+            # for the full rationale. SIGKILL on damaged pages instead
+            # of wedging the whole event loop.
+            pdf_lines, _err = _phase3_extract_lines(
+                pdf_path_str, pi, _PHASE1A_PAGE_TIMEOUT
+            )
+            if _err:
+                log.warning(f"Phase 3 native pdf lines page {pi}: {_err}")
             ocr_lines = ocr_lines_by_page.get(pi, []) or []
 
             # Legend entries — one dict per legend row, tight bbox around the
