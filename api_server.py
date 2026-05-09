@@ -321,16 +321,22 @@ app = FastAPI(title="Leo Fence Detection API", lifespan=lifespan)
 
 
 # Allow the Next.js frontend (Vercel + local dev) to call us across origins.
-# Comma-separated env override; defaults to local dev origins.
+#   FENCE_CORS_ORIGINS — comma-separated explicit origin list; defaults
+#                        to local dev origins.
+#   FENCE_CORS_ORIGIN_REGEX — optional regex (e.g. for Vercel preview
+#                        deploys at https://leo-fence-git-*.vercel.app).
+#                        Matched in addition to the explicit list.
 _default_origins = "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001"
 _cors_origins = [o.strip() for o in os.environ.get("FENCE_CORS_ORIGINS", _default_origins).split(",") if o.strip()]
+_cors_origin_regex = os.environ.get("FENCE_CORS_ORIGIN_REGEX") or None
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
+    allow_origin_regex=_cors_origin_regex,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-User-Id"],
-    expose_headers=["Content-Disposition"],
+    expose_headers=["Content-Disposition", "X-Page-Number", "X-Image-Source"],
 )
 
 
