@@ -7,7 +7,7 @@
 **Plan file:** `/home/ubuntu/.claude/plans/yes-i-get-you-refactored-hummingbird.md`
 **Stage-1 highlighting plan (now superseded — work below is done):** `/home/ubuntu/.claude/plans/fuck-you-you-are-splendid-beacon.md`
 **Decision log:** UMT confirmed **critical-path** (customers always correct measurements manually).
-**Last updated:** 2026-05-09 — **Sprint 4 (UMT) complete + non-fence UX polish.** Sprint 4: drawing mode (4a.5), zoom + pan + Ctrl/Cmd-wheel zoom-around-cursor (4a.6), C8 cross-page measurement summary (4a.7), Measurement PDF/Excel honor UMT edits (4a.8). UX: per-line popover, layer highlight + per-layer category dropdown, 🎯 smart auto-assign with layer-vote confidence thresholds. Non-fence pages: pipeline now persists classifier reason / confidence / signals; `NonFencePageCard` shows reasoning teaser + LLM signals + on-demand page image; **fixed page-image misalignment bug** that was serving wrong-page from highlighted PDF when page_num didn't match a fence page index. Sprint-4 plan: `.claude/plans/sprint4-umt-react-canvas.md`. **Next:** Phase 10.1 (authorization tests) or Phase 11 (deploy).
+**Last updated:** 2026-05-09 — **Sprint 4 (UMT) complete + non-fence UX polish + Phase 10.1 authorization tests.** Sprint 4: drawing mode (4a.5), zoom + pan + Ctrl/Cmd-wheel zoom-around-cursor (4a.6), C8 cross-page measurement summary (4a.7), Measurement PDF/Excel honor UMT edits (4a.8). UX: per-line popover, layer highlight + per-layer category dropdown, 🎯 smart auto-assign with layer-vote confidence thresholds. Non-fence pages: pipeline now persists classifier reason / confidence / signals; `NonFencePageCard` shows reasoning teaser + LLM signals + on-demand page image; **fixed page-image misalignment bug** that was serving wrong-page from highlighted PDF when page_num didn't match a fence page index. Phase 10.1: `tests/test_authorization.py` (19 tests, 50/50 suite green) — every job-scoped endpoint rejects cross-user requests with 403/404. Sprint-4 plan: `.claude/plans/sprint4-umt-react-canvas.md`. **Next:** Phase 10.2 (upload limits + metadata) or Phase 11 (deploy).
 
 ---
 
@@ -58,6 +58,8 @@ The legacy Streamlit prod stays untouched per user instruction (they're serving 
 | `10146db` | **Bug fix**: line endpoints now transform per-point on rotated pages (`reverse_rotation_point`). Rectangle-shaped formula was scrambling y-coords on rot=90/180/270 pages. |
 | `f61e793` | Diagnostics: `_page_cb` log line + migration 004 (`page_results.updated_at`) for the live-pages debug |
 | `0ed52a8` | **Stage-1 highlighted-PDF parity with `app_ade_prod.py`.** Five wins, one file (`pipeline.py`) + one frontend cleanup: (1) `definitions` is now `legend_entries` (LLM per-row tight bboxes) instead of raw legend chunks; (2) new instance-finding step calls `find_instances_in_figures_fast` to get per-token indicator bboxes inside figures; (3) keyword scanner now runs against `get_native_pdf_lines` output (real per-line bboxes); (4) `phase1b` OCR step now preserves the per-line bboxes returned by Google DocAI (cache key bumped to `phase1b_v2`) — required for scanned pages where native PDF text is missing or has CID-without-CMap encoding; (5) `keyword_matches` always populated. Frontend: removed the noisy "Detected Instances (bbox)" table from the detail page. |
+| `dec5e61` | **test(auth): Phase 10.1 — cross-user authorization tests.** 19 tests, all passing. 13 parametrized cross-user attempts (USER_B requests USER_A's resources) covering every job-scoped endpoint: `GET /api/jobs/{id}` + `/results`, `/highlighted-pdf`, `/page-image/{n}`, `/page-vector-lines/{n}[/smart-assign]`, `/measurement-pdf`, `/measurement-excel`, `/measurement-summary`, `/umt-state`; `PUT` and `DELETE /umt-state/{n}`; `DELETE /api/jobs/{id}`. All return 403/404 (never 200). Plus: unknown `job_id` → 404; no `X-User-Id` (anonymous default) blocked; `/api/jobs` filters by user; `/api/healthz` is public; JWT-only `/api/me` + `/api/documents` reject legacy `X-User-Id`. Uses `FENCE_API_AUTH_MODE=legacy_header` so the suite doesn't need real Supabase JWTs — same `_job_for_user` ownership check fires either way. Postgres-backed `/api/documents*` ownership tested separately when JWT mocking lands. |
+| `b5bc4cf` | docs(status): mark Sprint 4 complete + log non-fence UX commits |
 | `685d69c` | **fix(page-image): map page_num correctly when serving from highlighted PDF.** The highlighted PDF only contains fence-classified pages (renumbered sequentially). The page-image endpoint was naively passing original-document page_num to the renderer → requesting original page 7 (a non-fence floor plan) returned the *7th fence page in order*, with all its keyword/ADE overlays drawn on it. Now: build `{original_page_num → highlighted-PDF index}` from `results.fence_pages`; `source=auto` renders fence pages from the highlighted PDF at the mapped index and falls back to original PDF for non-fence pages; `source=highlighted` 404s with a clear "not in highlighted PDF" message when the page isn't fence; `source=original` serves the original PDF page-num as-is. Pass resolved 1-indexed `page_in_pdf` to the render subprocess. |
 | `351a2f8` | **feat(detail): persist + display non-fence classifier reasoning.** Phase 1c was throwing away the LLM's reasoning before serializing — `non_fence_pages` was just `{page_idx, page_num}`. Now `classification_meta: dict[int, dict]` accumulates during Phase 1c and captures method + reason + confidence + signals (LLM path) / method + keyword_count (keyword path) / method + reason (no_llm + error fallbacks). Cache writes carry the rich payload; cache reads pull whatever's available (old entries stay thin). Both `result.non_fence_pages = [...]` build sites merge in the meta. Frontend `NonFencePage` type gains top-level confidence/signals/keyword_count; `NonFencePageCard` reads from top-level too, shows LLM signals row, prints a hint when neither reason nor method is present. Page-image button on non-fence cards now uses `source=auto` (highlighted has no overlays on non-fence pages anyway, so visually identical to original). |
 | `8857b62` | **feat(detail): non-fence pages — load image + reasoning teaser.** `GET /api/jobs/{id}/page-image/{n}` accepts `source` query param: "auto" (default), "original", "highlighted". `PageImage` component takes optional `source` + `altText`. `NonFencePageCard` shows a one-line reasoning teaser inline on the closed summary row (truncates at ~110 chars), full reasoning + keywords-found + page-image button + page text on expand. |
@@ -245,8 +247,8 @@ Plan refs: D1 / D2 / D3.
 - D3 — daily-cap UI (`cfg.MAX_DAILY_SPEND_USD` is enforced silently today)
 
 ### Phase 10 — security & robustness
-- 10.1 — `tests/test_authorization.py` covering cross-user 403/404 against all endpoints
-- 10.2 — file-size + page-count limits already enforced; need cost/perf metadata logged to `jobs` (file_size, duration_ms, model)
+- 10.1 ✅ — `tests/test_authorization.py` covering cross-user 403/404 against all job-scoped endpoints (commit `dec5e61`, 19 tests, 50/50 suite green). Postgres-backed `/api/documents*` ownership tested separately when JWT mocking lands.
+- 10.2 ⏳ — file-size + page-count limits already enforced; need cost/perf metadata logged to `jobs` (file_size, duration_ms, model)
 
 ### Phase 11 — deployment
 - 11.1 — Vercel deploy of `frontend/` (env vars, branch deploys)
@@ -264,9 +266,10 @@ Currently SQLite-based [job_registry.py](job_registry.py) handles queueing. Migr
 1. **Apply migrations 003 + 004 in Supabase** (one paste in SQL Editor — both blocks above) — still pending
 2. **Trigger one fresh upload, send the new uvicorn.log** so I can diagnose the live-pages issue from the `_page_cb` log lines
 3. ~~**Sprint 4 remaining checkpoints (4a.7–4a.8)**~~ — DONE 2026-05-08/09. (Manual scale-override numeric input still deferred until asked.)
-4. **Phase 10.1** — authorization tests
-5. **Phase 11** — Vercel + AWS deployment
-6. (later) Sprint 5 (operational/observability), S3 migration, Redis/RQ migration
+4. ~~**Phase 10.1** — authorization tests~~ — DONE 2026-05-09 (commit `dec5e61`).
+5. **Phase 10.2** — upload limits + cost/perf metadata on `jobs` rows (file_size, duration_ms, model). Data is collected by `telemetry.py` / `spend_tracker.py`; just needs to be wired into the row.
+6. **Phase 11** — Vercel + AWS deployment
+7. (later) Sprint 5 (operational/observability), S3 migration, Redis/RQ migration
 
 ---
 
