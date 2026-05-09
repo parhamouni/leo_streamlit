@@ -26,7 +26,13 @@ export function UploadStatusPanel() {
     if (remaining > 0) setOpen(true);
   }, [remaining]);
 
-  if (queue.length === 0) return null;
+  // The whole point of this floating widget is to show progress while the
+  // user is on a different route from the dashboard. Once nothing is
+  // actively uploading, it has no job — hide it. Done/deduped/failed
+  // entries still live in the queue and are visible inline on the
+  // dashboard's UploadButton; we just don't take up screen real estate
+  // here for them.
+  if (remaining === 0) return null;
 
   return (
     <div className="fixed bottom-4 right-4 z-50 w-80 max-w-[calc(100vw-2rem)] bg-white border border-gray-200 rounded-lg shadow-lg overflow-hidden">
