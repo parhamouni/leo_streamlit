@@ -129,6 +129,10 @@ def _run_job(job: dict, keys: dict):
         use_ade=config_data.get("use_ade", True),
         highlight_fence_text=config_data.get("highlight_fence_text", True),
         enable_unified_measurement=config_data.get("enable_unified_measurement", True),
+        # When False, pipeline skips the LLM-guided fallback measurement on
+        # pages with no fence layers — saves minutes per page on layerless
+        # PDFs the user knows to be irrelevant.
+        enable_nonlayer_suggestions=config_data.get("enable_nonlayer_suggestions", False),
         cache_scope=f"job_{job_id[:16]}",
     )
 

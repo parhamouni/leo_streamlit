@@ -198,6 +198,11 @@ def measure_fence_elements(
     scale_factor: Optional[float] = None,
     ocr_text: str = None,
     light_llm=None,  # optional: cheaper/faster model for layer-name matching
+    # Additive kwarg: when False, skip the expensive LLM-guided fallback
+    # path on pages that have no detectable fence layers. Default True
+    # preserves the existing prod behaviour (legacy app filtered the
+    # results post-hoc on the UI side rather than at the pipeline level).
+    enable_nonlayer_suggestions: bool = True,
 ) -> Dict:
     """
     Measure fence-related vector elements based on detected indicators.
@@ -320,7 +325,19 @@ def measure_fence_elements(
     layer_to_category = {}
     if fence_layers and _light and fence_definitions:
         layer_to_category = llm_match_layers_to_definitions(_light, fence_layers, fence_definitions)
-    
+
+    # Short-circuit: if the user disabled non-layer suggestions and we
+    # found no fence layers on this page, skip the LLM-guided fallback
+    # entirely. That fallback is the slow path — extracts every vector
+    # line, runs filter_params LLM, asks LLM to pick fence-like lines.
+    # On pages with no real fence content (annotation/title-block pages
+    # the classifier flagged on keyword hits), this saves minutes per page.
+    if not fence_layers and not enable_nonlayer_suggestions:
+        return _skip_measurement(
+            "non-layer suggestions disabled and no fence layers found",
+            layer_to_category=layer_to_category,
+        )
+
     # Extract lines from fence-related layers
     if fence_layers:
         fence_lines = extract_lines_by_layers(page, fence_layers)
