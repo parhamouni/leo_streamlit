@@ -1,189 +1,42 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { supabase } from "@/lib/supabase";
-
-const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
-
-type EntryStatus = "queued" | "uploading" | "done" | "deduped" | "failed";
-
-type Entry = {
-  id: string;
-  file: File;
-  status: EntryStatus;
-  progress: number; // 0..100
-  error?: string;
-  dedupedExistingStatus?: string;
-};
-
-function fmtBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 / 1024).toFixed(1)} MB`;
-}
-
-async function authToken(): Promise<string | null> {
-  const { data } = await supabase().auth.getSession();
-  return data.session?.access_token ?? null;
-}
-
-type UploadResponse = {
-  job_id?: string | null;
-  document_id?: string | null;
-  status?: string;
-  existing_status?: string;
-  queue_position?: number | null;
-  running_jobs?: number | null;
-};
-
 /**
- * Upload one file via XMLHttpRequest so we get real bytes-uploaded
- * progress events. Resolves with the server's parsed response on 2xx;
- * rejects with an Error whose message is the server-reported reason.
+ * UploadButton — drop-zone + inline queue display for the dashboard.
+ * State + XHR lifecycle is owned by `<UploadProvider>` in app/layout.tsx
+ * so navigating away mid-upload doesn't kill the request. This component
+ * is only the *view*.
  */
-function uploadOne(
-  file: File,
-  onProgress: (pct: number) => void,
-  token: string | null,
-  configJson: string,
-): Promise<UploadResponse> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    const url = `${apiBase}/api/jobs`;
-    xhr.open("POST", url);
-    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
-
-    xhr.upload.addEventListener("progress", (e) => {
-      if (e.lengthComputable) {
-        onProgress(Math.round((e.loaded / e.total) * 100));
-      }
-    });
-
-    xhr.addEventListener("load", () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        onProgress(100);
-        let parsed: UploadResponse = {};
-        try {
-          parsed = JSON.parse(xhr.responseText);
-        } catch {}
-        resolve(parsed);
-      } else {
-        let detail = xhr.responseText;
-        try {
-          const j = JSON.parse(xhr.responseText);
-          detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j);
-        } catch {}
-        reject(new Error(`HTTP ${xhr.status} — ${detail.slice(0, 200)}`));
-      }
-    });
-
-    xhr.addEventListener("error", () =>
-      reject(new Error("Network error during upload")),
-    );
-    xhr.addEventListener("abort", () =>
-      reject(new Error("Upload aborted")),
-    );
-
-    const form = new FormData();
-    form.append("pdf", file);
-    form.append("config", configJson);
-    xhr.send(form);
-  });
-}
+import { useEffect, useRef, useState } from "react";
+import {
+  fmtBytes,
+  useUpload,
+  type UploadEntry,
+} from "@/contexts/UploadContext";
 
 export function UploadButton({
   onUploaded,
   configJson = "{}",
 }: {
-  onUploaded: () => void;
+  onUploaded?: () => void;
   configJson?: string;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
-  const [queue, setQueue] = useState<Entry[]>([]);
-  const [busy, setBusy] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const { queue, enqueue, abort, clearFinished, successCount } = useUpload();
 
-  // Pin the latest configJson in a ref so the upload effect doesn't have to
-  // re-fire when the user toggles a setting mid-upload.
-  const configRef = useRef(configJson);
-  configRef.current = configJson;
-
-  // Drive the queue: when not busy, pick the next queued entry and upload it.
+  // Fire onUploaded when an upload succeeds. Backwards compatible with the
+  // dashboard's pre-context refresh hook.
+  const lastSuccessRef = useRef(successCount);
   useEffect(() => {
-    if (busy) return;
-    const next = queue.find((e) => e.status === "queued");
-    if (!next) return;
-
-    setBusy(true);
-    setQueue((q) =>
-      q.map((x) =>
-        x.id === next.id ? { ...x, status: "uploading", progress: 0 } : x,
-      ),
-    );
-
-    (async () => {
-      try {
-        const token = await authToken();
-        const resp = await uploadOne(
-          next.file,
-          (pct) =>
-            setQueue((q) =>
-              q.map((x) =>
-                x.id === next.id ? { ...x, progress: pct } : x,
-              ),
-            ),
-          token,
-          configRef.current,
-        );
-        const wasDeduped = resp.status === "deduped";
-        setQueue((q) =>
-          q.map((x) =>
-            x.id === next.id
-              ? {
-                  ...x,
-                  status: wasDeduped ? "deduped" : "done",
-                  progress: 100,
-                  dedupedExistingStatus: resp.existing_status,
-                }
-              : x,
-          ),
-        );
-        onUploaded();
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        setQueue((q) =>
-          q.map((x) =>
-            x.id === next.id ? { ...x, status: "failed", error: msg } : x,
-          ),
-        );
-        // Refresh in case earlier successes need rendering
-        onUploaded();
-      } finally {
-        setBusy(false);
-      }
-    })();
-  }, [queue, busy, onUploaded]);
-
-  function enqueue(filesIn: FileList | File[]) {
-    const accepted = Array.from(filesIn).filter(
-      (f) =>
-        f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf"),
-    );
-    if (accepted.length === 0) return;
-    setQueue((q) => [
-      ...q,
-      ...accepted.map<Entry>((f) => ({
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${f.name}`,
-        file: f,
-        status: "queued",
-        progress: 0,
-      })),
-    ]);
-  }
+    if (successCount !== lastSuccessRef.current) {
+      lastSuccessRef.current = successCount;
+      onUploaded?.();
+    }
+  }, [successCount, onUploaded]);
 
   function onPick(e: React.ChangeEvent<HTMLInputElement>) {
     if (e.target.files && e.target.files.length > 0) {
-      enqueue(e.target.files);
+      enqueue(e.target.files, configJson);
       e.target.value = "";
     }
   }
@@ -192,22 +45,13 @@ export function UploadButton({
     e.preventDefault();
     setDragOver(false);
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      enqueue(e.dataTransfer.files);
+      enqueue(e.dataTransfer.files, configJson);
     }
   }
 
-  function clearFinished() {
-    setQueue((q) =>
-      q.filter(
-        (x) =>
-          x.status !== "done" &&
-          x.status !== "failed" &&
-          x.status !== "deduped",
-      ),
-    );
-  }
-
-  const remaining = queue.filter((x) => x.status === "queued" || x.status === "uploading").length;
+  const remaining = queue.filter(
+    (x) => x.status === "queued" || x.status === "uploading",
+  ).length;
   const finished = queue.length - remaining;
 
   return (
@@ -259,13 +103,14 @@ export function UploadButton({
           </div>
           <div className="text-xs text-gray-400">
             {remaining > 0
-              ? `${remaining} file${remaining === 1 ? "" : "s"} in progress…`
+              ? `${remaining} file${remaining === 1 ? "" : "s"} in progress — they keep going if you navigate away`
               : "Drop more anytime — they'll queue up"}
           </div>
         </div>
       </div>
 
-      {/* Queue display */}
+      {/* Queue display (same data as the floating panel; kept inline for
+          the dashboard view). */}
       {queue.length > 0 && (
         <div className="border rounded-lg divide-y">
           <div className="flex items-center justify-between px-3 py-2 text-xs text-gray-500 bg-gray-50">
@@ -285,14 +130,25 @@ export function UploadButton({
             <div key={e.id} className="px-3 py-2 text-sm">
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0 flex-1">
-                  <div className="truncate font-medium" title={e.file.name}>
-                    {e.file.name}
+                  <div className="truncate font-medium" title={e.fileName}>
+                    {e.fileName}
                   </div>
                   <div className="text-xs text-gray-400">
-                    {fmtBytes(e.file.size)}
+                    {fmtBytes(e.fileSize)}
                   </div>
                 </div>
-                <StatusPill entry={e} />
+                <div className="flex items-center gap-2">
+                  <StatusPill entry={e} />
+                  {(e.status === "queued" || e.status === "uploading") && (
+                    <button
+                      onClick={() => abort(e.id)}
+                      className="text-xs text-gray-400 hover:text-red-600"
+                      title="Cancel this upload"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
               </div>
               {e.status === "uploading" && (
                 <div className="mt-1.5 h-1.5 w-full bg-gray-200 rounded overflow-hidden">
@@ -315,7 +171,7 @@ export function UploadButton({
   );
 }
 
-function StatusPill({ entry }: { entry: Entry }) {
+function StatusPill({ entry }: { entry: UploadEntry }) {
   switch (entry.status) {
     case "queued":
       return (
@@ -338,6 +194,12 @@ function StatusPill({ entry }: { entry: Entry }) {
           title={`Already uploaded — existing job is ${entry.dedupedExistingStatus ?? "present"}`}
         >
           ⊘ already uploaded
+        </span>
+      );
+    case "cancelled":
+      return (
+        <span className="text-xs text-gray-500 whitespace-nowrap">
+          cancelled
         </span>
       );
     case "failed":

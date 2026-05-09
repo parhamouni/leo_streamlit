@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import localFont from "next/font/local";
 import "./globals.css";
+import { UploadProvider } from "@/contexts/UploadContext";
+import { UploadStatusPanel } from "@/components/UploadStatusPanel";
 
 const geistSans = localFont({
   src: "./fonts/GeistVF.woff",
@@ -28,7 +30,15 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
-        {children}
+        {/* UploadProvider is mounted in the root layout (which Next.js does
+            NOT unmount during intra-app navigation), so the in-flight XHR
+            objects survive when the user clicks from /dashboard to
+            /documents/[id] mid-upload. UploadStatusPanel is the always-on
+            floating progress widget — visible regardless of route. */}
+        <UploadProvider>
+          {children}
+          <UploadStatusPanel />
+        </UploadProvider>
       </body>
     </html>
   );
