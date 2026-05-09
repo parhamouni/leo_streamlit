@@ -11,7 +11,6 @@ import {
   AnalysisSettingsPanel,
   useAnalysisSettings,
 } from "@/components/AnalysisSettings";
-import { RowActions } from "@/components/RowActions";
 
 type Document = {
   id: string;
@@ -66,9 +65,11 @@ function isActive(d: Document): boolean {
 function ProgressCell({
   doc,
   onCancel,
+  onDelete,
 }: {
   doc: Document;
   onCancel: () => void;
+  onDelete: () => void;
 }) {
   if (doc.job_status === "running" || doc.job_status === "queued") {
     const pct = doc.progress_percent ?? 0;
@@ -89,9 +90,6 @@ function ProgressCell({
             {eta}
           </span>
         )}
-        {/* Cancel sits inline with the running progress — it cancels
-            *this* run, so visually pair it here instead of the far-right
-            actions column. Delete (for terminal jobs) stays in actions. */}
         <button
           type="button"
           onClick={(e) => {
@@ -107,16 +105,37 @@ function ProgressCell({
       </div>
     );
   }
-  if (doc.job_status === "completed") {
-    return <span className="text-xs text-green-700">done</span>;
-  }
-  if (doc.job_status === "failed") {
-    return <span className="text-xs text-red-600">failed</span>;
-  }
-  if (doc.job_status === "cancelled") {
-    return <span className="text-xs text-yellow-700">cancelled</span>;
-  }
-  return <span className="text-xs text-gray-400">—</span>;
+  // Terminal states: status word inline with the Delete button so
+  // there isn't a giant empty gap between "done" and "Delete" anymore.
+  const statusEl =
+    doc.job_status === "completed" ? (
+      <span className="text-xs text-green-700">done</span>
+    ) : doc.job_status === "failed" ? (
+      <span className="text-xs text-red-600">failed</span>
+    ) : doc.job_status === "cancelled" ? (
+      <span className="text-xs text-yellow-700">cancelled</span>
+    ) : (
+      <span className="text-xs text-gray-400">—</span>
+    );
+  return (
+    <div className="flex items-center gap-3 justify-end">
+      {statusEl}
+      {doc.job_status && doc.latest_job_id && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            onDelete();
+          }}
+          className="text-xs text-red-700 hover:underline"
+          title="Remove the document and all artifacts permanently"
+        >
+          Delete
+        </button>
+      )}
+    </div>
+  );
 }
 
 function LiveIndicator() {
@@ -343,7 +362,6 @@ export default function DashboardPage() {
                   <th className="text-left px-4 py-2 font-medium">Pages</th>
                   <th className="text-left px-4 py-2 font-medium">Uploaded</th>
                   <th className="text-right px-4 py-2 font-medium">Progress</th>
-                  <th className="text-right px-4 py-2 font-medium w-24"></th>
                 </tr>
               </thead>
               <tbody className="divide-y">
@@ -398,14 +416,18 @@ export default function DashboardPage() {
                             .then(() => refresh(false))
                             .catch(() => refresh(false));
                         }}
-                      />
-                    </td>
-                    <td className="px-4 py-3 text-right">
-                      <RowActions
-                        jobId={d.latest_job_id}
-                        jobStatus={d.job_status}
-                        filename={d.original_filename}
-                        onChanged={() => refresh(false)}
+                        onDelete={() => {
+                          if (!d.latest_job_id) return;
+                          const ok = window.confirm(
+                            `Delete "${d.original_filename}"? This removes the document, its job history, and any generated artifacts. This cannot be undone.`,
+                          );
+                          if (!ok) return;
+                          apiFetch(`/api/jobs/${d.latest_job_id}`, {
+                            method: "DELETE",
+                          })
+                            .then(() => refresh(false))
+                            .catch(() => refresh(false));
+                        }}
                       />
                     </td>
                   </tr>
