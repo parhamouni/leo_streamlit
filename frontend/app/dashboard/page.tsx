@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { supabase } from "@/lib/supabase";
-import { apiJson, ApiError } from "@/lib/api";
+import { apiFetch, apiJson, ApiError } from "@/lib/api";
 import { etaSeconds, formatEta } from "@/lib/eta";
 import { UploadButton } from "@/components/UploadButton";
 import {
@@ -63,7 +63,13 @@ function isActive(d: Document): boolean {
   return d.job_status === "queued" || d.job_status === "running";
 }
 
-function ProgressCell({ doc }: { doc: Document }) {
+function ProgressCell({
+  doc,
+  onCancel,
+}: {
+  doc: Document;
+  onCancel: () => void;
+}) {
   if (doc.job_status === "running" || doc.job_status === "queued") {
     const pct = doc.progress_percent ?? 0;
     const eta = formatEta(etaSeconds(doc.job_started_at, pct));
@@ -79,10 +85,25 @@ function ProgressCell({ doc }: { doc: Document }) {
           {pct}%
         </span>
         {eta && (
-          <span className="text-[10px] text-gray-400 font-mono w-16 text-right">
+          <span className="text-[10px] text-gray-400 font-mono w-12 text-right">
             {eta}
           </span>
         )}
+        {/* Cancel sits inline with the running progress — it cancels
+            *this* run, so visually pair it here instead of the far-right
+            actions column. Delete (for terminal jobs) stays in actions. */}
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            onCancel();
+          }}
+          className="text-xs text-yellow-700 hover:underline ml-1"
+          title="Stop this job"
+        >
+          Cancel
+        </button>
       </div>
     );
   }
@@ -367,7 +388,17 @@ export default function DashboardPage() {
                       {formatDate(d.created_at)}
                     </td>
                     <td className="px-4 py-3 text-right">
-                      <ProgressCell doc={d} />
+                      <ProgressCell
+                        doc={d}
+                        onCancel={() => {
+                          if (!d.latest_job_id) return;
+                          apiFetch(`/api/jobs/${d.latest_job_id}`, {
+                            method: "DELETE",
+                          })
+                            .then(() => refresh(false))
+                            .catch(() => refresh(false));
+                        }}
+                      />
                     </td>
                     <td className="px-4 py-3 text-right">
                       <RowActions
