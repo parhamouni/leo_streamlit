@@ -7,7 +7,7 @@
 **Plan file:** `/home/ubuntu/.claude/plans/yes-i-get-you-refactored-hummingbird.md`
 **Stage-1 highlighting plan (now superseded — work below is done):** `/home/ubuntu/.claude/plans/fuck-you-you-are-splendid-beacon.md`
 **Decision log:** UMT confirmed **critical-path** (customers always correct measurements manually).
-**Last updated:** 2026-05-09 — **Sprint 4 (UMT) complete + non-fence UX polish + Phase 10.1 authorization tests.** Sprint 4: drawing mode (4a.5), zoom + pan + Ctrl/Cmd-wheel zoom-around-cursor (4a.6), C8 cross-page measurement summary (4a.7), Measurement PDF/Excel honor UMT edits (4a.8). UX: per-line popover, layer highlight + per-layer category dropdown, 🎯 smart auto-assign with layer-vote confidence thresholds. Non-fence pages: pipeline now persists classifier reason / confidence / signals; `NonFencePageCard` shows reasoning teaser + LLM signals + on-demand page image; **fixed page-image misalignment bug** that was serving wrong-page from highlighted PDF when page_num didn't match a fence page index. Phase 10.1: `tests/test_authorization.py` (19 tests, 50/50 suite green) — every job-scoped endpoint rejects cross-user requests with 403/404. Sprint-4 plan: `.claude/plans/sprint4-umt-react-canvas.md`. **Next:** Phase 10.2 (upload limits + metadata) or Phase 11 (deploy).
+**Last updated:** 2026-05-09 — **🚀 LIVE in staging: full end-to-end deploy.** Vercel frontend at https://leo-streamlit.vercel.app, AWS backend at `3.144.148.83` (no TLS — Vercel rewrite proxy bridges HTTPS browser ↔ HTTP backend). Sprint 4 UMT complete (4a.5 drawing, 4a.6 zoom+pan+wheel-zoom, 4a.7 C8 summary, 4a.8 exports honor UMT edits). UX bonuses: per-line popover, layer highlight + per-layer dropdown, 🎯 smart auto-assign, indicator-code dedup, /tmp eviction fallbacks, classifier-reasoning persistence, page-image misalignment fix. Phase 10.1: 19 cross-user authorization tests, 50/50 suite green. Phase 11 shipped: `fence-api-v2.service` on port 8513 (legacy `fence-api`/`fence-fast`/`stale-restart`/`watchdog` disabled), nginx as default_server on :80, Supabase JWT auth, Postgres pooler, worker tuning (`FENCE_WORKERS_PHASE3=8`, `FENCE_API_WORKER_COUNT=2`, `MemoryMax=32G`). **Next:** Phase 10.2 (upload limits + metadata logging) and final-cutover obligations (TLS via real domain, secret rotation, S3 storage migration).
 
 ---
 
@@ -250,11 +250,33 @@ Plan refs: D1 / D2 / D3.
 - 10.1 ✅ — `tests/test_authorization.py` covering cross-user 403/404 against all job-scoped endpoints (commit `dec5e61`, 19 tests, 50/50 suite green). Postgres-backed `/api/documents*` ownership tested separately when JWT mocking lands.
 - 10.2 ⏳ — file-size + page-count limits already enforced; need cost/perf metadata logged to `jobs` (file_size, duration_ms, model)
 
-### Phase 11 — deployment
-- 11.1 — Vercel deploy of `frontend/` (env vars, branch deploys)
-- 11.2 — `infra/systemd/fence-api-v2.service` (separate from prod's `fence-api.service`); nginx proxy for `api.<host>` → uvicorn
-- 11.3 — Production CORS allowlist + Supabase Auth → URL Configuration with Vercel domain
-- (deferred until later) S3 storage migration when going multi-instance — Sprint deferred from original Phase 5; storage_path keys already in S3-shape
+### Phase 11 — deployment ✅ DEPLOYED 2026-05-09 (staging)
+
+**Frontend** — `https://leo-streamlit.vercel.app`
+- Vercel project `leo-streamlit` (team: parhamhamouni-7949s, Hobby tier)
+- Deploys from `main` branch, root `frontend/`
+- Env vars (Production + Preview):
+  - `NEXT_PUBLIC_SUPABASE_URL=https://ssngaoyhxcghacdugdog.supabase.co`
+  - `NEXT_PUBLIC_SUPABASE_ANON_KEY=sb_publishable_…`
+  - `FENCE_API_INTERNAL_URL=http://3.144.148.83`
+- Auto-deploys on push to `main`; rebuild without cache to pick up env-var changes for `next.config.mjs` rewrites
+
+**Backend** — `http://3.144.148.83/api/*` (proxied by Vercel edge → no public TLS yet)
+- AWS EC2: 16 vCPU Xeon Platinum, 61 GiB RAM, public IP `3.144.148.83`
+- `fence-api-v2.service` (uvicorn) on `127.0.0.1:8513`, `MemoryMax=32G`
+- nginx `fence-api-v2` site as `default_server` on `:80`, no other sites enabled
+- All legacy systemd units (`fence-api`, `fence-fast`, `fence-stale-restart.timer`, `fence-watchdog.timer`) disabled — unit files preserved in `/etc/systemd/system/` for one-line revival
+- Env file `/etc/fence-api-v2/env` (root:root 600): Supabase URL/JWKS/anon, IPv4 pooler `DATABASE_URL`, `FENCE_CORS_ORIGINS` + regex, `FENCE_API_AUTH_MODE=supabase`, worker counts (`FENCE_WORKERS_PHASE3=8`, `_PHASE2=8`, `_PHASE1A=8`, `_PHASE1B=16`, `FENCE_API_WORKER_COUNT=2` for 2 concurrent jobs)
+
+**Auth** — Supabase
+- Site URL = `https://leo-streamlit.vercel.app`
+- Redirect URLs = `https://leo-streamlit.vercel.app/**` + `http://localhost:3000/**`
+
+**Open items (deliberately deferred)**
+- **TLS on backend** — needs a real domain. Browser→Vercel is HTTPS; Vercel→AWS is plain HTTP server-to-server (acceptable for staging because every protected endpoint enforces JWT ownership). Before "real customers": grab a free hostname (DuckDNS / Cloudflare tunnel) and switch nginx to the TLS template at `infra/nginx/fence-api-v2.conf`.
+- **`/tmp` source PDFs** — wiped on reboot. Measurement PDF endpoint already 404s with a re-upload message in that case. S3 migration is the durable fix.
+- **Single-box deployment** — `FENCE_API_WORKER_COUNT=2` lets two jobs run in parallel; for multi-instance scale-out, swap the in-process worker for Redis+RQ (Phase 7, deferred).
+- **Migrations 003 + 004** — apply in Supabase SQL Editor (idempotent SQL in `backend/db/migrations/`). Until 003 runs, A8's within-phase ETA bar stays empty.
 
 ### Phase 7 — Redis/RQ
 Currently SQLite-based [job_registry.py](job_registry.py) handles queueing. Migration to Redis/RQ deferred until multi-instance deployment. Not blocking launch.
@@ -268,7 +290,7 @@ Currently SQLite-based [job_registry.py](job_registry.py) handles queueing. Migr
 3. ~~**Sprint 4 remaining checkpoints (4a.7–4a.8)**~~ — DONE 2026-05-08/09. (Manual scale-override numeric input still deferred until asked.)
 4. ~~**Phase 10.1** — authorization tests~~ — DONE 2026-05-09 (commit `dec5e61`).
 5. **Phase 10.2** — upload limits + cost/perf metadata on `jobs` rows (file_size, duration_ms, model). Data is collected by `telemetry.py` / `spend_tracker.py`; just needs to be wired into the row.
-6. **Phase 11** — Vercel + AWS deployment
+6. ~~**Phase 11** — Vercel + AWS deployment~~ — DONE 2026-05-09 (staging). Production-ready bits remaining: TLS on backend (needs domain), secret rotation, S3 storage.
 7. (later) Sprint 5 (operational/observability), S3 migration, Redis/RQ migration
 
 ---
@@ -304,10 +326,34 @@ Order: non-prod first (DB password, test user) → prod-affecting last (Google s
 
 ## How to resume
 
+### Production / staging (as deployed 2026-05-09)
+
 ```bash
-# Backend (terminal 1)
+# Backend is a systemd unit; do not run uvicorn manually.
+sudo systemctl status fence-api-v2
+sudo journalctl -u fence-api-v2 -f          # live logs
+sudo systemctl restart fence-api-v2         # picks up /etc/fence-api-v2/env changes
+
+# Edit env (auth, CORS, workers, Postgres URL):
+sudoedit /etc/fence-api-v2/env
+
+# Edit nginx site:
+sudoedit /etc/nginx/sites-available/fence-api-v2
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+External URLs:
+- Frontend: https://leo-streamlit.vercel.app
+- Backend health: http://3.144.148.83/api/healthz
+
+### Local dev (legacy — for code changes)
+
+```bash
+# Backend (terminal 1) — only if you want to test code without deploying.
+# WILL conflict with the systemd unit on port 8513; stop the unit first
+# OR pick a different port and update FENCE_API_INTERNAL_URL on Vercel preview.
 cd /home/ubuntu/leo_streamlit
-fuser -k 8513/tcp 2>/dev/null   # in case old one is stuck
+sudo systemctl stop fence-api-v2
 FENCE_API_AUTH_MODE=both ./venv/bin/uvicorn api_server:app \
   --host 127.0.0.1 --port 8513 --reload
 
@@ -316,8 +362,6 @@ cd /home/ubuntu/leo_streamlit/frontend
 npm run dev   # serves on http://localhost:3000
 
 # Login at http://localhost:3000/login
-# - email/password: anything you create (auto-confirm enabled in Supabase)
-# - or Google OAuth via your existing leofence Google Cloud project
 ```
 
 A fresh Claude session starting here can read this file + the plan, then ask the user which sprint to tackle next.

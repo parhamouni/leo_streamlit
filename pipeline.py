@@ -773,6 +773,7 @@ def run_analysis(
                         scale_factor=scale_val,
                         ocr_text=text,
                         light_llm=llm_classifier,
+                        enable_nonlayer_suggestions=config.enable_nonlayer_suggestions,
                     )
                     measurements = _normalize_measurements(measurements or {})
                     page_result["measurements"] = measurements
