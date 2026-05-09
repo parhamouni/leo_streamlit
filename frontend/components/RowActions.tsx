@@ -11,10 +11,12 @@ type Props = {
 };
 
 /**
- * Per-row Cancel / Delete action.
+ * Per-row action button. Lives in the dashboard's far-right column.
  *
- * - jobStatus in {queued, running}  → "Cancel" button (no confirm)
  * - jobStatus in {completed, failed, cancelled}  → "Delete" button (confirms)
+ * - jobStatus in {queued, running}  → nothing here. Cancel is rendered
+ *   inline with the progress bar (see ProgressCell in dashboard/page.tsx)
+ *   so it's visually paired with the work it stops.
  * - no job (e.g. dedup edge case)  → nothing
  */
 export function RowActions({ jobId, jobStatus, filename, onChanged }: Props) {
@@ -23,11 +25,11 @@ export function RowActions({ jobId, jobStatus, filename, onChanged }: Props) {
 
   if (!jobId || !jobStatus) return null;
 
-  const isActive = jobStatus === "queued" || jobStatus === "running";
   const isTerminal =
     jobStatus === "completed" ||
     jobStatus === "failed" ||
     jobStatus === "cancelled";
+  if (!isTerminal) return null;
 
   async function run(verb: "cancel" | "delete") {
     if (verb === "delete") {
@@ -53,26 +55,14 @@ export function RowActions({ jobId, jobStatus, filename, onChanged }: Props) {
       className="flex items-center justify-end gap-2"
       onClick={(e) => e.stopPropagation()}
     >
-      {isActive && (
-        <button
-          onClick={() => run("cancel")}
-          disabled={busy}
-          className="text-xs text-yellow-700 hover:underline disabled:opacity-50"
-          title="Stop this job — keeps the row, marks it cancelled"
-        >
-          {busy ? "…" : "Cancel"}
-        </button>
-      )}
-      {isTerminal && (
-        <button
-          onClick={() => run("delete")}
-          disabled={busy}
-          className="text-xs text-red-700 hover:underline disabled:opacity-50"
-          title="Remove the document and all artifacts permanently"
-        >
-          {busy ? "…" : "Delete"}
-        </button>
-      )}
+      <button
+        onClick={() => run("delete")}
+        disabled={busy}
+        className="text-xs text-red-700 hover:underline disabled:opacity-50"
+        title="Remove the document and all artifacts permanently"
+      >
+        {busy ? "…" : "Delete"}
+      </button>
       {error && (
         <span className="text-xs text-red-600 ml-2" title={error}>
           ⚠
