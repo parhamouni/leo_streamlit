@@ -46,12 +46,26 @@ from utils_vector import (
     extract_vector_lines,
     verify_scale_with_bar,
     verify_scale_with_bar_fast,
+    transform_coords_for_rotation,
 )
 from config import cfg
 
 log = logging.getLogger("pipeline")
 
 ProgressCallback = Callable[[str, int, str], None]
+
+# Fired once per page when classification is known (Phase 1c) and again per
+# fence page when full enrichment is available (Phase 3). The dict carries:
+#   page_number   — 1-indexed page (matches the page_results schema)
+#   is_fence_page — bool from classification
+#   result_json   — partial or full per-page payload, or None for the
+#                   minimal Phase 1c stub
+# Workers can upsert this straight into Postgres `page_results`.
+PageCallback = Callable[[dict], None]
+
+
+def _noop_page(_page: dict) -> None:
+    pass
 
 
 @dataclass
@@ -107,6 +121,42 @@ def _noop_progress(phase: str, pct: int, message: str) -> None:
     pass
 
 
+def _line_to_dict(line: Any) -> dict:
+    """Coerce a `VectorLine` (or similar) into a JSON-friendly dict so that
+    `all_fence_lines` survives `json.dumps` to disk. Plain dicts pass
+    through; everything else gets best-effort attribute extraction."""
+    if isinstance(line, dict):
+        return line
+    if hasattr(line, "__dataclass_fields__"):
+        from dataclasses import asdict
+        try:
+            return asdict(line)
+        except Exception:
+            pass
+    out: dict[str, Any] = {}
+    for attr in ("start", "end", "length_pts", "color", "width", "dashes", "layer"):
+        if hasattr(line, attr):
+            out[attr] = getattr(line, attr)
+    return out
+
+
+def _normalize_measurements(measurements: dict) -> dict:
+    """Make a measurement payload JSON-safe before it lands in
+    `result.fence_pages` / `job_registry.save_results` / fence_cache.
+
+    Today's only offender is `all_fence_lines`, a list of `VectorLine`
+    dataclasses that `json.dumps(..., default=str)` was silently turning
+    into repr strings — defeating downstream exporters and the highlight
+    overlay that wants to read line geometry."""
+    if not isinstance(measurements, dict):
+        return measurements
+    out = dict(measurements)
+    afl = out.get("all_fence_lines")
+    if isinstance(afl, list):
+        out["all_fence_lines"] = [_line_to_dict(ln) for ln in afl]
+    return out
+
+
 def _sha256_file(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -159,6 +209,7 @@ def run_analysis(
     pdf_path: str,
     config: PipelineConfig,
     progress_cb: ProgressCallback | None = None,
+    page_cb: PageCallback | None = None,
 ) -> PipelineResult:
     """Run the full fence detection pipeline on a PDF.
 
@@ -166,6 +217,7 @@ def run_analysis(
     Returns a PipelineResult with all analysis data.
     """
     progress = progress_cb or _noop_progress
+    emit_page = page_cb or _noop_page
     result = PipelineResult()
     timings: dict[str, float] = {}
     t_start = time.perf_counter()
@@ -261,6 +313,13 @@ def run_analysis(
         progress("phase1b", 18, "Phase 1b: Running OCR on scanned pages...")
 
         ocr_texts_by_page: dict[str, str] = {}
+        # Per-page OCR lines WITH bboxes — mirrors app_ade_prod's
+        # `_ocr_lines_by_page`. Required for keyword/legend/instance
+        # highlighting on scanned pages whose native PDF text is missing
+        # or unmappable (CID fonts without ToUnicode CMap). Cache key was
+        # bumped to phase1b_v2 because the previous version stored only
+        # the joined text — we want the original line dicts back.
+        ocr_lines_by_page: dict[int, list[dict]] = {}
         if config.google_cloud_config:
             pages_needing_ocr = []
             for pi in valid_pages:
@@ -268,10 +327,11 @@ def run_analysis(
                     continue
                 native_text = page_texts.get(str(pi), "")
                 if len(native_text.strip()) < 50:
-                    cached_ocr = fence_cache.get("phase1b", pdf_hash, params,
+                    cached_ocr = fence_cache.get("phase1b_v2", pdf_hash, params,
                                                   page_idx=pi, user_scope=cache_scope)
                     if cached_ocr is not None:
                         ocr_texts_by_page[str(pi)] = cached_ocr.get("ocr_text", "")
+                        ocr_lines_by_page[pi] = cached_ocr.get("lines") or []
                     else:
                         pages_needing_ocr.append(pi)
 
@@ -298,9 +358,10 @@ def run_analysis(
                             text = " ".join(
                                 ln.get("text", "") for ln in lines).strip()
                             ocr_texts_by_page[str(pi)] = text
-                            fence_cache.put("phase1b", pdf_hash, params,
-                                           {"ocr_text": text}, page_idx=pi,
-                                           user_scope=cache_scope)
+                            ocr_lines_by_page[pi] = lines
+                            fence_cache.put("phase1b_v2", pdf_hash, params,
+                                           {"ocr_text": text, "lines": lines},
+                                           page_idx=pi, user_scope=cache_scope)
                     except Exception as e:
                         log.warning(f"Phase 1b batch OCR failed: {e}")
                         for pi in batch:
@@ -315,9 +376,10 @@ def run_analysis(
                                     ln.get("text", "") for ln in ocr_lines
                                 ).strip()
                                 ocr_texts_by_page[str(pi)] = text
-                                fence_cache.put("phase1b", pdf_hash, params,
-                                               {"ocr_text": text}, page_idx=pi,
-                                               user_scope=cache_scope)
+                                ocr_lines_by_page[pi] = ocr_lines
+                                fence_cache.put("phase1b_v2", pdf_hash, params,
+                                               {"ocr_text": text, "lines": ocr_lines},
+                                               page_idx=pi, user_scope=cache_scope)
                             except Exception:
                                 pass
 
@@ -337,6 +399,16 @@ def run_analysis(
 
         fence_page_indices: list[int] = []
         non_fence_page_indices: list[int] = []
+        # page_idx -> list of {keyword, text, x0, y0, x1, y1, source} dicts
+        # produced by scan_page_for_keywords_fast. Surfaced into
+        # page_result["keyword_matches"] so the highlight worker can draw
+        # orange rectangles around fence-keyword text (stage-1 overlay).
+        keyword_matches_by_page: dict[int, list[dict]] = {}
+        # page_idx -> {method, reason, confidence, signals, keyword_count}
+        # Captured during classification so the user can see WHY a page was
+        # marked non-fence. Cached entries (re-runs) only have method;
+        # fresh classifications get the rich payload.
+        classification_meta: dict[int, dict] = {}
 
         pages_to_classify: list[int] = []
         for pi in valid_pages:
@@ -349,6 +421,14 @@ def run_analysis(
                     fence_page_indices.append(pi)
                 else:
                     non_fence_page_indices.append(pi)
+                # Pull whatever rich fields the cache happens to have. Old
+                # cache entries only have {is_fence, method}; new ones
+                # carry reason/confidence/signals/keyword_count.
+                classification_meta[pi] = {
+                    k: cached_cls.get(k)
+                    for k in ("method", "reason", "confidence", "signals", "keyword_count")
+                    if cached_cls.get(k) is not None
+                }
             else:
                 pages_to_classify.append(pi)
 
@@ -359,11 +439,24 @@ def run_analysis(
                 pdf_lines = _text_to_lines(page_texts.get(str(pi), ""), "pdf")
                 ocr_lines = _text_to_lines(ocr_texts_by_page.get(str(pi), ""), "ocr")
                 kw_result = ade.scan_page_for_keywords_fast(pdf_lines, ocr_lines, config.fence_keywords)
+                # Keep matched_lines so the per-page result can render orange
+                # keyword-match rectangles in the highlighted PDF (parity with
+                # app_ade_prod's stage-1 overlay).
+                keyword_matches_by_page[pi] = kw_result.get("matched_lines", []) or []
+                kw_count = len(kw_result.get("matched_lines") or [])
                 if kw_result.get("has_keywords"):
                     keyword_hits[pi] = True
                     fence_page_indices.append(pi)
-                    fence_cache.put("phase1c", pdf_hash, params,
-                                   {"is_fence": True, "method": "keyword"},
+                    cls_payload = {
+                        "is_fence": True,
+                        "method": "keyword",
+                        "keyword_count": kw_count,
+                    }
+                    classification_meta[pi] = {
+                        "method": "keyword",
+                        "keyword_count": kw_count,
+                    }
+                    fence_cache.put("phase1c", pdf_hash, params, cls_payload,
                                    page_idx=pi, user_scope=cache_scope)
                 else:
                     llm_needed.append(pi)
@@ -386,22 +479,63 @@ def run_analysis(
                                 fence_page_indices.append(pi)
                             else:
                                 non_fence_page_indices.append(pi)
+                            meta = {
+                                "method": "llm",
+                                "reason": page_cls.get("reason"),
+                                "confidence": page_cls.get("confidence"),
+                                "signals": page_cls.get("signals"),
+                            }
+                            # Strip Nones to keep payload lean.
+                            meta = {k: v for k, v in meta.items() if v is not None}
+                            classification_meta[pi] = meta
                             fence_cache.put("phase1c", pdf_hash, params,
-                                           {"is_fence": is_fence, "method": "llm"},
+                                           {"is_fence": is_fence, **meta},
                                            page_idx=pi, user_scope=cache_scope)
                     except Exception as e:
                         log.warning(f"Phase 1c LLM batch failed: {e}")
                         for pi in batch:
                             non_fence_page_indices.append(pi)
+                            classification_meta[pi] = {
+                                "method": "error",
+                                "reason": f"LLM batch failed: {e}",
+                            }
                             fence_cache.put("phase1c", pdf_hash, params,
-                                           {"is_fence": False, "method": "error"},
+                                           {"is_fence": False, "method": "error",
+                                            "reason": f"LLM batch failed: {e}"},
                                            page_idx=pi, user_scope=cache_scope)
             elif llm_needed:
                 for pi in llm_needed:
                     non_fence_page_indices.append(pi)
+                    classification_meta[pi] = {
+                        "method": "no_llm",
+                        "reason": "no LLM classifier configured; defaulted to non-fence",
+                    }
 
         fence_page_indices.sort()
         non_fence_page_indices.sort()
+
+        # Emit Phase 1c stubs so the frontend can render placeholder rows
+        # (and the dashboard's "pages so far" counter) before Phase 3
+        # finishes enriching them. Fence pages get overwritten with the full
+        # payload below; non-fence pages keep their stub.
+        for pi in fence_page_indices:
+            try:
+                emit_page({
+                    "page_number": pi + 1,
+                    "is_fence_page": True,
+                    "result_json": {"page_idx": pi, "page_num": pi + 1, "phase": "phase1c"},
+                })
+            except Exception:
+                log.exception("page_cb (phase1c fence) failed")
+        for pi in non_fence_page_indices:
+            try:
+                emit_page({
+                    "page_number": pi + 1,
+                    "is_fence_page": False,
+                    "result_json": {"page_idx": pi, "page_num": pi + 1, "phase": "phase1c"},
+                })
+            except Exception:
+                log.exception("page_cb (phase1c non-fence) failed")
 
         timings["phase1c"] = time.perf_counter() - t1c
         progress("phase1c", 45, f"Phase 1c done: {len(fence_page_indices)} fence, "
@@ -410,7 +544,12 @@ def run_analysis(
         if not fence_page_indices:
             progress("done", 100, "No fence pages found")
             result.non_fence_pages = [
-                {"page_idx": pi, "page_num": pi + 1} for pi in non_fence_page_indices
+                {
+                    "page_idx": pi,
+                    "page_num": pi + 1,
+                    **(classification_meta.get(pi) or {}),
+                }
+                for pi in non_fence_page_indices
             ]
             result.timings = timings
             doc.close()
@@ -501,26 +640,37 @@ def run_analysis(
             chunks = ade_chunks_by_page.get(pi, [])
             page_result["ade_chunks"] = chunks
 
+            # ----- Stage-1 highlight data (matches app_ade_prod.py) -----
+            # Three-layer overlay: green = legend entries (per-row), purple =
+            # figure instances (per-token indicator hits), orange = keyword
+            # fallback. Mirrors app_ade_prod's generate_combined_highlighted_pdf
+            # at lines 1562-1670 and the orchestration at 4654-4703 / 4887-4896.
             if chunks:
                 legend_chunks, figure_chunks = ade.segment_chunks(chunks)
-                page_result["definitions"] = legend_chunks
-                page_result["instances"] = figure_chunks
-                page_result["keyword_matches"] = []
             else:
-                page_result["definitions"] = []
-                page_result["instances"] = []
-                page_result["keyword_matches"] = []
+                legend_chunks, figure_chunks = [], []
 
-            legend_chunks = page_result.get("definitions", [])
-            figure_chunks = page_result.get("instances", [])
-            pdf_lines = _text_to_lines(page_texts.get(str(pi), ""), "pdf")
-            ocr_lines = _text_to_lines(ocr_texts_by_page.get(str(pi), ""), "ocr")
+            # Per-line PDF and OCR text dicts WITH real bboxes in display
+            # space — mirrors app_ade_prod's _pdf_lines_by_page +
+            # _ocr_lines_by_page pipeline. Using these gives all three
+            # highlight layers (definitions / instances / keyword_matches)
+            # the same geometry source prod uses, so highlights render
+            # correctly on scanned pages whose native PDF text is missing
+            # or unmappable (CID fonts without ToUnicode CMap).
+            try:
+                pdf_lines = ade.get_native_pdf_lines(doc[pi])
+            except Exception as e:
+                log.warning(f"Phase 3 native pdf lines page {pi}: {e}")
+                pdf_lines = []
+            ocr_lines = ocr_lines_by_page.get(pi, []) or []
 
-            # Legend extraction
+            # Legend entries — one dict per legend row, tight bbox around the
+            # legend item's text. Used both for the detail-page table
+            # (`legend_entries`) and the green highlight layer (`definitions`).
             cached_legend = fence_cache.get("phase3_legend", pdf_hash, params,
                                            page_idx=pi, user_scope=cache_scope)
             if cached_legend is not None:
-                page_result["legend_entries"] = cached_legend.get("entries", [])
+                legend_entries = cached_legend.get("entries", []) or []
             elif llm_analysis and chunks:
                 try:
                     legend_entries = ade.extract_legend_entries(
@@ -528,15 +678,63 @@ def run_analysis(
                         config.fence_keywords, llm_analysis,
                         figure_chunks=figure_chunks,
                     )
-                    page_result["legend_entries"] = legend_entries
                     fence_cache.put("phase3_legend", pdf_hash, params,
                                    {"entries": legend_entries}, page_idx=pi,
                                    user_scope=cache_scope)
                 except Exception as e:
                     log.warning(f"Phase 3 legend page {pi}: {e}")
-                    page_result["legend_entries"] = []
+                    legend_entries = []
             else:
-                page_result["legend_entries"] = []
+                legend_entries = []
+            page_result["legend_entries"] = legend_entries
+
+            # Figure instances — search figure-chunk tokens for indicator
+            # strings from legend_entries, return one dict per matched token.
+            # Mirrors app_ade_prod.py:4670-4703.
+            cached_instances = fence_cache.get("phase3_instances", pdf_hash, params,
+                                               page_idx=pi, user_scope=cache_scope)
+            if cached_instances is not None:
+                figure_instances = cached_instances.get("instances", []) or []
+            elif legend_entries and figure_chunks:
+                try:
+                    page_obj = doc[pi]
+                    rotation_deg = page_obj.rotation
+                    mbox_w = page_obj.mediabox.width
+                    mbox_h = page_obj.mediabox.height
+                    all_page_tokens: list[dict] = []
+                    for w in page_obj.get_text("words"):
+                        tx0, ty0 = transform_coords_for_rotation(
+                            w[0], w[1], rotation_deg, mbox_w, mbox_h)
+                        tx1, ty1 = transform_coords_for_rotation(
+                            w[2], w[3], rotation_deg, mbox_w, mbox_h)
+                        all_page_tokens.append({
+                            "text": w[4],
+                            "x0": min(tx0, tx1), "y0": min(ty0, ty1),
+                            "x1": max(tx0, tx1), "y1": max(ty0, ty1),
+                        })
+                    figure_instances = ade.find_instances_in_figures_fast(
+                        legend_entries, figure_chunks, all_page_tokens,
+                        ocr_lines=ocr_lines,
+                    )
+                    fence_cache.put("phase3_instances", pdf_hash, params,
+                                   {"instances": figure_instances}, page_idx=pi,
+                                   user_scope=cache_scope)
+                except Exception as e:
+                    log.warning(f"Phase 3 instances page {pi}: {e}")
+                    figure_instances = []
+            else:
+                figure_instances = []
+
+            page_result["definitions"] = legend_entries
+            page_result["instances"] = figure_instances
+
+            # Orange = fence-keyword text. Always populate so keyword
+            # rectangles render alongside green/purple even when ADE
+            # succeeded. pdf_lines / ocr_lines already carry real bboxes
+            # (built above), so matches land at the right location.
+            kw_result = ade.scan_page_for_keywords_fast(
+                pdf_lines, ocr_lines, config.fence_keywords)
+            page_result["keyword_matches"] = kw_result.get("matched_lines", []) or []
 
             # Scale detection
             cached_scale = fence_cache.get("phase3_scale", pdf_hash, params,
@@ -562,7 +760,7 @@ def run_analysis(
             cached_measure = fence_cache.get("phase3_measure", pdf_hash, params,
                                             page_idx=pi, user_scope=cache_scope)
             if cached_measure is not None:
-                page_result["measurements"] = cached_measure
+                page_result["measurements"] = _normalize_measurements(cached_measure)
             elif config.enable_unified_measurement:
                 try:
                     page_obj = doc[pi]
@@ -576,9 +774,10 @@ def run_analysis(
                         ocr_text=text,
                         light_llm=llm_classifier,
                     )
-                    page_result["measurements"] = measurements or {}
+                    measurements = _normalize_measurements(measurements or {})
+                    page_result["measurements"] = measurements
                     fence_cache.put("phase3_measure", pdf_hash, params,
-                                   measurements or {}, page_idx=pi,
+                                   measurements, page_idx=pi,
                                    user_scope=cache_scope)
                 except Exception as e:
                     log.warning(f"Phase 3 measure page {pi}: {e}")
@@ -603,13 +802,24 @@ def run_analysis(
                         per_page_measurements[str(pi)] = page_result["measurements"]
                 except Exception as e:
                     log.warning(f"Phase 3 page {pi} failed: {e}")
-                    fence_results.append({
+                    page_result = {
                         "page_idx": pi, "page_num": pi + 1,
                         "error": str(e),
-                    })
+                    }
+                    fence_results.append(page_result)
                 completed_count += 1
                 pct = 63 + int(30 * completed_count / max(len(fence_page_indices), 1))
                 progress("phase3", pct, f"Phase 3: {completed_count}/{len(fence_page_indices)} pages")
+                # Stream the enriched page row out so the frontend can render
+                # measurements / scale / legends as soon as each page finishes.
+                try:
+                    emit_page({
+                        "page_number": pi + 1,
+                        "is_fence_page": True,
+                        "result_json": page_result,
+                    })
+                except Exception:
+                    log.exception(f"page_cb (phase3 fence pi={pi}) failed")
 
         fence_results.sort(key=lambda x: x.get("page_idx", 0))
 
@@ -649,7 +859,12 @@ def run_analysis(
         # ---- Assemble result ----
         result.fence_pages = fence_results
         result.non_fence_pages = [
-            {"page_idx": pi, "page_num": pi + 1} for pi in non_fence_page_indices
+            {
+                "page_idx": pi,
+                "page_num": pi + 1,
+                **(classification_meta.get(pi) or {}),
+            }
+            for pi in non_fence_page_indices
         ]
         result.element_details = element_details or {}
         result.highlighted_pdf_bytes = highlighted_pdf_bytes
@@ -685,10 +900,35 @@ def _generate_highlighted_pdf(
             "ops", "highlight_pdf_worker.py",
         )
 
+        import tempfile, uuid
+        out_path = os.path.join(
+            tempfile.gettempdir(),
+            f"highlight_{uuid.uuid4().hex}.pdf",
+        )
+
         if os.path.exists(worker_script):
+            # Reshape fence_results for the worker. The stage-1 highlighted
+            # PDF carries only the keyword/instance/legend rectangles
+            # (green/purple/orange). Fence-line strokes belong to the stage-2
+            # measurement PDF (`/api/jobs/{id}/measurement-pdf`) — drawing
+            # them here floods the page with cyan and visually drowns the
+            # stage-1 overlay. The worker still accepts a `fence_lines`
+            # field; we just don't populate it from this code path.
+            worker_pages = []
+            for r in fence_results:
+                pi = r.get("page_idx")
+                if pi is None:
+                    continue
+                worker_pages.append({
+                    "page_index_in_original_doc": pi,
+                    "definitions": r.get("definitions") or [],
+                    "instances": r.get("instances") or [],
+                    "keyword_matches": r.get("keyword_matches") or [],
+                })
             task = {
                 "pdf_path": pdf_path,
-                "fence_pages": fence_results,
+                "out_path": out_path,
+                "fence_pages": worker_pages,
                 "highlight_fence_text": config.highlight_fence_text,
             }
             proc = subprocess.run(
@@ -697,10 +937,24 @@ def _generate_highlighted_pdf(
                 capture_output=True,
                 timeout=cfg.HIGHLIGHT_PDF_TIMEOUT,
             )
-            if proc.returncode == 0 and proc.stdout:
-                return proc.stdout
-            log.warning(f"Highlight worker failed (rc={proc.returncode}): "
-                       f"{proc.stderr[:500] if proc.stderr else 'no stderr'}")
+            if proc.returncode == 0 and os.path.exists(out_path):
+                try:
+                    with open(out_path, "rb") as f:
+                        return f.read()
+                finally:
+                    try:
+                        os.unlink(out_path)
+                    except Exception:
+                        pass
+            log.warning(
+                "Highlight worker failed (rc=%s): %s",
+                proc.returncode,
+                proc.stderr[:500] if proc.stderr else "no stderr",
+            )
+            try:
+                os.unlink(out_path)
+            except Exception:
+                pass
 
         doc = fitz.open(pdf_path)
         fence_page_set = {r["page_idx"] for r in fence_results if "page_idx" in r}
@@ -719,6 +973,9 @@ def _generate_highlighted_pdf(
                     annot.set_colors(stroke=cfg.HIGHLIGHT_COLOR_UI)
                     annot.set_border(width=cfg.HIGHLIGHT_WIDTH_UI)
                     annot.update()
+
+            # Stage-1 highlighter only draws keyword/instance/legend
+            # rectangles. Fence-line strokes are stage 2 (measurement PDF).
 
             for inst in page_result.get("instances", []):
                 bbox = inst.get("bbox")

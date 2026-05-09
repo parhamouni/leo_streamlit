@@ -10,8 +10,10 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Anchor lib/ and lib64/ to repo root — unanchored, they'd swallow
+# frontend/lib/ (intentional source code).
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -37,6 +39,17 @@ venv.bak/
 # Streamlit
 .streamlit/secrets.toml
 .streamlit/config.toml
+
+# Web-app migration env files (Supabase / S3 / Redis credentials)
+.env
+.env.local
+.env.*.local
+backend/.env
+backend/.env.local
+frontend/.env
+frontend/.env.local
+worker/.env
+worker/.env.local
 
 # OS
 .DS_Store

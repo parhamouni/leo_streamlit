@@ -100,6 +100,16 @@ class Config:
     RESULTS_TTL_HOURS: int = field(default_factory=lambda: _int_env("FENCE_RESULTS_TTL_HOURS", 24, hi=168))
     RESULTS_DIR: str = field(default_factory=lambda: os.path.expanduser(_str_env("FENCE_RESULTS_DIR", "~/.leo/results")))
 
+    # --- Web-app migration: Supabase auth (orthogonal to streamlit AUTH_MODE) ---
+    # API_AUTH_MODE values: "legacy_header" | "supabase" | "both"
+    #   legacy_header — endpoints trust X-User-Id (current behavior)
+    #   supabase      — endpoints require Authorization: Bearer <jwt>, verified via JWKS
+    #   both          — accept either; prefer JWT when present
+    API_AUTH_MODE: str = field(default_factory=lambda: _str_env("FENCE_API_AUTH_MODE", "legacy_header").lower().strip())
+    SUPABASE_URL: str = field(default_factory=lambda: _str_env("SUPABASE_URL", ""))
+    SUPABASE_ANON_KEY: str = field(default_factory=lambda: _str_env("SUPABASE_ANON_KEY", ""))
+    SUPABASE_JWKS_URL: str = field(default_factory=lambda: _str_env("SUPABASE_JWKS_URL", ""))
+
     # --- Upload limits (mirror old monolith) ---
     MAX_PDF_MB: int = field(default_factory=lambda: _int_env("FENCE_MAX_PDF_MB", 500, lo=1, hi=2000))
     MAX_PAGES: int = field(default_factory=lambda: _int_env("FENCE_MAX_PAGES", 300, lo=1, hi=5000))
