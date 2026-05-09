@@ -149,9 +149,12 @@ export type NonFencePage = {
     reasoning?: string;
     [k: string]: unknown;
   };
-  // Legacy field names that may show up
+  // Legacy / top-level field names emitted by pipeline.py.
   method?: string;
   reason?: string;
+  confidence?: number;
+  signals?: string[];
+  keyword_count?: number;
   keywords_found?: string[];
 };
 

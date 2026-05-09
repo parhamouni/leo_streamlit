@@ -404,6 +404,11 @@ def run_analysis(
         # page_result["keyword_matches"] so the highlight worker can draw
         # orange rectangles around fence-keyword text (stage-1 overlay).
         keyword_matches_by_page: dict[int, list[dict]] = {}
+        # page_idx -> {method, reason, confidence, signals, keyword_count}
+        # Captured during classification so the user can see WHY a page was
+        # marked non-fence. Cached entries (re-runs) only have method;
+        # fresh classifications get the rich payload.
+        classification_meta: dict[int, dict] = {}
 
         pages_to_classify: list[int] = []
         for pi in valid_pages:
@@ -416,6 +421,14 @@ def run_analysis(
                     fence_page_indices.append(pi)
                 else:
                     non_fence_page_indices.append(pi)
+                # Pull whatever rich fields the cache happens to have. Old
+                # cache entries only have {is_fence, method}; new ones
+                # carry reason/confidence/signals/keyword_count.
+                classification_meta[pi] = {
+                    k: cached_cls.get(k)
+                    for k in ("method", "reason", "confidence", "signals", "keyword_count")
+                    if cached_cls.get(k) is not None
+                }
             else:
                 pages_to_classify.append(pi)
 
@@ -430,11 +443,20 @@ def run_analysis(
                 # keyword-match rectangles in the highlighted PDF (parity with
                 # app_ade_prod's stage-1 overlay).
                 keyword_matches_by_page[pi] = kw_result.get("matched_lines", []) or []
+                kw_count = len(kw_result.get("matched_lines") or [])
                 if kw_result.get("has_keywords"):
                     keyword_hits[pi] = True
                     fence_page_indices.append(pi)
-                    fence_cache.put("phase1c", pdf_hash, params,
-                                   {"is_fence": True, "method": "keyword"},
+                    cls_payload = {
+                        "is_fence": True,
+                        "method": "keyword",
+                        "keyword_count": kw_count,
+                    }
+                    classification_meta[pi] = {
+                        "method": "keyword",
+                        "keyword_count": kw_count,
+                    }
+                    fence_cache.put("phase1c", pdf_hash, params, cls_payload,
                                    page_idx=pi, user_scope=cache_scope)
                 else:
                     llm_needed.append(pi)
@@ -457,19 +479,37 @@ def run_analysis(
                                 fence_page_indices.append(pi)
                             else:
                                 non_fence_page_indices.append(pi)
+                            meta = {
+                                "method": "llm",
+                                "reason": page_cls.get("reason"),
+                                "confidence": page_cls.get("confidence"),
+                                "signals": page_cls.get("signals"),
+                            }
+                            # Strip Nones to keep payload lean.
+                            meta = {k: v for k, v in meta.items() if v is not None}
+                            classification_meta[pi] = meta
                             fence_cache.put("phase1c", pdf_hash, params,
-                                           {"is_fence": is_fence, "method": "llm"},
+                                           {"is_fence": is_fence, **meta},
                                            page_idx=pi, user_scope=cache_scope)
                     except Exception as e:
                         log.warning(f"Phase 1c LLM batch failed: {e}")
                         for pi in batch:
                             non_fence_page_indices.append(pi)
+                            classification_meta[pi] = {
+                                "method": "error",
+                                "reason": f"LLM batch failed: {e}",
+                            }
                             fence_cache.put("phase1c", pdf_hash, params,
-                                           {"is_fence": False, "method": "error"},
+                                           {"is_fence": False, "method": "error",
+                                            "reason": f"LLM batch failed: {e}"},
                                            page_idx=pi, user_scope=cache_scope)
             elif llm_needed:
                 for pi in llm_needed:
                     non_fence_page_indices.append(pi)
+                    classification_meta[pi] = {
+                        "method": "no_llm",
+                        "reason": "no LLM classifier configured; defaulted to non-fence",
+                    }
 
         fence_page_indices.sort()
         non_fence_page_indices.sort()
@@ -504,7 +544,12 @@ def run_analysis(
         if not fence_page_indices:
             progress("done", 100, "No fence pages found")
             result.non_fence_pages = [
-                {"page_idx": pi, "page_num": pi + 1} for pi in non_fence_page_indices
+                {
+                    "page_idx": pi,
+                    "page_num": pi + 1,
+                    **(classification_meta.get(pi) or {}),
+                }
+                for pi in non_fence_page_indices
             ]
             result.timings = timings
             doc.close()
@@ -814,7 +859,12 @@ def run_analysis(
         # ---- Assemble result ----
         result.fence_pages = fence_results
         result.non_fence_pages = [
-            {"page_idx": pi, "page_num": pi + 1} for pi in non_fence_page_indices
+            {
+                "page_idx": pi,
+                "page_num": pi + 1,
+                **(classification_meta.get(pi) or {}),
+            }
+            for pi in non_fence_page_indices
         ]
         result.element_details = element_details or {}
         result.highlighted_pdf_bytes = highlighted_pdf_bytes

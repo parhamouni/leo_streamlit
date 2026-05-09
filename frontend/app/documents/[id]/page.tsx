@@ -983,7 +983,8 @@ function NonFencePageCard({
 }) {
   const reasoning = page.classification?.reasoning ?? page.reason;
   const method = page.classification?.method ?? page.method;
-  const conf = page.classification?.confidence;
+  const conf = page.classification?.confidence ?? page.confidence;
+  const signals = page.signals;
   // One-line teaser shown on the closed summary so the user can scan
   // many non-fence pages without expanding each. Strip newlines, clip
   // to ~110 chars.
@@ -1030,13 +1031,27 @@ function NonFencePageCard({
             Keywords found: {page.keywords_found.join(", ")}
           </div>
         )}
-        {/* Render the original page (no highlights) on demand so the user
-            can sanity-check the classification visually. */}
+        {signals && signals.length > 0 && (
+          <div className="text-xs text-gray-600">
+            <span className="text-gray-500 uppercase mr-1">LLM signals:</span>
+            {signals.join(", ")}
+          </div>
+        )}
+        {!reasoning && !method && (
+          <div className="text-xs text-gray-500 italic">
+            (No classifier reasoning was captured for this job. Re-run the
+            analysis to see why pages were excluded — the pipeline now
+            persists the LLM's reason / confidence / signals.)
+          </div>
+        )}
+        {/* Non-fence pages have no overlays drawn even in the highlighted
+            PDF, so the default "auto" source renders the page faithfully
+            without the original on disk. */}
         {jobId && (
           <PageImage
             jobId={jobId}
             pageNum={page.page_num}
-            source="original"
+            altText={`Page ${page.page_num} (non-fence)`}
           />
         )}
         {page.fence_text && (
