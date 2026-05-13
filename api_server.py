@@ -19,9 +19,9 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
@@ -155,13 +155,33 @@ def _run_job(job: dict, keys: dict):
     # per-page rows as Phase 1c / Phase 3 finish each page. Legacy
     # X-User-Id jobs have no Postgres row → document_id stays None and
     # page_cb is a no-op.
-    document_id: str | None = None
-    try:
-        document_id = db.get_document_id_by_job(job_id)
-    except Exception:
-        log.exception(f"Job {job_id[:8]}: document lookup failed; live page updates disabled")
+    #
+    # The Postgres mirror is written by a background task after the
+    # upload response returns, so the row may not exist yet when the
+    # worker grabs this job. Resolve lazily and cache once we see it.
+    _doc_state: dict[str, Any] = {"id": None, "checked_legacy": False}
+
+    def _resolve_document_id() -> str | None:
+        if _doc_state["id"] is not None:
+            return _doc_state["id"]
+        if _doc_state["checked_legacy"]:
+            return None
+        try:
+            did = db.get_document_id_by_job(job_id)
+        except Exception:
+            return None
+        if did:
+            _doc_state["id"] = did
+            return did
+        # Not in Postgres (yet). For legacy X-User-Id jobs it will never
+        # arrive; user_id on the job row tells us which. Latch a sentinel
+        # so we stop hammering the DB on every page callback.
+        if not _is_uuid(job.get("user_id", "")):
+            _doc_state["checked_legacy"] = True
+        return None
 
     def _page_cb(page: dict) -> None:
+        document_id = _resolve_document_id()
         if not document_id:
             return
         try:
@@ -348,13 +368,58 @@ app.add_middleware(
 # Endpoints
 # ---------------------------------------------------------------------------
 
-@app.post("/api/jobs")
+def _mirror_document_to_postgres(
+    *,
+    document_id: str,
+    job_id: str,
+    user_id: str,
+    original_filename: str,
+    storage_path: str,
+    total_pages: int,
+    pdf_hash: str,
+) -> None:
+    """Background task: write the document + job row to Postgres after the
+    upload response has been sent. On failure, mark the SQLite job failed
+    so the worker won't pick it up and the user sees an error in the
+    dashboard. The PDF file is kept for debugging.
+    """
+    log.info(f"Mirror starting for job {job_id[:8]} doc {document_id[:8]}")
+    try:
+        db.insert_document_and_job(
+            user_id=user_id,
+            original_filename=original_filename,
+            storage_path=storage_path,
+            total_pages=total_pages,
+            job_id=job_id,
+            pdf_hash=pdf_hash,
+            document_id=document_id,
+        )
+        log.info(f"Mirror OK for job {job_id[:8]} doc {document_id[:8]}")
+    except Exception as e:
+        log.exception(f"Postgres mirror failed for job {job_id[:8]}; marking failed")
+        try:
+            job_registry.update_job(
+                job_id,
+                status="failed",
+                error_msg=f"Database unavailable: {str(e)[:400]}",
+                completed_at=int(time.time()),
+            )
+        except Exception:
+            log.exception(f"Could not mark job {job_id[:8]} failed after mirror failure")
+
+
+@app.post("/api/jobs", status_code=202)
 async def create_job(
+    background_tasks: BackgroundTasks,
     pdf: UploadFile = File(...),
     config: str = Form("{}"),
     user_id: str = Depends(get_current_user),
 ):
-    """Submit a PDF for analysis. Returns the job ID immediately."""
+    """Submit a PDF for analysis. Returns 202 with the job + document IDs
+    immediately after the file is on disk and the SQLite job row exists;
+    the Postgres mirror runs as a background task after the response is
+    sent (so a slow / flaky DB write doesn't push the response past the
+    edge router's timeout — see incident notes for the 502 from sfo1)."""
     try:
         config_data = json.loads(config)
     except Exception:
@@ -429,29 +494,26 @@ async def create_job(
     # Only Supabase (UUID) users get a Postgres row — the legacy X-User-Id
     # path (e.g. the existing Streamlit fast-stack client) skips this and
     # continues to live in SQLite job_registry only.
+    #
+    # The mirror runs as a background task so the response can return
+    # immediately. We pre-allocate the document_id here so the client gets
+    # it in the response before the row is actually persisted. The worker
+    # tolerates the mirror not yet being committed when it picks up the job
+    # — see `_run_job._resolve_document_id`.
     document_id: str | None = None
     if _is_uuid(user_id):
+        document_id = str(_uuid.uuid4())
         rel_storage_path = f"{user_id}/{pdf_filename}"
-        try:
-            document_id, _ = db.insert_document_and_job(
-                user_id=user_id,
-                original_filename=pdf.filename or "unknown.pdf",
-                storage_path=rel_storage_path,
-                total_pages=n_pages,
-                job_id=job_id,
-                pdf_hash=pdf_hash,
-            )
-        except Exception as e:
-            log.exception("Postgres mirror failed for upload")
-            try:
-                job_registry.delete_job(job_id)
-            except Exception:
-                pass
-            try:
-                Path(pdf_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-            raise HTTPException(503, f"Database unavailable: {e}")
+        background_tasks.add_task(
+            _mirror_document_to_postgres,
+            document_id=document_id,
+            job_id=job_id,
+            user_id=user_id,
+            original_filename=pdf.filename or "unknown.pdf",
+            storage_path=rel_storage_path,
+            total_pages=n_pages,
+            pdf_hash=pdf_hash,
+        )
 
     queue_pos = job_registry.queue_position(job_id)
     running = job_registry.count_running_jobs()

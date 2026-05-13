@@ -293,21 +293,40 @@ def insert_document_and_job(
     pdf_hash: str | None = None,
     document_status: str = "uploaded",
     job_status: str = "queued",
+    document_id: str | None = None,
 ) -> tuple[str, str]:
     """Atomic upload mirror: create the document row and its initial job
     row in a single transaction. Returns (document_id, job_id).
+
+    If `document_id` is provided, it is used as the documents.id; otherwise
+    the DB default (gen_random_uuid()) generates one. The pre-allocated
+    form lets the upload endpoint return the document_id to the client
+    before the row is actually persisted (the persistence happens in a
+    background task — see api_server.create_job).
     """
     with pool().connection() as conn:
         with conn.transaction():
-            doc_row = conn.execute(
-                """
-                insert into documents
-                  (user_id, original_filename, storage_path, status, total_pages, pdf_hash)
-                values (%s, %s, %s, %s, %s, %s)
-                returning id
-                """,
-                (user_id, original_filename, storage_path, document_status, total_pages, pdf_hash),
-            ).fetchone()
+            if document_id is not None:
+                doc_row = conn.execute(
+                    """
+                    insert into documents
+                      (id, user_id, original_filename, storage_path, status, total_pages, pdf_hash)
+                    values (%s, %s, %s, %s, %s, %s, %s)
+                    returning id
+                    """,
+                    (document_id, user_id, original_filename, storage_path,
+                     document_status, total_pages, pdf_hash),
+                ).fetchone()
+            else:
+                doc_row = conn.execute(
+                    """
+                    insert into documents
+                      (user_id, original_filename, storage_path, status, total_pages, pdf_hash)
+                    values (%s, %s, %s, %s, %s, %s)
+                    returning id
+                    """,
+                    (user_id, original_filename, storage_path, document_status, total_pages, pdf_hash),
+                ).fetchone()
             doc_id = str(doc_row["id"])
             conn.execute(
                 """
