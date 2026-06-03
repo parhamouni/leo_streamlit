@@ -18,6 +18,7 @@ type VectorLinesResponse = {
   rotation: number;
   pdf_width: number;
   pdf_height: number;
+  verified_scale?: number | null;
   lines: VectorLine[];
   auto_categories: Record<string, CategoryInfo>;
   auto_assignments: Record<string, string>;
@@ -169,7 +170,8 @@ export default function UMTCanvasInner({
   const latestStateRef = useRef<PageState>(pageState);
   latestStateRef.current = pageState;
 
-  const scheduleSave = useCallback(() => {
+  const scheduleSave = useCallback((nextState?: PageState) => {
+    if (nextState) latestStateRef.current = nextState;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     setSaveStatus("saving");
     saveTimerRef.current = setTimeout(async () => {
@@ -342,6 +344,7 @@ export default function UMTCanvasInner({
   const stageHeight = vectorData ? vectorData.pdf_height * scale : 0;
 
   const minLen = pageState.min_line_pts ?? 20;
+  const measurementScale = vectorData?.verified_scale || 360;
 
   const layerSummary = useMemo(() => {
     if (!vectorData)
@@ -405,21 +408,24 @@ export default function UMTCanvasInner({
   function assignLayerTo(layerName: string, cat: string | null) {
     if (!vectorData) return;
     setError(null);
-    let count = 0;
-    setPageState((prev) => {
-      const next = { ...prev, line_assignments: { ...prev.line_assignments } };
-      for (const ln of vectorData.lines) {
-        const lk = ln.layer || "(no layer)";
-        if (lk !== layerName) continue;
-        const k = String(ln.idx);
-        if (cat === null) delete next.line_assignments[k];
-        else next.line_assignments[k] = cat;
-        count += 1;
-      }
-      return next;
-    });
-    if (count === 0) setError(`No lines on layer "${layerName}".`);
-    else scheduleSave();
+    const matchingLines = vectorData.lines.filter(
+      (ln) => (ln.layer || "(no layer)") === layerName,
+    );
+    if (matchingLines.length === 0) {
+      setError(`No lines on layer "${layerName}".`);
+      return;
+    }
+    const next = {
+      ...pageState,
+      line_assignments: { ...pageState.line_assignments },
+    };
+    for (const ln of matchingLines) {
+      const k = String(ln.idx);
+      if (cat === null) delete next.line_assignments[k];
+      else next.line_assignments[k] = cat;
+    }
+    setPageState(next);
+    scheduleSave(next);
   }
 
   function toggleAssignment(lineIdx: number) {
@@ -510,20 +516,22 @@ export default function UMTCanvasInner({
     }
     if (!vectorData) return;
     setError(null);
-    let count = 0;
-    setPageState((prev) => {
-      const next = { ...prev, line_assignments: { ...prev.line_assignments } };
-      for (const ln of vectorData.lines) {
-        const lk = ln.layer || "(no layer)";
-        if (lk === layerName) {
-          next.line_assignments[String(ln.idx)] = activeCategory;
-          count += 1;
-        }
-      }
-      return next;
-    });
-    if (count === 0) setError(`No lines on layer "${layerName}".`);
-    else scheduleSave();
+    const matchingLines = vectorData.lines.filter(
+      (ln) => (ln.layer || "(no layer)") === layerName,
+    );
+    if (matchingLines.length === 0) {
+      setError(`No lines on layer "${layerName}".`);
+      return;
+    }
+    const next = {
+      ...pageState,
+      line_assignments: { ...pageState.line_assignments },
+    };
+    for (const ln of matchingLines) {
+      next.line_assignments[String(ln.idx)] = activeCategory;
+    }
+    setPageState(next);
+    scheduleSave(next);
   }
 
   async function smartAutoAssign() {
@@ -923,7 +931,7 @@ export default function UMTCanvasInner({
                             Lines
                           </th>
                           <th className="px-2 py-1 font-medium text-right">
-                            Length (pts)
+                            Length (ft)
                           </th>
                           <th className="px-2 py-1 font-medium">Assigned to</th>
                         </tr>
@@ -952,7 +960,7 @@ export default function UMTCanvasInner({
                                 {l.count}
                               </td>
                               <td className="px-2 py-1 text-right tabular-nums">
-                                {l.lengthPts.toFixed(0)}
+                                {(l.lengthPts / measurementScale).toFixed(1)}
                               </td>
                               <td
                                 className="px-2 py-1"

@@ -1091,12 +1091,15 @@ async def get_page_vector_lines(
     # the user's *saved* assignments still apply because we always return
     # `lines` (indices match the highlighted PDF's vector order, which is
     # additive over the original).
+    scale_info = (target or {}).get("scale_info") or {}
+    verified_scale = scale_info.get("verified_scale") or scale_info.get("text_scale")
     return {
         "page_num": page_num,
         "page_idx": page_idx,
         "rotation": rotation,
         "pdf_width": float(display_w),
         "pdf_height": float(display_h),
+        "verified_scale": float(verified_scale) if verified_scale else None,
         "lines": out_lines,
         "auto_categories": auto_categories,
         "auto_assignments": {} if source_missing else auto_assignments,
