@@ -13,7 +13,11 @@ import {
 } from "@/lib/eta";
 import { RowActions } from "@/components/RowActions";
 import { UMTCanvas } from "@/components/UMTCanvas";
-import { MeasurementSummary } from "@/components/MeasurementSummary";
+import {
+  MeasurementSummary,
+  type PageRow as MeasurementSummaryPage,
+  type SummaryResponse,
+} from "@/components/MeasurementSummary";
 import {
   cleanElementKey,
   detectionLabel,
@@ -123,6 +127,9 @@ export default function DocumentDetailPage() {
   const [filter, setFilter] = useState<"fence" | "all" | "nonfence">("fence");
   const [downloading, setDownloading] = useState(false);
   const [pagesSoFar, setPagesSoFar] = useState<PageRow[]>([]);
+  const [measurementRefresh, setMeasurementRefresh] = useState(0);
+  const [measurementSummary, setMeasurementSummary] =
+    useState<SummaryResponse | null>(null);
 
   // Auth
   useEffect(() => {
@@ -306,6 +313,18 @@ export default function DocumentDetailPage() {
       `${(doc?.original_filename ?? "document").replace(/\.[^.]+$/, "")}_measurements.xlsx`,
     );
 
+  const markMeasurementsChanged = useCallback(() => {
+    setMeasurementRefresh((n) => n + 1);
+  }, []);
+
+  useEffect(() => {
+    if (doc?.job_status === "completed" && doc.latest_job_id) {
+      markMeasurementsChanged();
+    } else {
+      setMeasurementSummary(null);
+    }
+  }, [doc?.job_status, doc?.latest_job_id, markMeasurementsChanged]);
+
   if (!authReady || (loading && !doc)) {
     return (
       <main className="min-h-screen flex items-center justify-center text-gray-500">
@@ -343,6 +362,16 @@ export default function DocumentDetailPage() {
       0;
     return acc + (ft || 0);
   }, 0);
+  const summaryLengthFt = measurementSummary
+    ? Object.values(measurementSummary.grand_total).reduce(
+        (acc, v) => acc + (v.ft || 0),
+        0,
+      )
+    : null;
+  const displayedTotalLengthFt = summaryLengthFt ?? totalLengthFt;
+  const measurementSummaryByPage = new Map(
+    (measurementSummary?.pages ?? []).map((p) => [p.page_num, p]),
+  );
   const elementDetails = results?.element_details ?? {};
   const populatedSpecs = Object.entries(elementDetails).filter(([, spec]) =>
     specHasContent(spec),
@@ -443,8 +472,12 @@ export default function DocumentDetailPage() {
             <StatCard label="Non-fence pages" value={String(nonFencePages.length)} accent="gray" />
             <StatCard
               label="Total fence length"
-              value={totalLengthFt > 0 ? `${totalLengthFt.toFixed(1)} ft` : "—"}
-              accent={totalLengthFt > 0 ? "green" : "gray"}
+              value={
+                displayedTotalLengthFt > 0
+                  ? `${displayedTotalLengthFt.toFixed(1)} ft`
+                  : "—"
+              }
+              accent={displayedTotalLengthFt > 0 ? "green" : "gray"}
             />
           </section>
         )}
@@ -487,7 +520,11 @@ export default function DocumentDetailPage() {
 
         {/* ---------- Cross-page measurement summary (Sprint 4 / C8) ---------- */}
         {isComplete && results && doc?.latest_job_id && fencePages.length > 0 && (
-          <MeasurementSummary jobId={doc.latest_job_id} />
+          <MeasurementSummary
+            jobId={doc.latest_job_id}
+            refreshSignal={measurementRefresh}
+            onDataChange={setMeasurementSummary}
+          />
         )}
 
         {/* ---------- Pages list ---------- */}
@@ -518,6 +555,8 @@ export default function DocumentDetailPage() {
                       key={p.page_num}
                       page={p}
                       jobId={doc.latest_job_id}
+                      summaryPage={measurementSummaryByPage.get(p.page_num)}
+                      onMeasurementsSaved={markMeasurementsChanged}
                     />
                   ))
                 ))}
@@ -540,6 +579,8 @@ export default function DocumentDetailPage() {
                       key={`f-${p.page_num}`}
                       page={p}
                       jobId={doc.latest_job_id}
+                      summaryPage={measurementSummaryByPage.get(p.page_num)}
+                      onMeasurementsSaved={markMeasurementsChanged}
                     />
                   ))}
                   {nonFencePages.map((p) => (
@@ -815,15 +856,33 @@ function PageImage({
 function FencePageCard({
   page,
   jobId,
+  summaryPage,
+  onMeasurementsSaved,
 }: {
   page: FencePage;
   jobId?: string | null;
+  summaryPage?: MeasurementSummaryPage;
+  onMeasurementsSaved?: () => void;
 }) {
+  const summaryFt = summaryPage
+    ? Object.values(summaryPage.per_category).reduce(
+        (acc, v) => acc + (v.ft || 0),
+        0,
+      )
+    : null;
+  const summarySeg = summaryPage
+    ? Object.values(summaryPage.per_category).reduce(
+        (acc, v) => acc + (v.auto || 0) + (v.manual || 0),
+        0,
+      )
+    : null;
   const totalFt =
+    summaryFt ??
     page.measurements?.proximity_totals?.total_length_feet ??
     page.measurements?.totals?.total_length_feet ??
     null;
   const totalSeg =
+    summarySeg ??
     page.measurements?.proximity_totals?.total_segments ??
     page.measurements?.totals?.total_segments ??
     null;
@@ -877,6 +936,7 @@ function FencePageCard({
             pageNum={page.page_num}
             legendEntries={legend}
             skipReason={skipReason ?? null}
+            onSaved={onMeasurementsSaved}
           />
         )}
 

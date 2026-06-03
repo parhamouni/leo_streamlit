@@ -18,6 +18,7 @@ export function UMTCanvas(props: {
   legendEntries: Array<{ indicator?: string; keyword?: string }>;
   initiallyOpen?: boolean;
   skipReason?: string | null;
+  onSaved?: () => void;
 }) {
   return <UMTCanvasInner {...props} />;
 }
