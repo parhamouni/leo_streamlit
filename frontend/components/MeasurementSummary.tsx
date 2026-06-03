@@ -1,23 +1,23 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { apiJson } from "@/lib/api";
 
-type CategoryEntry = {
+export type CategoryEntry = {
   pts: number;
   ft: number;
   auto: number;
   manual: number;
 };
 
-type PageRow = {
+export type PageRow = {
   page_num: number;
   scale: number;
   has_user_edits: boolean;
   per_category: Record<string, CategoryEntry>;
 };
 
-type SummaryResponse = {
+export type SummaryResponse = {
   pages: PageRow[];
   grand_total: Record<string, CategoryEntry>;
   page_count: number;
@@ -39,7 +39,15 @@ function colorFor(idx: number) {
   return PALETTE[idx % PALETTE.length];
 }
 
-export function MeasurementSummary({ jobId }: { jobId: string }) {
+export function MeasurementSummary({
+  jobId,
+  refreshSignal = 0,
+  onDataChange,
+}: {
+  jobId: string;
+  refreshSignal?: number;
+  onDataChange?: (data: SummaryResponse) => void;
+}) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -53,12 +61,17 @@ export function MeasurementSummary({ jobId }: { jobId: string }) {
         `/api/jobs/${jobId}/measurement-summary`,
       );
       setData(d);
+      onDataChange?.(d);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
-  }, [jobId]);
+  }, [jobId, onDataChange]);
+
+  useEffect(() => {
+    if (refreshSignal > 0) void fetchSummary();
+  }, [fetchSummary, refreshSignal]);
 
   function toggle() {
     if (!open) {

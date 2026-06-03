@@ -115,12 +115,14 @@ export default function UMTCanvasInner({
   legendEntries,
   initiallyOpen = false,
   skipReason = null,
+  onSaved,
 }: {
   jobId: string;
   pageNum: number;
   legendEntries: Array<{ indicator?: string; keyword?: string }>;
   initiallyOpen?: boolean;
   skipReason?: string | null;
+  onSaved?: () => void;
 }) {
   const [open, setOpen] = useState(initiallyOpen);
   const [loading, setLoading] = useState(false);
@@ -178,12 +180,13 @@ export default function UMTCanvasInner({
           body: JSON.stringify(latestStateRef.current),
         });
         setSaveStatus("saved");
+        onSaved?.();
       } catch (e) {
         console.error("UMT save failed", e);
         setSaveStatus("error");
       }
     }, 500);
-  }, [jobId, pageNum]);
+  }, [jobId, onSaved, pageNum]);
 
   useEffect(() => {
     return () => {
