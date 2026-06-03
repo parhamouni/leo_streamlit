@@ -18,6 +18,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -51,6 +52,87 @@ def _is_uuid(s: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _unix_to_iso(ts: Any) -> str | None:
+    try:
+        if ts is None:
+            return None
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def _sqlite_job_to_document(job: dict) -> dict:
+    """Present a legacy SQLite-only job as a document row.
+
+    The Next.js app is document-oriented, but the worker queue and older
+    runs are job-oriented. When a job has no Postgres mirror row, using the
+    job_id as the synthetic document id lets `/documents/{id}` load and then
+    fetch results through the existing `/api/jobs/{job_id}/results` path.
+    """
+    progress = job_registry.read_progress(job["job_id"]) or {}
+    status = job.get("status")
+    created_at = _unix_to_iso(job.get("created_at")) or datetime.now(timezone.utc).isoformat()
+    return {
+        "id": job["job_id"],
+        "user_id": job.get("user_id"),
+        "original_filename": job.get("filename") or "unknown.pdf",
+        "storage_path": job.get("pdf_path") or "",
+        "document_status": "uploaded",
+        "total_pages": job.get("total_pages"),
+        "created_at": created_at,
+        "latest_job_id": job["job_id"],
+        "job_status": status,
+        "current_phase": progress.get("phase") if status in ("queued", "running") else ("done" if status == "completed" else None),
+        "progress_percent": progress.get("pct") if status in ("queued", "running") else (100 if status in ("completed", "failed", "cancelled") else 0),
+        "error_message": job.get("error_msg"),
+        "job_started_at": _unix_to_iso(job.get("started_at")),
+        "phase_started_at": None,
+        "source": "sqlite",
+    }
+
+
+def _merge_sqlite_fallback_documents(user_id: str, documents: list[dict]) -> list[dict]:
+    """Append SQLite jobs that are not represented by any Postgres job row."""
+    seen_job_ids = {
+        str(d.get("latest_job_id"))
+        for d in documents
+        if d.get("latest_job_id")
+    }
+    merged = [dict(d) for d in documents]
+    for job in job_registry.get_user_jobs(user_id):
+        job_id = str(job.get("job_id") or "")
+        if not job_id or job_id in seen_job_ids:
+            continue
+        merged.append(_sqlite_job_to_document(job))
+        seen_job_ids.add(job_id)
+    merged.sort(key=lambda d: str(d.get("created_at") or ""), reverse=True)
+    return merged
+
+
+def _delete_postgres_document_for_job(job_id: str, user_id: str) -> bool:
+    """Delete the Postgres document owning `job_id`, if the user owns it.
+
+    Older dashboard rows can outlive their SQLite job_registry row because
+    local job results expire separately from the Postgres mirror. In that
+    state the normal delete path cannot start from SQLite, so this helper
+    deletes by Postgres job id and lets FK cascades remove page_results,
+    artifacts, and the mirrored jobs row.
+    """
+    if not _is_uuid(user_id):
+        return False
+    with db.pool().connection() as conn:
+        row = conn.execute(
+            """
+            delete from documents
+            where user_id = %s
+              and id in (select document_id from jobs where id = %s)
+            returning id
+            """,
+            (user_id, job_id),
+        ).fetchone()
+    return row is not None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1989,6 +2071,11 @@ async def delete_job(
     """
     job = job_registry.get_job(job_id)
     if job is None:
+        try:
+            if _delete_postgres_document_for_job(job_id, user_id):
+                return {"status": "deleted"}
+        except Exception:
+            log.exception("Postgres-only cleanup failed for delete_job %s", job_id)
         raise HTTPException(404, "Job not found")
     if job["user_id"] != user_id:
         raise HTTPException(403, "Access denied")
@@ -2024,15 +2111,7 @@ async def delete_job(
     # for legacy non-UUID users or if the document was never mirrored.
     if _is_uuid(user_id):
         try:
-            with db.pool().connection() as conn:
-                conn.execute(
-                    """
-                    delete from documents
-                    where user_id = %s
-                      and id in (select document_id from jobs where id = %s)
-                    """,
-                    (user_id, job_id),
-                )
+            _delete_postgres_document_for_job(job_id, user_id)
         except Exception:
             log.exception("Postgres cleanup failed for delete_job %s", job_id)
 
@@ -2089,7 +2168,12 @@ def list_documents(user_id: str = Depends(require_supabase_jwt)):
     Requires a Supabase JWT — the legacy X-User-Id path doesn't have a
     Postgres mirror.
     """
-    return {"documents": db.list_documents(user_id)}
+    try:
+        documents = db.list_documents(user_id)
+    except Exception:
+        log.exception("Postgres document list failed; falling back to SQLite jobs")
+        documents = []
+    return {"documents": _merge_sqlite_fallback_documents(user_id, documents)}
 
 
 @app.get("/api/documents/{document_id}")
@@ -2100,9 +2184,16 @@ def get_document(
     """Get one document, ownership-checked. Requires Supabase JWT."""
     if not _is_uuid(document_id):
         raise HTTPException(400, "document_id must be a UUID")
-    doc = db.get_document(document_id, user_id)
+    try:
+        doc = db.get_document(document_id, user_id)
+    except Exception:
+        log.exception("Postgres document lookup failed; trying SQLite fallback")
+        doc = None
     if doc is None:
-        raise HTTPException(404, "Document not found")
+        job = job_registry.get_job(document_id)
+        if job is None or job.get("user_id") != user_id:
+            raise HTTPException(404, "Document not found")
+        return _sqlite_job_to_document(job)
     return doc
 
 
@@ -2122,8 +2213,16 @@ def list_document_pages(
     if not _is_uuid(document_id):
         raise HTTPException(400, "document_id must be a UUID")
     # Confirm ownership before listing — prevents existence-leak via empty []
-    if db.get_document(document_id, user_id) is None:
-        raise HTTPException(404, "Document not found")
+    try:
+        doc = db.get_document(document_id, user_id)
+    except Exception:
+        log.exception("Postgres document lookup failed for pages; trying SQLite fallback")
+        doc = None
+    if doc is None:
+        job = job_registry.get_job(document_id)
+        if job is None or job.get("user_id") != user_id:
+            raise HTTPException(404, "Document not found")
+        return {"pages": []}
     rows = db.list_page_results(document_id, user_id)
     if slim:
         rows = [_slim_page_result(r) for r in rows]
