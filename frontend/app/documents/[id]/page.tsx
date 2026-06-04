@@ -60,6 +60,19 @@ type PageRow = {
   created_at: string;
 };
 
+type UmtPageState = {
+  categories?: Record<string, unknown>;
+  line_assignments?: Record<string, string>;
+  user_drawn_lines?: Array<unknown>;
+  scale_override?: number;
+  min_line_pts?: number;
+};
+
+type UmtState = {
+  version: number;
+  pages: Record<string, UmtPageState>;
+};
+
 const POLL_MS = 3000;
 
 function isPhase1cStub(row: PageRow): boolean {
@@ -110,6 +123,118 @@ function StatusBadge({ status }: { status: string | null }) {
   );
 }
 
+function scaleInchesToFeet(scaleInches?: number | null): number | null {
+  const scale = Number(scaleInches);
+  if (!Number.isFinite(scale) || scale <= 0) return null;
+  return scale / 12;
+}
+
+function ScaleEditor({
+  detectedScaleInches,
+  confidence,
+  overrideScaleInches,
+  disabled,
+  onSave,
+}: {
+  detectedScaleInches?: number | null;
+  confidence?: string;
+  overrideScaleInches?: number | null;
+  disabled?: boolean;
+  onSave: (scaleOverrideInches: number | null) => Promise<void>;
+}) {
+  const detectedFeet = scaleInchesToFeet(detectedScaleInches);
+  const activeFeet = scaleInchesToFeet(overrideScaleInches) ?? detectedFeet;
+  const [value, setValue] = useState(
+    activeFeet != null ? Number(activeFeet.toFixed(3)).toString() : "",
+  );
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setValue(activeFeet != null ? Number(activeFeet.toFixed(3)).toString() : "");
+  }, [activeFeet]);
+
+  async function saveFeet(nextFeet: number | null) {
+    setError(null);
+    if (nextFeet != null && (!Number.isFinite(nextFeet) || nextFeet <= 0)) {
+      setError("Scale must be greater than zero");
+      return;
+    }
+    setSaving(true);
+    try {
+      await onSave(nextFeet == null ? null : nextFeet * 12);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <span
+      className="inline-flex items-center gap-1 text-xs text-gray-500"
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => e.stopPropagation()}
+      title={
+        detectedScaleInches
+          ? `Detected scale factor: ${detectedScaleInches} real inches per drawing inch`
+          : "No detected scale was found for this page"
+      }
+    >
+      <span>scale 1 in =</span>
+      <input
+        type="number"
+        min={0.01}
+        step={0.5}
+        value={value}
+        disabled={disabled || saving}
+        onChange={(e) => setValue(e.target.value)}
+        onBlur={() => {
+          if (!value.trim()) return;
+          void saveFeet(Number(value));
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            e.currentTarget.blur();
+          }
+        }}
+        className="w-16 border rounded px-1 py-0.5 text-xs text-gray-700 bg-white disabled:bg-gray-50"
+        aria-label="Measurement scale feet per drawing inch"
+      />
+      <span>ft</span>
+      {confidence ? <span>({confidence})</span> : null}
+      {detectedFeet != null && overrideScaleInches ? (
+        <button
+          type="button"
+          disabled={disabled || saving}
+          onClick={() => void saveFeet(null)}
+          className="text-blue-600 hover:underline disabled:text-gray-400"
+          title={`Clear override and use detected ${detectedFeet.toFixed(2)} ft`}
+        >
+          use detected
+        </button>
+      ) : null}
+      {detectedFeet != null && (
+        <button
+          type="button"
+          disabled={disabled || saving}
+          onClick={() => {
+            setValue(Number(detectedFeet.toFixed(3)).toString());
+            void saveFeet(detectedFeet);
+          }}
+          className="text-blue-600 hover:underline disabled:text-gray-400"
+          title="Apply detected scale as an explicit saved override"
+        >
+          detected {detectedFeet.toFixed(2)}
+        </button>
+      )}
+      {saving ? <span>saving...</span> : null}
+      {error ? <span className="text-red-600">{error}</span> : null}
+    </span>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Page component
 // ---------------------------------------------------------------------------
@@ -130,6 +255,7 @@ export default function DocumentDetailPage() {
   const [measurementRefresh, setMeasurementRefresh] = useState(0);
   const [measurementSummary, setMeasurementSummary] =
     useState<SummaryResponse | null>(null);
+  const [umtPages, setUmtPages] = useState<Record<string, UmtPageState>>({});
 
   // Auth
   useEffect(() => {
@@ -159,12 +285,17 @@ export default function DocumentDetailPage() {
         setError(null);
 
         if (found.job_status === "completed" && found.latest_job_id) {
-          const r = await apiJson<PipelineResults>(
-            `/api/jobs/${found.latest_job_id}/results`,
-          );
+          const [r, umt] = await Promise.all([
+            apiJson<PipelineResults>(`/api/jobs/${found.latest_job_id}/results`),
+            apiJson<UmtState>(`/api/jobs/${found.latest_job_id}/umt-state`).catch(
+              () => ({ version: 1, pages: {} }),
+            ),
+          ]);
           setResults(r);
+          setUmtPages(umt.pages ?? {});
         } else {
           setResults(null);
+          setUmtPages({});
         }
       } catch (e) {
         if (e instanceof ApiError && e.status === 404) {
@@ -316,6 +447,35 @@ export default function DocumentDetailPage() {
   const markMeasurementsChanged = useCallback(() => {
     setMeasurementRefresh((n) => n + 1);
   }, []);
+
+  const savePageScaleOverride = useCallback(
+    async (jobId: string, pageNum: number, scaleOverride: number | null) => {
+      const pageKey = `page_${pageNum}`;
+      const existing = umtPages[pageKey] ?? {};
+      const next: UmtPageState = {
+        ...existing,
+        categories: existing.categories ?? {},
+        line_assignments: existing.line_assignments ?? {},
+        user_drawn_lines: existing.user_drawn_lines ?? [],
+      };
+      if (scaleOverride == null) {
+        delete next.scale_override;
+      } else {
+        next.scale_override = scaleOverride;
+      }
+      const full = await apiJson<UmtState>(
+        `/api/jobs/${jobId}/umt-state/${pageNum}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(next),
+        },
+      );
+      setUmtPages(full.pages ?? {});
+      markMeasurementsChanged();
+    },
+    [markMeasurementsChanged, umtPages],
+  );
 
   useEffect(() => {
     if (doc?.job_status === "completed" && doc.latest_job_id) {
@@ -555,8 +715,10 @@ export default function DocumentDetailPage() {
                       key={p.page_num}
                       page={p}
                       jobId={doc.latest_job_id}
+                      umtPageState={umtPages[`page_${p.page_num}`]}
                       summaryPage={measurementSummaryByPage.get(p.page_num)}
                       onMeasurementsSaved={markMeasurementsChanged}
+                      onScaleOverrideSaved={savePageScaleOverride}
                     />
                   ))
                 ))}
@@ -579,8 +741,10 @@ export default function DocumentDetailPage() {
                       key={`f-${p.page_num}`}
                       page={p}
                       jobId={doc.latest_job_id}
+                      umtPageState={umtPages[`page_${p.page_num}`]}
                       summaryPage={measurementSummaryByPage.get(p.page_num)}
                       onMeasurementsSaved={markMeasurementsChanged}
+                      onScaleOverrideSaved={savePageScaleOverride}
                     />
                   ))}
                   {nonFencePages.map((p) => (
@@ -856,13 +1020,21 @@ function PageImage({
 function FencePageCard({
   page,
   jobId,
+  umtPageState,
   summaryPage,
   onMeasurementsSaved,
+  onScaleOverrideSaved,
 }: {
   page: FencePage;
   jobId?: string | null;
+  umtPageState?: UmtPageState;
   summaryPage?: MeasurementSummaryPage;
   onMeasurementsSaved?: () => void;
+  onScaleOverrideSaved?: (
+    jobId: string,
+    pageNum: number,
+    scaleOverride: number | null,
+  ) => Promise<void>;
 }) {
   const summaryFt = summaryPage
     ? Object.values(summaryPage.per_category).reduce(
@@ -909,15 +1081,17 @@ function FencePageCard({
             <span>{m.icon}</span>
             <span>{m.label}</span>
           </span>
-          {scale?.verified_scale && (
-            <span
-              className="text-xs text-gray-500"
-              title={`Detected scale factor: ${scale.verified_scale} real inches per drawing inch`}
-            >
-              scale 1 in = {(scale.verified_scale / 12).toFixed(2)} ft
-              {scale.confidence ? ` (${scale.confidence})` : ""}
-            </span>
-          )}
+          <ScaleEditor
+            detectedScaleInches={scale?.verified_scale ?? scale?.text_scale ?? null}
+            confidence={scale?.confidence}
+            overrideScaleInches={umtPageState?.scale_override ?? null}
+            disabled={!jobId || !onScaleOverrideSaved}
+            onSave={(scaleOverride) =>
+              jobId && onScaleOverrideSaved
+                ? onScaleOverrideSaved(jobId, page.page_num, scaleOverride)
+                : Promise.resolve()
+            }
+          />
         </div>
         <div className="text-xs text-gray-600 flex items-center gap-3">
           {totalFt != null && totalFt > 0 && (
@@ -939,6 +1113,7 @@ function FencePageCard({
             pageNum={page.page_num}
             legendEntries={legend}
             skipReason={skipReason ?? null}
+            scaleOverride={umtPageState?.scale_override ?? null}
             onSaved={onMeasurementsSaved}
           />
         )}

@@ -10,6 +10,7 @@
 export type ScaleInfo = {
   success?: boolean;
   verified_scale?: number;
+  text_scale?: number;
   scale_text?: string;
   confidence?: "low" | "medium" | "high" | string;
   message?: string;

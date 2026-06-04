@@ -73,12 +73,6 @@ function scaleInchesToPointsPerFoot(scaleInches?: number | null) {
   return 864 / scale;
 }
 
-function scaleInchesToFeet(scaleInches?: number | null) {
-  const scale = Number(scaleInches);
-  if (!Number.isFinite(scale) || scale <= 0) return 30;
-  return scale / 12;
-}
-
 // Drop the pipeline's "indicator code" placeholders (where the keyword is
 // just the indicator number, e.g. "11: 11"). Mirrors `_clean_legend_entries`
 // on the backend so the chip list matches what `auto_categories` returns.
@@ -128,6 +122,7 @@ export default function UMTCanvasInner({
   legendEntries,
   initiallyOpen = false,
   skipReason = null,
+  scaleOverride,
   onSaved,
 }: {
   jobId: string;
@@ -135,6 +130,7 @@ export default function UMTCanvasInner({
   legendEntries: Array<{ indicator?: string; keyword?: string }>;
   initiallyOpen?: boolean;
   skipReason?: string | null;
+  scaleOverride?: number | null;
   onSaved?: () => void;
 }) {
   const [open, setOpen] = useState(initiallyOpen);
@@ -255,6 +251,20 @@ export default function UMTCanvasInner({
   }, [imageUrl]);
 
   useEffect(() => {
+    if (scaleOverride === undefined) return;
+    setPageState((prev) => {
+      const current = prev.scale_override ?? null;
+      const nextScale = scaleOverride ?? null;
+      if (current === nextScale) return prev;
+      const next = { ...prev };
+      if (nextScale == null) delete next.scale_override;
+      else next.scale_override = nextScale;
+      latestStateRef.current = next;
+      return next;
+    });
+  }, [scaleOverride]);
+
+  useEffect(() => {
     if (!containerRef.current) return;
     const ro = new ResizeObserver((entries) => {
       for (const entry of entries) {
@@ -358,8 +368,6 @@ export default function UMTCanvasInner({
   const minLen = pageState.min_line_pts ?? 20;
   const detectedScaleInches = vectorData?.verified_scale ?? null;
   const activeScaleInches = pageState.scale_override ?? detectedScaleInches ?? 360;
-  const detectedScaleFeet = scaleInchesToFeet(detectedScaleInches);
-  const activeScaleFeet = scaleInchesToFeet(activeScaleInches);
   const measurementScale = scaleInchesToPointsPerFoot(activeScaleInches);
 
   const layerSummary = useMemo(() => {
@@ -508,24 +516,6 @@ export default function UMTCanvasInner({
 
   function setMinLen(v: number) {
     const next = { ...pageState, min_line_pts: v };
-    setPageState(next);
-    scheduleSave(next);
-  }
-
-  function setScaleOverrideFeet(v: number) {
-    if (!Number.isFinite(v) || v <= 0) {
-      setError("Scale must be greater than zero.");
-      return;
-    }
-    setError(null);
-    const next = { ...pageState, scale_override: v * 12 };
-    setPageState(next);
-    scheduleSave(next);
-  }
-
-  function resetScaleOverride() {
-    const next = { ...pageState };
-    delete next.scale_override;
     setPageState(next);
     scheduleSave(next);
   }
@@ -805,44 +795,6 @@ export default function UMTCanvasInner({
                     className="w-16 border rounded px-1 py-0.5 text-xs"
                   />
                 </label>
-                <label className="flex items-center gap-1">
-                  Scale:
-                  <span>1 in =</span>
-                  <input
-                    type="number"
-                    min={0.01}
-                    step={0.5}
-                    value={Number(activeScaleFeet.toFixed(3))}
-                    onChange={(e) =>
-                      setScaleOverrideFeet(Number(e.target.value))
-                    }
-                    className="w-20 border rounded px-1 py-0.5 text-xs"
-                    title="Architectural scale used for measurement totals"
-                  />
-                  <span>ft</span>
-                </label>
-                {detectedScaleInches ? (
-                  <button
-                    type="button"
-                    onClick={() => setScaleOverrideFeet(detectedScaleFeet)}
-                    className="text-blue-600 hover:underline"
-                    title="Use the automatically detected scale for this page"
-                  >
-                    detected {detectedScaleFeet.toFixed(2)} ft
-                  </button>
-                ) : (
-                  <span className="text-gray-500">detected scale unavailable</span>
-                )}
-                {pageState.scale_override ? (
-                  <button
-                    type="button"
-                    onClick={resetScaleOverride}
-                    className="text-blue-600 hover:underline"
-                    title="Clear the manual scale and use the detected scale"
-                  >
-                    use detected
-                  </button>
-                ) : null}
                 <div
                   className="flex items-center gap-1"
                   title="Tip: Ctrl/Cmd + mouse-wheel zooms around the cursor"
