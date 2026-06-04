@@ -395,14 +395,12 @@ export default function UMTCanvasInner({
   // Pass `null` as `cat` to unassign.
   function assignLineTo(lineIdx: number, cat: string | null) {
     setError(null);
-    setPageState((prev) => {
-      const next = { ...prev, line_assignments: { ...prev.line_assignments } };
-      const k = String(lineIdx);
-      if (cat === null) delete next.line_assignments[k];
-      else next.line_assignments[k] = cat;
-      return next;
-    });
-    scheduleSave();
+    const next = { ...pageState, line_assignments: { ...pageState.line_assignments } };
+    const k = String(lineIdx);
+    if (cat === null) delete next.line_assignments[k];
+    else next.line_assignments[k] = cat;
+    setPageState(next);
+    scheduleSave(next);
   }
 
   function assignLayerTo(layerName: string, cat: string | null) {
@@ -434,79 +432,75 @@ export default function UMTCanvasInner({
       return;
     }
     setError(null);
-    setPageState((prev) => {
-      const key = String(lineIdx);
-      const next = { ...prev, line_assignments: { ...prev.line_assignments } };
-      if (next.line_assignments[key] === activeCategory) {
-        delete next.line_assignments[key];
-      } else {
-        next.line_assignments[key] = activeCategory;
-      }
-      return next;
-    });
-    scheduleSave();
+    const key = String(lineIdx);
+    const next = { ...pageState, line_assignments: { ...pageState.line_assignments } };
+    if (next.line_assignments[key] === activeCategory) {
+      delete next.line_assignments[key];
+    } else {
+      next.line_assignments[key] = activeCategory;
+    }
+    setPageState(next);
+    scheduleSave(next);
   }
 
   function addCategory(name: string) {
     const trimmed = name.trim();
     if (!trimmed) return;
-    setPageState((prev) => {
-      if (prev.categories[trimmed]) return prev;
-      const idx = Object.keys(prev.categories).length;
-      return {
-        ...prev,
-        categories: {
-          ...prev.categories,
-          [trimmed]: {
-            indicator: "",
-            keyword: trimmed,
-            color: PALETTE[idx % PALETTE.length],
-          },
+    if (pageState.categories[trimmed]) return;
+    const idx = Object.keys(pageState.categories).length;
+    const next = {
+      ...pageState,
+      categories: {
+        ...pageState.categories,
+        [trimmed]: {
+          indicator: "",
+          keyword: trimmed,
+          color: PALETTE[idx % PALETTE.length],
         },
-      };
-    });
+      },
+    };
+    setPageState(next);
     setActiveCategory(trimmed);
-    scheduleSave();
+    scheduleSave(next);
   }
 
   function removeCategory(name: string) {
-    setPageState((prev) => {
-      const cats = { ...prev.categories };
-      delete cats[name];
-      const assignments = { ...prev.line_assignments };
-      for (const k of Object.keys(assignments)) {
-        if (assignments[k] === name) delete assignments[k];
-      }
-      const drawn = (prev.user_drawn_lines ?? []).filter(
-        (l) => l.category !== name,
-      );
-      return {
-        ...prev,
-        categories: cats,
-        line_assignments: assignments,
-        user_drawn_lines: drawn,
-      };
-    });
+    const cats = { ...pageState.categories };
+    delete cats[name];
+    const assignments = { ...pageState.line_assignments };
+    for (const k of Object.keys(assignments)) {
+      if (assignments[k] === name) delete assignments[k];
+    }
+    const drawn = (pageState.user_drawn_lines ?? []).filter(
+      (l) => l.category !== name,
+    );
+    const next = {
+      ...pageState,
+      categories: cats,
+      line_assignments: assignments,
+      user_drawn_lines: drawn,
+    };
+    setPageState(next);
     if (activeCategory === name) {
       setActiveCategory((prev) => {
-        const remaining = Object.keys(pageState.categories).filter(
-          (c) => c !== name,
-        );
+        const remaining = Object.keys(cats);
         return remaining[0] ?? null;
       });
     }
-    scheduleSave();
+    scheduleSave(next);
   }
 
   function setMinLen(v: number) {
-    setPageState((prev) => ({ ...prev, min_line_pts: v }));
-    scheduleSave();
+    const next = { ...pageState, min_line_pts: v };
+    setPageState(next);
+    scheduleSave(next);
   }
 
   function clearAssignments() {
     if (!confirm("Clear all line assignments on this page?")) return;
-    setPageState((prev) => ({ ...prev, line_assignments: {} }));
-    scheduleSave();
+    const next = { ...pageState, line_assignments: {} };
+    setPageState(next);
+    scheduleSave(next);
   }
 
   function assignLayer(layerName: string) {
@@ -569,30 +563,29 @@ export default function UMTCanvasInner({
       // Make sure every assigned-to category exists in our category map —
       // smart-assign only references legend categories, but the user may
       // have deleted some locally.
-      setPageState((prev) => {
-        const cats = { ...prev.categories };
-        const distinctCats = Array.from(new Set(Object.values(newAssignments)));
-        for (const c of distinctCats) {
-          if (!cats[c]) {
-            const idx = Object.keys(cats).length;
-            cats[c] = {
-              indicator: c.split(":")[0]?.trim() || "",
-              keyword: c.split(":").slice(1).join(":").trim() || c,
-              color: PALETTE[idx % PALETTE.length],
-            };
-          }
+      const cats = { ...pageState.categories };
+      const distinctCats = Array.from(new Set(Object.values(newAssignments)));
+      for (const c of distinctCats) {
+        if (!cats[c]) {
+          const idx = Object.keys(cats).length;
+          cats[c] = {
+            indicator: c.split(":")[0]?.trim() || "",
+            keyword: c.split(":").slice(1).join(":").trim() || c,
+            color: PALETTE[idx % PALETTE.length],
+          };
         }
-        return {
-          ...prev,
-          categories: cats,
-          line_assignments: newAssignments,
-        };
-      });
+      }
+      const next = {
+        ...pageState,
+        categories: cats,
+        line_assignments: newAssignments,
+      };
+      setPageState(next);
       const s = data.stats;
       setError(
         `Smart-assigned ${s.layers_assigned} of ${s.layer_count} layers (${s.by_indicator} lines) using indicator-bbox proximity · ${s.unassigned} lines left unassigned (low-confidence layers + layers with no nearby indicator). Click a line to override manually.`,
       );
-      scheduleSave();
+      scheduleSave(next);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -609,20 +602,18 @@ export default function UMTCanvasInner({
     }
     setError(null);
     let moved = 0;
-    setPageState((prev) => {
-      const next = { ...prev, line_assignments: { ...prev.line_assignments } };
-      for (const k of Object.keys(next.line_assignments)) {
-        if (next.line_assignments[k] === "Auto-detected") {
-          next.line_assignments[k] = activeCategory;
-          moved += 1;
-        }
+    const next = { ...pageState, line_assignments: { ...pageState.line_assignments } };
+    for (const k of Object.keys(next.line_assignments)) {
+      if (next.line_assignments[k] === "Auto-detected") {
+        next.line_assignments[k] = activeCategory;
+        moved += 1;
       }
-      return next;
-    });
+    }
     if (moved === 0) {
       setError("No Auto-detected lines to reassign on this page.");
     } else {
-      scheduleSave();
+      setPageState(next);
+      scheduleSave(next);
     }
   }
 
@@ -666,34 +657,33 @@ export default function UMTCanvasInner({
     const start = pendingLine.start;
     const end = pendingLine.end;
     const cat = activeCategory;
-    setPageState((prev) => ({
-      ...prev,
+    const next = {
+      ...pageState,
       user_drawn_lines: [
-        ...(prev.user_drawn_lines ?? []),
+        ...(pageState.user_drawn_lines ?? []),
         { start, end, category: cat },
       ],
-    }));
+    };
+    setPageState(next);
     setPendingLine(null);
-    scheduleSave();
+    scheduleSave(next);
   }
 
   function removeUserDrawnLine(idx: number) {
-    setPageState((prev) => {
-      const next = [...(prev.user_drawn_lines ?? [])];
-      next.splice(idx, 1);
-      return { ...prev, user_drawn_lines: next };
-    });
-    scheduleSave();
+    const drawn = [...(pageState.user_drawn_lines ?? [])];
+    drawn.splice(idx, 1);
+    const next = { ...pageState, user_drawn_lines: drawn };
+    setPageState(next);
+    scheduleSave(next);
   }
 
   function reassignUserDrawnLine(idx: number, cat: string) {
-    setPageState((prev) => {
-      const arr = [...(prev.user_drawn_lines ?? [])];
-      if (idx < 0 || idx >= arr.length) return prev;
-      arr[idx] = { ...arr[idx], category: cat };
-      return { ...prev, user_drawn_lines: arr };
-    });
-    scheduleSave();
+    const arr = [...(pageState.user_drawn_lines ?? [])];
+    if (idx < 0 || idx >= arr.length) return;
+    arr[idx] = { ...arr[idx], category: cat };
+    const next = { ...pageState, user_drawn_lines: arr };
+    setPageState(next);
+    scheduleSave(next);
   }
 
   function resetToAuto() {
@@ -714,14 +704,15 @@ export default function UMTCanvasInner({
     for (const [k, v] of Object.entries(rawAuto)) {
       if (cats[v]) filteredAuto[k] = v;
     }
-    setPageState((prev) => ({
-      ...prev,
+    const next = {
+      ...pageState,
       categories: cats,
       line_assignments: filteredAuto,
-    }));
+    };
+    setPageState(next);
     const firstCat = Object.keys(cats)[0];
     setActiveCategory(firstCat ?? null);
-    scheduleSave();
+    scheduleSave(next);
   }
 
   return (

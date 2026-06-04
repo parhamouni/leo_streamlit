@@ -31,6 +31,7 @@ type Document = {
 type DocumentList = { documents: Document[] };
 
 const POLL_MS = 3000;
+const DOCUMENT_REFRESH_TIMEOUT_MS = 15000;
 
 const STATUS_CLASSES: Record<string, string> = {
   queued: "bg-gray-100 text-gray-800",
@@ -198,19 +199,31 @@ export default function DashboardPage() {
 
   const refresh = useCallback(async (silent = false) => {
     if (!silent) setInitialLoading(true);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(
+      () => controller.abort(),
+      DOCUMENT_REFRESH_TIMEOUT_MS,
+    );
     try {
-      const data = await apiJson<DocumentList>("/api/documents");
+      const data = await apiJson<DocumentList>("/api/documents", {
+        signal: controller.signal,
+      });
       setDocs(data.documents);
       setError(null);
     } catch (e) {
       const msg =
-        e instanceof ApiError
-          ? `API ${e.status}: ${typeof e.body === "string" ? e.body : JSON.stringify(e.body)}`
-          : e instanceof Error
-            ? e.message
-            : String(e);
+        e instanceof DOMException && e.name === "AbortError"
+          ? "The document list request timed out. The API may be busy or wedged; try refreshing again."
+          : e instanceof Error && e.name === "AbortError"
+            ? "The document list request timed out. The API may be busy or wedged; try refreshing again."
+            : e instanceof ApiError
+              ? `API ${e.status}: ${typeof e.body === "string" ? e.body : JSON.stringify(e.body)}`
+              : e instanceof Error
+                ? e.message
+                : String(e);
       setError(msg);
     } finally {
+      window.clearTimeout(timeout);
       if (!silent) setInitialLoading(false);
     }
   }, []);

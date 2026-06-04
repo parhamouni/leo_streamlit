@@ -115,3 +115,74 @@ def test_delete_job_removes_postgres_only_old_job(
 
     assert resp == {"status": "deleted"}
     assert deleted == [(job_id, USER_ID)]
+
+
+def test_delete_terminal_job_removes_registry_and_artifacts(
+    api_server_module, job_registry_temp, monkeypatch, tmp_path
+):
+    import asyncio
+    import job_registry
+
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    (results_dir / "result.json").write_text("{}", encoding="utf-8")
+    pdf_path = tmp_path / "source.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+
+    job_id = job_registry.create_job(
+        user_id=USER_ID,
+        filename="source.pdf",
+        pdf_path=str(pdf_path),
+    )
+    job_registry.update_job(
+        job_id,
+        status="completed",
+        results_dir=str(results_dir),
+        completed_at=1700000000,
+    )
+
+    deleted = []
+    monkeypatch.setattr(
+        api_server_module,
+        "_delete_postgres_document_for_job",
+        lambda pg_job_id, user_id: deleted.append((pg_job_id, user_id)) or True,
+    )
+
+    resp = asyncio.run(api_server_module.delete_job(job_id, user_id=USER_ID))
+
+    assert resp == {"status": "deleted"}
+    assert job_registry.get_job(job_id) is None
+    assert not results_dir.exists()
+    assert not pdf_path.exists()
+    assert deleted == [(job_id, USER_ID)]
+
+
+def test_delete_running_job_marks_cancelled(
+    api_server_module, job_registry_temp, monkeypatch
+):
+    import asyncio
+    import job_registry
+
+    job_id = job_registry.create_job(
+        user_id=USER_ID,
+        filename="source.pdf",
+        pdf_path="/tmp/source.pdf",
+    )
+    job_registry.update_job(job_id, status="running")
+
+    progress_updates = []
+    monkeypatch.setattr(
+        api_server_module.db,
+        "update_job_progress",
+        lambda pg_job_id, **kwargs: progress_updates.append((pg_job_id, kwargs)),
+    )
+
+    resp = asyncio.run(api_server_module.delete_job(job_id, user_id=USER_ID))
+
+    assert resp == {"status": "cancelled"}
+    job = job_registry.get_job(job_id)
+    assert job is not None
+    assert job["status"] == "cancelled"
+    assert progress_updates == [
+        (job_id, {"status": "cancelled", "finished_at_now": True})
+    ]

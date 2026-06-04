@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -42,6 +43,18 @@ from backend.app.auth import get_current_user, require_supabase_jwt
 from config import cfg
 from pipeline import PipelineConfig, PipelineResult, run_analysis
 from secrets_loader import load_api_keys as _load_api_keys
+
+
+_MEASUREMENT_PDF_WORKER = Path(__file__).parent / "ops" / "measurement_pdf_worker.py"
+_EXPORT_VECTOR_WORKER = Path(__file__).parent / "ops" / "export_vector_worker.py"
+
+
+class ExportWorkerError(RuntimeError):
+    """Controlled export-worker failure safe to surface as an HTTP error."""
+
+
+class ExportWorkerTimeout(TimeoutError):
+    """Export worker exceeded its wall-clock cap."""
 
 
 def _is_uuid(s: str) -> bool:
@@ -1512,6 +1525,100 @@ def _umt_export_for_page(
     return cats, page_assignments, auto_lines, user_drawn
 
 
+def _line_assignment_export_pages(results: dict, pages_node: dict) -> list[tuple[int, int, dict]]:
+    """Return pages whose saved UMT line assignments require PDF vector lookup."""
+    out: list[tuple[int, int, dict]] = []
+    for fp in (results or {}).get("fence_pages") or []:
+        if not isinstance(fp, dict):
+            continue
+        page_num = fp.get("page_num") or fp.get("page_number")
+        page_idx = fp.get("page_idx")
+        if page_idx is None:
+            page_idx = fp.get("page_index_in_original_doc")
+        if page_num is None or page_idx is None:
+            continue
+        page_state = pages_node.get(f"page_{page_num}") or {}
+        if page_state.get("line_assignments"):
+            out.append((int(page_idx), int(page_num), page_state))
+    return out
+
+
+def _extract_export_vector_lines(
+    *,
+    job_id: str,
+    pdf_path: str | None,
+    page_indices: list[int],
+) -> dict[int, list[dict]]:
+    """Resolve UMT line indices via a subprocess-isolated PyMuPDF worker."""
+    unique_indices = sorted({int(pi) for pi in page_indices})
+    if not unique_indices:
+        return {}
+    if not pdf_path or not Path(pdf_path).exists():
+        raise ExportWorkerError("Source PDF is required to resolve saved UMT edits")
+    if not _EXPORT_VECTOR_WORKER.exists():
+        raise ExportWorkerError(f"Export vector worker missing: {_EXPORT_VECTOR_WORKER}")
+
+    t0 = time.perf_counter()
+    log.info(
+        "export vector extraction start job=%s pages=%d",
+        job_id[:8],
+        len(unique_indices),
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(_EXPORT_VECTOR_WORKER)],
+            input=json.dumps(
+                {"pdf_path": pdf_path, "page_indices": unique_indices},
+                default=str,
+            ),
+            capture_output=True,
+            text=True,
+            timeout=cfg.HIGHLIGHT_PDF_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        elapsed = time.perf_counter() - t0
+        log.warning(
+            "export vector extraction timeout job=%s pages=%d wall=%.1fs cap=%ss",
+            job_id[:8],
+            len(unique_indices),
+            elapsed,
+            cfg.HIGHLIGHT_PDF_TIMEOUT,
+        )
+        raise ExportWorkerTimeout(
+            f"Vector extraction exceeded {cfg.HIGHLIGHT_PDF_TIMEOUT}s"
+        )
+
+    payload = None
+    for line in (proc.stdout or "").splitlines():
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+
+    if proc.returncode != 0 or not payload or not payload.get("ok"):
+        err = (payload or {}).get("error") if isinstance(payload, dict) else None
+        if not err:
+            err = (proc.stderr or "export vector worker failed").strip()[:500]
+        log.warning(
+            "export vector extraction failed job=%s pages=%d rc=%s error=%s",
+            job_id[:8],
+            len(unique_indices),
+            proc.returncode,
+            err,
+        )
+        raise ExportWorkerError(str(err))
+
+    raw = payload.get("lines_by_page") or {}
+    lines_by_page = {int(k): (v or []) for k, v in raw.items()}
+    log.info(
+        "export vector extraction done job=%s pages=%d wall=%ss",
+        job_id[:8],
+        len(unique_indices),
+        payload.get("wall_s"),
+    )
+    return lines_by_page
+
+
 def _build_export_state(
     job_id: str,
     results: dict,
@@ -1534,49 +1641,17 @@ def _build_export_state(
     umt = umt_state_mod.load(job_id)
     pages_node = (umt or {}).get("pages") or {}
 
-    # Pre-extract vector lines for any page that has UMT edits, sharing
-    # one fitz.Doc handle across pages to avoid repeated opens.
+    # Pre-extract vector lines for any page that has UMT edits. This must
+    # stay out of the FastAPI process: PyMuPDF can hang in C on malformed
+    # content and freeze every endpoint, including /api/healthz.
     umt_lines_by_idx: dict[int, list[dict]] = {}
-    needs_extraction = [
-        fp for fp in fence_pages_in
-        if isinstance(fp, dict)
-        and pages_node.get(f"page_{fp.get('page_num') or fp.get('page_number')}")
-        and (
-            (pages_node.get(f"page_{fp.get('page_num') or fp.get('page_number')}", {}).get("line_assignments"))
-            or (pages_node.get(f"page_{fp.get('page_num') or fp.get('page_number')}", {}).get("user_drawn_lines"))
+    needs_extraction = _line_assignment_export_pages(results, pages_node)
+    if needs_extraction:
+        umt_lines_by_idx = _extract_export_vector_lines(
+            job_id=job_id,
+            pdf_path=pdf_path,
+            page_indices=[page_idx for page_idx, _page_num, _state in needs_extraction],
         )
-    ]
-    if needs_extraction and pdf_path and Path(pdf_path).exists():
-        import fitz
-        from utils_vector import extract_vector_lines
-
-        doc = None
-        try:
-            doc = fitz.open(pdf_path)
-            for fp in needs_extraction:
-                page_idx = fp.get("page_idx")
-                if page_idx is None:
-                    page_idx = fp.get("page_index_in_original_doc")
-                if page_idx is None:
-                    continue
-                if not (0 <= page_idx < len(doc)):
-                    continue
-                vlines = extract_vector_lines(doc[page_idx], apply_rotation=True)
-                umt_lines_by_idx[page_idx] = [
-                    {
-                        "start": [float(v.start[0]), float(v.start[1])],
-                        "end": [float(v.end[0]), float(v.end[1])],
-                        "length_pts": float(v.length_pts),
-                        "layer": v.layer or "",
-                    }
-                    for v in vlines
-                ]
-        finally:
-            if doc is not None:
-                try:
-                    doc.close()
-                except Exception:
-                    pass
 
     line_assignments: dict[str, dict[str, str]] = {}
     user_drawn_lines: dict[str, list] = {}
@@ -1640,6 +1715,91 @@ def _build_export_state(
     )
 
 
+def _generate_measurement_pdf_in_subprocess(
+    *,
+    pdf_path: str,
+    fence_pages: list,
+    line_assignments: dict,
+    user_drawn_lines: dict,
+    page_categories: dict,
+    uploaded_pdf_name: str,
+) -> tuple[bytes, str]:
+    """Run measurement-PDF generation outside uvicorn.
+
+    PyMuPDF can enter unbounded C-level loops on malformed content streams.
+    If that happens in the API process, even `/api/healthz` stops responding.
+    The worker process gives us an OS-level kill switch.
+    """
+    import tempfile
+    import uuid
+
+    if not _MEASUREMENT_PDF_WORKER.exists():
+        raise RuntimeError(f"Measurement PDF worker missing: {_MEASUREMENT_PDF_WORKER}")
+
+    base = (uploaded_pdf_name or "document.pdf").rsplit(".", 1)[0]
+    fname = f"{base}_measurement.pdf"
+    out_path = str(Path(tempfile.gettempdir()) / f"measurement_{uuid.uuid4().hex}.pdf")
+    task = {
+        "pdf_path": pdf_path,
+        "out_path": out_path,
+        "fence_pages": fence_pages,
+        "line_assignments": line_assignments,
+        "user_drawn_lines": user_drawn_lines,
+        "page_categories": page_categories,
+        "uploaded_pdf_name": uploaded_pdf_name,
+    }
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(_MEASUREMENT_PDF_WORKER)],
+            input=json.dumps(task, default=str),
+            capture_output=True,
+            text=True,
+            timeout=cfg.HIGHLIGHT_PDF_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        try:
+            Path(out_path).unlink(missing_ok=True)
+            Path(out_path + ".tmp").unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise TimeoutError(
+            f"Measurement PDF generation exceeded {cfg.HIGHLIGHT_PDF_TIMEOUT}s"
+        )
+
+    payload = None
+    for line in (proc.stdout or "").splitlines():
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+
+    if proc.returncode != 0 or not payload or not payload.get("ok"):
+        err = (payload or {}).get("error") if isinstance(payload, dict) else None
+        if not err:
+            err = (proc.stderr or "measurement worker failed").strip()[:500]
+        try:
+            Path(out_path).unlink(missing_ok=True)
+            Path(out_path + ".tmp").unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise RuntimeError(err)
+
+    worker_out = Path(str(payload.get("out_path") or out_path))
+    try:
+        pdf_bytes = worker_out.read_bytes()
+    finally:
+        try:
+            worker_out.unlink(missing_ok=True)
+            Path(str(worker_out) + ".tmp").unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    if not pdf_bytes:
+        raise RuntimeError("Measurement PDF worker returned an empty file")
+    return pdf_bytes, fname
+
+
 @app.get("/api/jobs/{job_id}/measurement-pdf")
 async def get_measurement_pdf(
     job_id: str,
@@ -1676,22 +1836,44 @@ async def get_measurement_pdf(
     if results is None:
         raise HTTPException(404, "Results not available — job may still be running")
 
-    fence_pages_out, line_assignments, user_drawn, page_cats, _scale, _lines = (
-        _build_export_state(job_id, results, pdf_path)
-    )
+    log.info("measurement-pdf start job=%s", job_id[:8])
+    try:
+        fence_pages_out, line_assignments, user_drawn, page_cats, _scale, _lines = (
+            await asyncio.to_thread(_build_export_state, job_id, results, pdf_path)
+        )
+    except ExportWorkerTimeout as e:
+        log.warning("measurement-pdf vector timeout job=%s: %s", job_id[:8], e)
+        raise HTTPException(504, str(e))
+    except ExportWorkerError as e:
+        log.warning("measurement-pdf vector failed job=%s: %s", job_id[:8], e)
+        raise HTTPException(500, f"Measurement PDF export state failed: {e}")
 
-    from exports import generate_measurement_pdf
-    pdf_bytes, fname = generate_measurement_pdf(
-        pdf_path=pdf_path,
-        fence_pages=fence_pages_out,
-        line_assignments=line_assignments,
-        user_drawn_lines=user_drawn,
-        page_categories=page_cats,
-        uploaded_pdf_name=job.get("filename") or "document.pdf",
-    )
+    try:
+        pdf_bytes, fname = await asyncio.to_thread(
+            _generate_measurement_pdf_in_subprocess,
+            pdf_path=pdf_path,
+            fence_pages=fence_pages_out,
+            line_assignments=line_assignments,
+            user_drawn_lines=user_drawn,
+            page_categories=page_cats,
+            uploaded_pdf_name=job.get("filename") or "document.pdf",
+        )
+    except TimeoutError as e:
+        log.warning("Measurement PDF timed out for job %s: %s", job_id[:8], e)
+        raise HTTPException(504, str(e))
+    except Exception as e:
+        log.warning("Measurement PDF failed for job %s: %s", job_id[:8], e)
+        raise HTTPException(500, f"Measurement PDF generation failed: {e}")
+
     if not pdf_bytes:
         raise HTTPException(500, "Measurement PDF generation returned no bytes")
 
+    log.info(
+        "measurement-pdf done job=%s pages=%d bytes=%d",
+        job_id[:8],
+        len(fence_pages_out),
+        len(pdf_bytes),
+    )
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
@@ -1730,13 +1912,22 @@ async def get_measurement_excel(
     if results is None:
         raise HTTPException(404, "Results not available — job may still be running")
 
-    fence_pages_out, line_assignments, user_drawn, page_cats, scale_info, lines_by_page = (
-        _build_export_state(job_id, results, pdf_path)
-    )
+    log.info("measurement-excel start job=%s", job_id[:8])
+    try:
+        fence_pages_out, line_assignments, user_drawn, page_cats, scale_info, lines_by_page = (
+            await asyncio.to_thread(_build_export_state, job_id, results, pdf_path)
+        )
+    except ExportWorkerTimeout as e:
+        log.warning("measurement-excel vector timeout job=%s: %s", job_id[:8], e)
+        raise HTTPException(504, str(e))
+    except ExportWorkerError as e:
+        log.warning("measurement-excel vector failed job=%s: %s", job_id[:8], e)
+        raise HTTPException(500, f"Measurement Excel export state failed: {e}")
     element_details = (results or {}).get("element_details") or {}
 
     from exports import generate_measurement_spreadsheet
-    xlsx_bytes = generate_measurement_spreadsheet(
+    xlsx_bytes = await asyncio.to_thread(
+        generate_measurement_spreadsheet,
         fence_pages=fence_pages_out,
         line_assignments=line_assignments,
         user_drawn_lines=user_drawn,
@@ -1755,6 +1946,12 @@ async def get_measurement_excel(
 
     base = (job.get("filename") or "document.pdf").rsplit(".", 1)[0]
     fname = f"{base}_measurements.xlsx"
+    log.info(
+        "measurement-excel done job=%s pages=%d bytes=%d",
+        job_id[:8],
+        len(fence_pages_out),
+        len(xlsx_bytes),
+    )
     return Response(
         content=xlsx_bytes,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1766,10 +1963,10 @@ async def get_measurement_excel(
 
 
 def _summary_for_page(
-    pdf_path: str,
     page_idx: int,
     fp: dict,
     page_state: dict | None,
+    vlines: list[dict] | None = None,
 ) -> dict:
     """Compute per-category measurement totals for one fence page.
 
@@ -1799,21 +1996,7 @@ def _summary_for_page(
     if has_user_edits:
         # Recompute from saved UMT state. Re-extract vector lines so we
         # can map saved indices -> length_pts.
-        import fitz
-        from utils_vector import extract_vector_lines
-
-        doc = None
-        vlines = []
-        try:
-            doc = fitz.open(pdf_path)
-            if 0 <= page_idx < len(doc):
-                vlines = extract_vector_lines(doc[page_idx], apply_rotation=True)
-        finally:
-            if doc is not None:
-                try:
-                    doc.close()
-                except Exception:
-                    pass
+        vlines = vlines or []
 
         line_assignments = (page_state or {}).get("line_assignments") or {}
         for idx_str, cat in line_assignments.items():
@@ -1827,7 +2010,18 @@ def _summary_for_page(
             entry = per_cat.setdefault(
                 cat, {"pts": 0.0, "auto": 0, "manual": 0}
             )
-            entry["pts"] += float(ln.length_pts)
+            if isinstance(ln, dict):
+                length_pts = ln.get("length_pts")
+                if not isinstance(length_pts, (int, float)):
+                    try:
+                        sx, sy = float(ln["start"][0]), float(ln["start"][1])
+                        ex, ey = float(ln["end"][0]), float(ln["end"][1])
+                        length_pts = ((ex - sx) ** 2 + (ey - sy) ** 2) ** 0.5
+                    except (KeyError, TypeError, ValueError, IndexError):
+                        continue
+                entry["pts"] += float(length_pts)
+            else:
+                entry["pts"] += float(ln.length_pts)
             entry["auto"] += 1
 
         user_drawn = (page_state or {}).get("user_drawn_lines") or []
@@ -1924,6 +2118,29 @@ async def measurement_summary(
     pages_node = (umt or {}).get("pages") or {}
 
     fence_pages = (results or {}).get("fence_pages") or []
+    edited_pages = _line_assignment_export_pages(results, pages_node)
+    edited_lines_by_idx: dict[int, list[dict]] = {}
+    if edited_pages:
+        log.info(
+            "measurement-summary vector extraction job=%s edited_pages=%d",
+            job_id[:8],
+            len(edited_pages),
+        )
+        try:
+            edited_lines_by_idx = await asyncio.to_thread(
+                _extract_export_vector_lines,
+                job_id=job_id,
+                pdf_path=pdf_path,
+                page_indices=[page_idx for page_idx, _page_num, _state in edited_pages],
+            )
+        except ExportWorkerTimeout as e:
+            log.warning("measurement-summary vector timeout job=%s: %s", job_id[:8], e)
+            raise HTTPException(504, str(e))
+        except ExportWorkerError as e:
+            log.warning("measurement-summary vector failed job=%s: %s", job_id[:8], e)
+            raise HTTPException(500, f"Measurement summary export state failed: {e}")
+
+    log.info("measurement-summary start job=%s pages=%d", job_id[:8], len(fence_pages))
     pages_data: list[dict] = []
     grand: dict[str, dict] = {}
     for fp in fence_pages:
@@ -1934,7 +2151,12 @@ async def measurement_summary(
         if page_idx is None or page_num is None:
             continue
         page_state = pages_node.get(f"page_{page_num}")
-        ps = _summary_for_page(pdf_path, int(page_idx), fp, page_state)
+        ps = _summary_for_page(
+            int(page_idx),
+            fp,
+            page_state,
+            edited_lines_by_idx.get(int(page_idx)),
+        )
         pages_data.append({
             "page_num": page_num,
             "scale": ps["scale"],
@@ -1955,6 +2177,12 @@ async def measurement_summary(
 
     sorted_grand = dict(
         sorted(grand.items(), key=lambda kv: -kv[1]["ft"])
+    )
+    log.info(
+        "measurement-summary done job=%s pages=%d categories=%d",
+        job_id[:8],
+        len(pages_data),
+        len(sorted_grand),
     )
     return {
         "pages": pages_data,
