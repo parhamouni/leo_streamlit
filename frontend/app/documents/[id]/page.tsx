@@ -442,7 +442,7 @@ export default function DocumentDetailPage() {
                       onClick={onDownloadMeasurementPdf}
                       disabled={downloading}
                       className="flex-1 rounded border border-gray-300 px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-100 disabled:opacity-60"
-                      title="Auto-detected measurement lines (UMT edits not yet supported)"
+                      title="Measurement lines with saved UMT edits when available"
                     >
                       Measurement PDF
                     </button>
@@ -450,7 +450,7 @@ export default function DocumentDetailPage() {
                       onClick={onDownloadMeasurementExcel}
                       disabled={downloading}
                       className="flex-1 rounded border border-gray-300 px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-100 disabled:opacity-60"
-                      title="Auto-detected measurement rows as XLSX"
+                      title="Measurement rows with saved UMT edits when available"
                     >
                       Measurement Excel
                     </button>
