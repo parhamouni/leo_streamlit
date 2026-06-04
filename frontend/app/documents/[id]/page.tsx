@@ -910,8 +910,11 @@ function FencePageCard({
             <span>{m.label}</span>
           </span>
           {scale?.verified_scale && (
-            <span className="text-xs text-gray-500">
-              scale 1:{scale.verified_scale}
+            <span
+              className="text-xs text-gray-500"
+              title={`Detected scale factor: ${scale.verified_scale} real inches per drawing inch`}
+            >
+              scale 1 in = {(scale.verified_scale / 12).toFixed(2)} ft
               {scale.confidence ? ` (${scale.confidence})` : ""}
             </span>
           )}

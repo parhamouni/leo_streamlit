@@ -1399,6 +1399,25 @@ _CATEGORY_PALETTE = [
 ]
 
 
+def _scale_inches_to_points_per_foot(scale_inches: Any) -> float:
+    """Convert architectural scale inches to PDF points per real foot.
+
+    Scale detection returns the real-world inches represented by 1 drawing
+    inch, e.g. 360 for `1" = 30'`. PDF coordinates are points, where
+    1 drawing inch is 72 points. Therefore:
+
+        feet = points / 72 * scale_inches / 12
+             = points / (864 / scale_inches)
+    """
+    try:
+        scale = float(scale_inches)
+    except (TypeError, ValueError):
+        scale = 360.0
+    if scale <= 0:
+        scale = 360.0
+    return 864.0 / scale
+
+
 def _auto_export_for_page(fp: dict) -> tuple[dict, dict, list]:
     """Auto-only export shape for one fence page (no UMT edits).
 
@@ -1979,13 +1998,12 @@ def _summary_for_page(
     """
     scale_info = (fp or {}).get("scale_info") or {}
     page_scale_override = (page_state or {}).get("scale_override")
-    page_scale = (
-        float(page_scale_override)
+    scale_inches = (
+        page_scale_override
         if page_scale_override
-        else float(scale_info.get("verified_scale") or 360.0)
+        else scale_info.get("verified_scale") or scale_info.get("text_scale") or 360.0
     )
-    if page_scale <= 0:
-        page_scale = 360.0
+    page_scale = _scale_inches_to_points_per_foot(scale_inches)
 
     per_cat: dict[str, dict] = {}
     has_user_edits = bool(

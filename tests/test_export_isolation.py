@@ -274,3 +274,12 @@ def test_vector_worker_timeout_maps_to_excel_504(
 
     assert resp.status_code == 504
     assert "vector timeout" in resp.text
+
+
+def test_architectural_scale_converts_to_points_per_foot(api_server_module):
+    import exports
+
+    # 1" = 30' means 360 real inches per drawing inch. Since a PDF inch
+    # is 72 points, one real foot is 72 / 30 = 2.4 PDF points.
+    assert api_server_module._scale_inches_to_points_per_foot(360) == pytest.approx(2.4)
+    assert exports._scale_inches_to_points_per_foot(360) == pytest.approx(2.4)

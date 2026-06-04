@@ -16,6 +16,17 @@ import pandas as pd
 log = logging.getLogger("exports")
 
 
+def _scale_inches_to_points_per_foot(scale_inches) -> float:
+    """Convert architectural scale inches to PDF points per real foot."""
+    try:
+        scale = float(scale_inches)
+    except (TypeError, ValueError):
+        scale = 360.0
+    if scale <= 0:
+        scale = 360.0
+    return 864.0 / scale
+
+
 def generate_measurement_pdf(
     pdf_path: str,
     fence_pages: list[dict],
@@ -170,7 +181,8 @@ def generate_measurement_spreadsheet(
         page_key = f"page_{page_num}"
 
         scale_info = per_page_scale_info.get(page_key, {})
-        page_scale = scale_info.get("verified_scale") or scale_info.get("text_scale") or 360.0
+        scale_inches = scale_info.get("verified_scale") or scale_info.get("text_scale") or 360.0
+        page_scale = _scale_inches_to_points_per_foot(scale_inches)
 
         lines = (lines_by_page or {}).get(page_key, [])
         pa = line_assignments.get(page_key, {})
