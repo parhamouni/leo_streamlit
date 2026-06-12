@@ -9,6 +9,26 @@
 **Decision log:** UMT confirmed **critical-path** (customers always correct measurements manually).
 **Last updated:** 2026-05-09 — **🚀 LIVE in staging: full end-to-end deploy.** Vercel frontend at https://leo-streamlit.vercel.app, AWS backend at `3.144.148.83` (no TLS — Vercel rewrite proxy bridges HTTPS browser ↔ HTTP backend). Sprint 4 UMT complete (4a.5 drawing, 4a.6 zoom+pan+wheel-zoom, 4a.7 C8 summary, 4a.8 exports honor UMT edits). UX bonuses: per-line popover, layer highlight + per-layer dropdown, 🎯 smart auto-assign, indicator-code dedup, /tmp eviction fallbacks, classifier-reasoning persistence, page-image misalignment fix. Phase 10.1: 19 cross-user authorization tests, 62/62 suite green. Phase 11 shipped: `fence-api-v2.service` on port 8513 (legacy `fence-api`/`fence-fast`/`stale-restart`/`watchdog` disabled), nginx as default_server on :80, Supabase JWT auth, Postgres pooler, worker tuning (`FENCE_WORKERS_PHASE3=8`, `MemoryMax=32G`). **Damaged-page hang resolved (`df199cd` → `09962fc`)**: broader probe (`get_text` text/words/dict + `get_drawings`) folded into Phase 1a's existing per-page subprocess — single pass instead of two, ~20–30 s saved per 179-page job; Phase 3 inline call restored, `FENCE_API_WORKER_COUNT` back to 2. **Live-validated**: Lone Mountain re-upload caught a damaged page mid-Phase-1a (`page extraction exceeded 20s — marking damaged and skipping`) and kept going without hanging the worker. **Next:** Phase 10.2 (upload limits + metadata logging) and final-cutover obligations (TLS via real domain, secret rotation, S3 storage migration).
 
+### 2026-06-12 session — reliability hardening + raised upload ceiling
+
+Closed the remaining "partially addressed" reliability gaps and raised the
+upload limits. All live on `main` + deployed.
+
+| What | Where | Status |
+|---|---|---|
+| Surface damaged/unreadable pages (stub row + "could not be read" badge + summary banner) instead of silently dropping them; cache broken pages so re-runs report too | `pipeline.py`, `frontend/.../documents/[id]/page.tsx`, `results.ts` | `18cf817` |
+| Retry backoff gains jitter (5xx bursts don't retry in lockstep) | `frontend/lib/api.ts` | `18cf817` |
+| Postgres `statement_timeout=30s` / `lock_timeout=10s` / `idle_in_transaction_session_timeout=60s` via connection `options` (env-overridable `FENCE_DB_*_TIMEOUT_MS`). Pool's `timeout=5` only bounded *acquisition*; a lock-blocked query could pin a conn forever | `backend/app/db.py` | `18cf817` |
+| Over-limit upload errors show the 4xx detail verbatim (no `HTTP 413 —` prefix); 5xx keep status | `frontend/contexts/UploadContext.tsx` | `18cf817` |
+| **Phase A3** — page-count peek moved into a SIGKILL-timeout subprocess (`ops/pdf_pagecount_worker.py` + `_peek_page_count`); removes the inline `fitz.open(stream=…)` that could block the event loop on a malformed PDF and held the whole file in RAM. Dedup now runs before the peek | `api_server.py`, `ops/pdf_pagecount_worker.py` | this session |
+
+**Infra changes applied directly to EC2 (not in git)**:
+- **Upload ceiling raised to 1 GiB / 1000 pages.** `FENCE_MAX_PDF_MB=1024` + `FENCE_MAX_PAGES=1000` appended to `/etc/fence-api-v2/env`. nginx `client_max_body_size 500M → 1024M` and `client_body_timeout 120s → 600s` on **both** vhosts (`fence-api-v2`, `fence-api-v2-tls`). Backups: `/etc/fence-api-v2/env.bak.*`, `/etc/nginx/sites-available/*.bak.20260612-*`.
+- **DB timeouts verified live**: `SHOW statement_timeout` → 30s/10s/1min against the local Postgres.
+- **Vercel cap is a non-issue**: uploads go browser → `https://leofence-api.duckdns.org` (TLS vhost) **directly**, bypassing Vercel's edge (confirmed: real browser IPs on `POST /api/jobs` in nginx access log). Vercel's 4.5 MB cap is Functions-only; its 120s proxy timeout doesn't apply to a path that never touches Vercel.
+
+**Still open**: (1) rest of the scalability rewrite — streaming upload (A1/A2) + windowed pipeline (B) in `~/.claude/plans/scalability-rewrite-larger-files.md`; (2) contracting-scope / electrical support (fence-only hardcoding — not started); (3) optional `MAX_DAILY_SPEND_USD` cap (currently 0 = unlimited), more relevant now 1000-page jobs are allowed.
+
 ### 2026-05-09 session — six fixes shipped + damage-probe consolidation
 
 | What | Commit | Status |

@@ -47,6 +47,10 @@ from secrets_loader import load_api_keys as _load_api_keys
 
 _MEASUREMENT_PDF_WORKER = Path(__file__).parent / "ops" / "measurement_pdf_worker.py"
 _EXPORT_VECTOR_WORKER = Path(__file__).parent / "ops" / "export_vector_worker.py"
+_PAGECOUNT_WORKER = Path(__file__).parent / "ops" / "pdf_pagecount_worker.py"
+# Page-count peek is normally sub-second; a hang here means a malformed PDF,
+# so cap it tight rather than waiting on the long export timeouts.
+_PAGECOUNT_TIMEOUT = 30
 
 
 class ExportWorkerError(RuntimeError):
@@ -531,28 +535,13 @@ async def create_job(
             f"File too large ({size_mb:.0f} MB). Max is {cfg.MAX_PDF_MB} MB.",
         )
 
-    # Peek page count before queueing
-    try:
-        import fitz as _fitz
-        _doc = _fitz.open(stream=pdf_bytes, filetype="pdf")
-        n_pages = _doc.page_count
-        _doc.close()
-    except Exception as e:
-        raise HTTPException(400, f"Could not read PDF: {e}")
-
-    if n_pages > cfg.MAX_PAGES:
-        raise HTTPException(
-            413,
-            f"PDF has {n_pages} pages (max {cfg.MAX_PAGES}). "
-            "Please split the document by page range.",
-        )
-
     import hashlib
     pdf_hash = hashlib.sha256(pdf_bytes).hexdigest()
 
     # Dedup: if this Supabase user already has a document with the same
     # pdf_hash, return the existing one. Re-process only if the previous
-    # attempt is in a terminal-failed state.
+    # attempt is in a terminal-failed state. Done before the page-count
+    # peek so duplicates skip that work entirely.
     if _is_uuid(user_id):
         try:
             existing = db.find_document_by_hash(user_id, pdf_hash)
@@ -576,6 +565,30 @@ async def create_job(
     pdf_filename = f"job_{pdf_hash[:16]}.pdf"
     pdf_path = upload_dir / pdf_filename
     pdf_path.write_bytes(pdf_bytes)
+
+    # Peek page count in a subprocess with a hard timeout. A malformed PDF
+    # can drive PyMuPDF into a C-level recovery loop; doing this inline would
+    # block the API event loop (and every concurrent request) until it gave
+    # up. On failure we drop the just-written file so a rejected upload
+    # doesn't leave an orphan in PDF_TMP_DIR.
+    try:
+        n_pages = _peek_page_count(str(pdf_path))
+    except ExportWorkerTimeout:
+        pdf_path.unlink(missing_ok=True)
+        raise HTTPException(
+            400, "Could not read PDF: page-count timed out (file may be damaged)."
+        )
+    except ExportWorkerError as e:
+        pdf_path.unlink(missing_ok=True)
+        raise HTTPException(400, f"Could not read PDF: {e}")
+
+    if n_pages > cfg.MAX_PAGES:
+        pdf_path.unlink(missing_ok=True)
+        raise HTTPException(
+            413,
+            f"PDF has {n_pages} pages (max {cfg.MAX_PAGES}). "
+            "Please split the document by page range.",
+        )
 
     job_id = job_registry.create_job(
         user_id=user_id,
@@ -1636,6 +1649,44 @@ def _extract_export_vector_lines(
         payload.get("wall_s"),
     )
     return lines_by_page
+
+
+def _peek_page_count(pdf_path: str) -> int:
+    """Count a freshly-uploaded PDF's pages in a subprocess with a hard
+    timeout. Isolating this keeps a malformed PDF that hangs PyMuPDF from
+    wedging the API event loop (the same C-level recovery-loop hazard the
+    pipeline already isolates in Phase 1a). Raises ExportWorkerTimeout on
+    hang and ExportWorkerError on any read failure — both map to a 4xx in
+    create_job."""
+    if not _PAGECOUNT_WORKER.exists():
+        raise ExportWorkerError(f"Page-count worker missing: {_PAGECOUNT_WORKER}")
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(_PAGECOUNT_WORKER)],
+            input=json.dumps({"pdf_path": pdf_path}, default=str),
+            capture_output=True,
+            text=True,
+            timeout=_PAGECOUNT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise ExportWorkerTimeout(
+            f"page-count exceeded {_PAGECOUNT_TIMEOUT}s (file may be damaged)"
+        )
+
+    payload = None
+    for line in (proc.stdout or "").splitlines():
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+
+    if proc.returncode != 0 or not payload or not payload.get("ok"):
+        err = (payload or {}).get("error") if isinstance(payload, dict) else None
+        if not err:
+            err = (proc.stderr or "page-count worker failed").strip()[:500]
+        raise ExportWorkerError(str(err))
+
+    return int(payload.get("page_count") or 0)
 
 
 def _build_export_state(
