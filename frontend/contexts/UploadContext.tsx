@@ -298,7 +298,12 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
             const j = JSON.parse(xhr.responseText);
             detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j);
           } catch {}
-          reject(new Error(`HTTP ${xhr.status} — ${detail.slice(0, 200)}`));
+          detail = detail.slice(0, 200);
+          // 4xx carry a user-facing reason (file too large, too many pages,
+          // unreadable PDF) — show it verbatim. 5xx are server faults where
+          // the status code is the useful signal, so keep it prefixed.
+          const isClientError = xhr.status >= 400 && xhr.status < 500;
+          reject(new Error(isClientError ? detail : `HTTP ${xhr.status} — ${detail}`));
         }
       });
       xhr.addEventListener("error", () =>

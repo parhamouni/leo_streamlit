@@ -112,6 +112,10 @@ class PipelineResult:
     unified_measurements: dict = field(default_factory=dict)
     page_categories: dict = field(default_factory=dict)
     total_pages: int = 0
+    # Pages MuPDF couldn't read (damaged/timed-out in Phase 1a). Each entry is
+    # {page_idx, page_num, reason}. Surfaced to the UI so a skipped page is
+    # visible instead of silently vanishing from the page list.
+    broken_pages: list[dict] = field(default_factory=list)
     timings: dict = field(default_factory=dict)
     error: str | None = None
 
@@ -371,6 +375,9 @@ def run_analysis(
         # hang get marked damaged in the same single pass and added to
         # broken_pages below; downstream guards filter them out.
         broken_pages: set[int] = set()
+        # page_idx -> human-readable reason, kept alongside broken_pages so the
+        # final result can tell the user *why* a page was skipped.
+        broken_page_reasons: dict[int, str] = {}
         valid_pages = list(range(total_pages))
 
         progress("init", 5, f"PDF loaded: {total_pages} pages")
@@ -388,6 +395,13 @@ def run_analysis(
         if cached_1a:
             page_texts = cached_1a.get("page_texts", {})
             page_dims = cached_1a.get("page_dims", {})
+            # Older cache entries predate broken-page tracking and simply
+            # lack this key — .get falls back to {} so nothing is reported,
+            # matching prior behavior.
+            for pi_str, reason in (cached_1a.get("broken") or {}).items():
+                pi = int(pi_str)
+                broken_pages.add(pi)
+                broken_page_reasons[pi] = reason
             log.info("Phase 1a: cache hit")
         else:
             # Phase 1a runs in a subprocess per batch with hard SIGKILL on
@@ -425,10 +439,12 @@ def run_analysis(
                             f"marking damaged and skipping"
                         )
                         broken_pages.add(pi)
+                        broken_page_reasons[pi] = r.get("error") or "extraction failed"
 
             cache_data = {
                 "page_texts": page_texts,
                 "page_dims": page_dims,
+                "broken": {str(pi): broken_page_reasons[pi] for pi in broken_pages},
             }
             fence_cache.put("phase1a_v2", pdf_hash, params, cache_data, user_scope=cache_scope)
 
@@ -672,6 +688,35 @@ def run_analysis(
                 })
             except Exception:
                 log.exception("page_cb (phase1c non-fence) failed")
+
+        # Surface damaged/unreadable pages. They were excluded from every
+        # downstream phase (text, OCR, classification) so without this they
+        # would silently disappear from the page list — the user would just
+        # see fewer pages than the PDF actually has. Emit a stub row per
+        # broken page (rendered with a "could not be read" badge) and record
+        # them in the result summary.
+        result.broken_pages = [
+            {
+                "page_idx": pi,
+                "page_num": pi + 1,
+                "reason": broken_page_reasons.get(pi, "extraction failed"),
+            }
+            for pi in sorted(broken_pages)
+        ]
+        for entry in result.broken_pages:
+            try:
+                emit_page({
+                    "page_number": entry["page_num"],
+                    "is_fence_page": False,
+                    "result_json": {
+                        "page_idx": entry["page_idx"],
+                        "page_num": entry["page_num"],
+                        "phase": "broken",
+                        "error": entry["reason"],
+                    },
+                })
+            except Exception:
+                log.exception("page_cb (broken) failed")
 
         timings["phase1c"] = time.perf_counter() - t1c
         progress("phase1c", 45, f"Phase 1c done: {len(fence_page_indices)} fence, "

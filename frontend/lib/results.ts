@@ -184,6 +184,9 @@ export type PipelineResults = {
   unified_measurements?: Record<string, Measurements>;
   page_categories?: Record<string, string>;
   total_pages?: number;
+  // Pages MuPDF couldn't read (damaged / timed out during extraction). Shown
+  // to the user so a skipped page is visible instead of silently dropped.
+  broken_pages?: { page_idx: number; page_num: number; reason: string }[];
   timings?: Record<string, number>;
   error?: string | null;
 };

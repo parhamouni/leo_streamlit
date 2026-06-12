@@ -63,7 +63,10 @@ export async function apiFetch(
     lastResp = resp;
     if (!canRetry || !TRANSIENT_STATUSES.has(resp.status)) break;
     if (attempt < backoffsMs.length) {
-      await sleep(backoffsMs[attempt]);
+      // Add up to +50% random jitter so a burst of clients that all 500ed at
+      // the same instant don't retry in lockstep and re-stampede the pool.
+      const base = backoffsMs[attempt];
+      await sleep(base + Math.floor(Math.random() * base * 0.5));
       continue;
     }
   }

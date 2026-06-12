@@ -41,6 +41,39 @@ def _database_url() -> str:
     return url
 
 
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _session_options() -> str:
+    """Server-side per-connection timeouts, applied at connection startup via
+    libpq's `options`. The pool's `timeout=5` only bounds how long we wait to
+    *acquire* a connection; these bound what happens once we have one, so a
+    query that blocks on a row lock or a slow scan can't wedge a request (and
+    its pooled connection) indefinitely.
+
+      * statement_timeout — cap any single query (default 30s).
+      * lock_timeout — fail fast instead of queueing behind a held row lock,
+        e.g. a delete racing a concurrent per-page upsert (default 10s).
+      * idle_in_transaction_session_timeout — reap a transaction left open by
+        a crashed/stuck caller so it stops holding locks (default 60s).
+
+    All overridable via env for incident response without a redeploy. Set any
+    to 0 to disable that individual timeout (Postgres treats 0 as "no limit").
+    """
+    statement_ms = _int_env("FENCE_DB_STATEMENT_TIMEOUT_MS", 30_000)
+    lock_ms = _int_env("FENCE_DB_LOCK_TIMEOUT_MS", 10_000)
+    idle_tx_ms = _int_env("FENCE_DB_IDLE_TX_TIMEOUT_MS", 60_000)
+    return (
+        f"-c statement_timeout={statement_ms} "
+        f"-c lock_timeout={lock_ms} "
+        f"-c idle_in_transaction_session_timeout={idle_tx_ms}"
+    )
+
+
 class _LeakSafePool(ConnectionPool):
     """ConnectionPool that closes the underlying socket of broken
     connections instead of silently dropping them.
@@ -127,7 +160,10 @@ def pool() -> ConnectionPool:
                     # on free tier, plenty of headroom.
                     min_size=2,
                     max_size=20,
-                    kwargs={"row_factory": dict_row},
+                    # `options` ships server-side statement/lock/idle-tx
+                    # timeouts so a blocked query can't pin a connection
+                    # forever — see _session_options().
+                    kwargs={"row_factory": dict_row, "options": _session_options()},
                     # Run `check` on each getconn() to detect stale conns.
                     check=_check_connection,
                     # Recycle connections every 15 min so slow drift in

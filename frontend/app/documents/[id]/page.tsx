@@ -687,6 +687,27 @@ export default function DocumentDetailPage() {
           />
         )}
 
+        {/* ---------- Unreadable / damaged pages ---------- */}
+        {isComplete && (results?.broken_pages?.length ?? 0) > 0 && (
+          <section className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+            <h2 className="font-medium text-amber-800 text-sm mb-1">
+              {results!.broken_pages!.length} page
+              {results!.broken_pages!.length === 1 ? "" : "s"} could not be read
+            </h2>
+            <p className="text-xs text-amber-700 mb-2">
+              These pages were damaged or timed out during extraction and were
+              skipped. The rest of the document was analysed normally.
+            </p>
+            <ul className="text-xs text-amber-700 font-mono space-y-0.5">
+              {results!.broken_pages!.map((b) => (
+                <li key={b.page_num}>
+                  Page {b.page_num} — {b.reason}
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
         {/* ---------- Pages list ---------- */}
         {isComplete && results && (
           <section className="bg-white rounded-lg shadow">
@@ -909,6 +930,25 @@ function FilterChip({
 }
 
 function LivePageRow({ row, jobId }: { row: PageRow; jobId?: string | null }) {
+  // Damaged page MuPDF couldn't read — flag it clearly rather than letting it
+  // masquerade as an ordinary non-fence page.
+  if (row.result_json?.phase === "broken") {
+    const reason = (row.result_json as { error?: string }).error;
+    return (
+      <div className="flex items-center justify-between gap-3 px-4 py-3">
+        <div className="flex items-center gap-3 min-w-0">
+          <span className="font-mono text-gray-700">Page {row.page_number}</span>
+          <span className="text-xs px-2 py-0.5 rounded bg-amber-100 text-amber-700">
+            could not be read
+          </span>
+        </div>
+        <span className="text-xs text-gray-400 italic truncate">
+          {reason ?? "damaged page skipped"}
+        </span>
+      </div>
+    );
+  }
+
   const stub = isPhase1cStub(row);
   if (!stub && row.is_fence_page && row.result_json) {
     // Phase 3 enrichment is in — render with the existing rich card.
