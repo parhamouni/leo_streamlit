@@ -568,6 +568,18 @@ export default function DocumentDetailPage() {
               </h1>
               <div className="mt-2 flex flex-wrap items-center gap-3 text-sm text-gray-600">
                 <StatusBadge status={doc.job_status} />
+                {results?.trade && (
+                  <span
+                    className={`text-xs px-2 py-0.5 rounded font-medium ${
+                      tradeRaw === "fence"
+                        ? "bg-green-100 text-green-700"
+                        : "bg-amber-100 text-amber-700"
+                    }`}
+                    title="Analysis mode this document was processed in"
+                  >
+                    {subjCap} mode
+                  </span>
+                )}
                 <span>{doc.total_pages ?? "—"} pages</span>
                 <span>•</span>
                 <span>uploaded {formatDate(doc.created_at)}</span>

@@ -9,6 +9,8 @@ import { etaSeconds, formatEta } from "@/lib/eta";
 import { UploadButton } from "@/components/UploadButton";
 import {
   AnalysisSettingsPanel,
+  TradeModeSelector,
+  TRADES,
   useAnalysisSettings,
 } from "@/components/AnalysisSettings";
 
@@ -323,6 +325,20 @@ export default function DashboardPage() {
             </button>
           </div>
         </div>
+
+        {/* Analysis mode — prominent so the active mode is always visible
+            and easy to switch before uploading. Persists per browser. */}
+        <section className="bg-white rounded-lg shadow p-4 flex flex-wrap items-center gap-x-4 gap-y-2">
+          <span className="text-sm font-medium text-gray-800">Analysis mode</span>
+          <TradeModeSelector settings={settings} setSettings={setSettings} />
+          <span className="text-xs text-gray-500">
+            New uploads are analysed in{" "}
+            <span className="font-medium text-gray-700">
+              {TRADES[settings.trade ?? "fence"].label}
+            </span>{" "}
+            mode.
+          </span>
+        </section>
 
         {/* Analysis settings */}
         <AnalysisSettingsPanel settings={settings} setSettings={setSettings} />
