@@ -7,7 +7,30 @@
 **Plan file:** `/home/ubuntu/.claude/plans/yes-i-get-you-refactored-hummingbird.md`
 **Stage-1 highlighting plan (now superseded — work below is done):** `/home/ubuntu/.claude/plans/fuck-you-you-are-splendid-beacon.md`
 **Decision log:** UMT confirmed **critical-path** (customers always correct measurements manually).
-**Last updated:** 2026-05-09 — **🚀 LIVE in staging: full end-to-end deploy.** Vercel frontend at https://leo-streamlit.vercel.app, AWS backend at `3.144.148.83` (no TLS — Vercel rewrite proxy bridges HTTPS browser ↔ HTTP backend). Sprint 4 UMT complete (4a.5 drawing, 4a.6 zoom+pan+wheel-zoom, 4a.7 C8 summary, 4a.8 exports honor UMT edits). UX bonuses: per-line popover, layer highlight + per-layer dropdown, 🎯 smart auto-assign, indicator-code dedup, /tmp eviction fallbacks, classifier-reasoning persistence, page-image misalignment fix. Phase 10.1: 19 cross-user authorization tests, 62/62 suite green. Phase 11 shipped: `fence-api-v2.service` on port 8513 (legacy `fence-api`/`fence-fast`/`stale-restart`/`watchdog` disabled), nginx as default_server on :80, Supabase JWT auth, Postgres pooler, worker tuning (`FENCE_WORKERS_PHASE3=8`, `MemoryMax=32G`). **Damaged-page hang resolved (`df199cd` → `09962fc`)**: broader probe (`get_text` text/words/dict + `get_drawings`) folded into Phase 1a's existing per-page subprocess — single pass instead of two, ~20–30 s saved per 179-page job; Phase 3 inline call restored, `FENCE_API_WORKER_COUNT` back to 2. **Live-validated**: Lone Mountain re-upload caught a damaged page mid-Phase-1a (`page extraction exceeded 20s — marking damaged and skipping`) and kept going without hanging the worker. **Next:** Phase 10.2 (upload limits + metadata logging) and final-cutover obligations (TLS via real domain, secret rotation, S3 storage migration).
+**Last updated:** 2026-06-17 — see the dated session logs below (electrical multi-trade mode is the latest; 1 GiB / 1000-page upload ceiling; reliability hardening). The 2026-05-09 snapshot that follows is retained for history. — **🚀 LIVE in staging: full end-to-end deploy.** Vercel frontend at https://leo-streamlit.vercel.app, AWS backend at `3.144.148.83` (no TLS — Vercel rewrite proxy bridges HTTPS browser ↔ HTTP backend). Sprint 4 UMT complete (4a.5 drawing, 4a.6 zoom+pan+wheel-zoom, 4a.7 C8 summary, 4a.8 exports honor UMT edits). UX bonuses: per-line popover, layer highlight + per-layer dropdown, 🎯 smart auto-assign, indicator-code dedup, /tmp eviction fallbacks, classifier-reasoning persistence, page-image misalignment fix. Phase 10.1: 19 cross-user authorization tests, 62/62 suite green. Phase 11 shipped: `fence-api-v2.service` on port 8513 (legacy `fence-api`/`fence-fast`/`stale-restart`/`watchdog` disabled), nginx as default_server on :80, Supabase JWT auth, Postgres pooler, worker tuning (`FENCE_WORKERS_PHASE3=8`, `MemoryMax=32G`). **Damaged-page hang resolved (`df199cd` → `09962fc`)**: broader probe (`get_text` text/words/dict + `get_drawings`) folded into Phase 1a's existing per-page subprocess — single pass instead of two, ~20–30 s saved per 179-page job; Phase 3 inline call restored, `FENCE_API_WORKER_COUNT` back to 2. **Live-validated**: Lone Mountain re-upload caught a damaged page mid-Phase-1a (`page extraction exceeded 20s — marking damaged and skipping`) and kept going without hanging the worker. **Next:** Phase 10.2 (upload limits + metadata logging) and final-cutover obligations (TLS via real domain, secret rotation, S3 storage migration).
+
+### 2026-06-17 session — electrical analysis mode (multi-trade)
+
+Generalised the fence-only pipeline into a **trade-aware** one. Users pick an
+analysis mode (**Fence** or **Electrical**) in Analysis settings at upload.
+Live on `main` + deployed (backend restarted, frontend via Vercel).
+
+| What | Where | Status |
+|---|---|---|
+| Trade-profile registry: per-trade keyword set, classification "look for" hints, per-element detail-field schema, `supports_measurement` flag. `DEFAULT_FENCE_KEYWORDS` now sources from it | `config.py` (`TRADE_PROFILES`, `DEFAULT_TRADE`, `trade_profile()`) | `eb78354` |
+| Prompts parameterised by `profile` (classification, legend, detail extraction). `profile=None` ⇒ identical fence behavior. Classifier JSON key generalised `is_fence_related` → `is_relevant` (old key still accepted/returned) | `utils_ade/llm.py` | `eb78354` |
+| `PipelineConfig.trade` + `PipelineResult.trade`; profile resolved once and passed to every prompt; **trade added to the cache key** (fence/electrical never cross-contaminate); linear measurement force-disabled for trades that opt out; `--trade` CLI flag | `pipeline.py` | `eb78354` |
+| Upload config parses `trade`; keywords default to the trade's set | `api_server.py` | `eb78354` |
+| Mode selector (Fence/Electrical), per-trade default keywords, fence-only toggles hidden for electrical, dynamic labels | `frontend/components/AnalysisSettings.tsx` | `eb78354` |
+| Labels/stats/filters/filename derive from `results.trade`; element-specs table derives columns from the data (adapts per trade); measurement UI gated to measurement trades | `frontend/app/documents/[id]/page.tsx`, `frontend/lib/results.ts` | `eb78354` |
+
+**Electrical keywords** (product-owner list + recall synonyms): one-line / single-line, available power, loads, cable/wire/conduit schedule, outlets/receptacles, lights/lighting, panel/panelboard schedule, feeder, circuit, breaker, switchgear, transformer, grounding.
+
+**Electrical detail fields**: rating, phase, wire_size, conduit_size, breaker, load, circuit, mounting, location.
+
+**To tune electrical**: edit `config.TRADE_PROFILES["electrical"]` — single source of truth for keywords / `look_for` hints / detail fields. Prompts are sensible first drafts, **not yet validated on real electrical drawings** — needs a real set uploaded in Electrical mode to tune from. Tests: 83 passed (8 new in `tests/test_trade_profiles.py`).
+
+**This closes the last of the six original issues** (Contracting Scope). Remaining future work: rest of the scalability rewrite (streaming upload A1/A2 + windowed pipeline B in `~/.claude/plans/scalability-rewrite-larger-files.md`).
 
 ### 2026-06-12 session — reliability hardening + raised upload ceiling
 
