@@ -643,6 +643,79 @@ async def create_job(
     }
 
 
+@app.post("/api/jobs/{job_id}/reanalyze", status_code=202)
+async def reanalyze_job(
+    job_id: str,
+    trade: str,
+    user_id: str = Depends(get_current_user),
+):
+    """Re-run analysis on an already-uploaded document in a different trade
+    mode (fence/electrical), reusing the PDF already on disk — no re-upload.
+
+    Creates a NEW job for the same document with the requested trade. Because
+    page_results are keyed per document (not per job), the new run replaces
+    the prior trade's per-page rows and the document view switches to the new
+    trade. The pipeline cache is keyed by (pdf_hash, trade), so a trade that
+    was analysed before re-runs from cache — fast and no new LLM spend, which
+    is what makes "do it again if not done already" cheap.
+    """
+    old = job_registry.get_job(job_id)
+    if not old or old.get("user_id") != user_id:
+        raise HTTPException(404, "Job not found")
+
+    trade = (trade or "").strip().lower()
+    if trade not in cfg_mod.TRADE_PROFILES:
+        raise HTTPException(
+            400,
+            f"Unknown trade '{trade}'. Choose one of: {', '.join(cfg_mod.TRADE_PROFILES)}.",
+        )
+
+    pdf_path = old.get("pdf_path")
+    if not pdf_path or not Path(pdf_path).exists():
+        raise HTTPException(
+            409,
+            "The original PDF is no longer on the server (uploads are cleaned "
+            f"up after a day). Re-upload it to analyse in "
+            f"{cfg_mod.trade_profile(trade)['label']} mode.",
+        )
+
+    # Carry over the prior run's settings; swap the trade + its keyword set.
+    try:
+        new_cfg = json.loads(old.get("config_json") or "{}")
+    except Exception:
+        new_cfg = {}
+    new_cfg["trade"] = trade
+    new_cfg["fence_keywords"] = list(cfg_mod.trade_profile(trade)["keywords"])
+
+    new_job_id = job_registry.create_job(
+        user_id=user_id,
+        filename=old.get("filename") or "document.pdf",
+        pdf_hash=old.get("pdf_hash"),
+        pdf_path=pdf_path,
+        config_json=json.dumps(new_cfg, default=str),
+    )
+
+    # Mirror under the SAME Postgres document so the document view picks the
+    # new job up as "latest". Legacy X-User-Id jobs have no Postgres doc.
+    document_id = None
+    if _is_uuid(user_id):
+        try:
+            document_id = db.get_document_id_by_job(job_id)
+            if document_id:
+                db.insert_job(document_id, user_id, status="queued", job_id=new_job_id)
+        except Exception:
+            log.exception("reanalyze: postgres job mirror failed")
+
+    return {
+        "job_id": new_job_id,
+        "document_id": document_id,
+        "trade": trade,
+        "status": "queued",
+        "queue_position": job_registry.queue_position(new_job_id),
+        "running_jobs": job_registry.count_running_jobs(),
+    }
+
+
 @app.get("/api/jobs")
 async def list_jobs(user_id: str = Depends(get_current_user)):
     """List the user's recent jobs."""

@@ -12,6 +12,7 @@ import {
   withinPhasePct,
 } from "@/lib/eta";
 import { RowActions } from "@/components/RowActions";
+import { TRADES, type TradeId } from "@/components/AnalysisSettings";
 import { UMTCanvas } from "@/components/UMTCanvas";
 import {
   MeasurementSummary,
@@ -321,6 +322,37 @@ export default function DocumentDetailPage() {
   useEffect(() => {
     if (authReady) refresh(false);
   }, [authReady, refresh]);
+
+  // Re-analyze this already-uploaded document in another trade mode. Creates
+  // a new job on the same PDF; refresh() then picks it up and polling shows
+  // its progress until it completes (and the view switches to that trade).
+  const [reanalyzing, setReanalyzing] = useState(false);
+  const onReanalyze = useCallback(
+    async (targetTrade: string) => {
+      if (!doc?.latest_job_id) return;
+      setReanalyzing(true);
+      try {
+        await apiFetch(
+          `/api/jobs/${doc.latest_job_id}/reanalyze?trade=${encodeURIComponent(targetTrade)}`,
+          { method: "POST" },
+        );
+        await refresh(false);
+      } catch (e) {
+        setError(
+          e instanceof ApiError
+            ? typeof e.body === "string"
+              ? e.body
+              : (e.body as { detail?: string })?.detail ?? `Re-analyze failed (${e.status})`
+            : e instanceof Error
+              ? e.message
+              : String(e),
+        );
+      } finally {
+        setReanalyzing(false);
+      }
+    },
+    [doc?.latest_job_id, refresh],
+  );
 
   // Poll while running/queued
   const docRef = useRef<DashboardDoc | null>(null);
@@ -644,6 +676,45 @@ export default function DocumentDetailPage() {
             </div>
           </div>
         </section>
+
+        {/* ---------- Re-analyze in another mode ---------- */}
+        {isComplete && results && (
+          <section className="bg-white rounded-lg shadow p-4">
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-sm font-medium text-gray-800">
+                Re-analyze in another mode
+              </span>
+              {(Object.keys(TRADES) as TradeId[]).map((t) => {
+                const isCurrent = t === tradeRaw;
+                return (
+                  <button
+                    key={t}
+                    type="button"
+                    disabled={isCurrent || reanalyzing}
+                    onClick={() => onReanalyze(t)}
+                    className={`px-3 py-1 text-sm rounded-md border transition ${
+                      isCurrent
+                        ? "border-transparent bg-gray-100 text-gray-500 cursor-default"
+                        : "border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-60"
+                    }`}
+                  >
+                    {isCurrent
+                      ? `✓ ${TRADES[t].label} (current)`
+                      : reanalyzing
+                        ? "Starting…"
+                        : `Run ${TRADES[t].label} analysis`}
+                  </button>
+                );
+              })}
+            </div>
+            <p className="text-xs text-gray-500 mt-2">
+              Re-runs analysis on this PDF — no re-upload. The view switches to the
+              selected mode; a mode you&apos;ve run before re-loads from cache
+              (fast, no extra cost). The original PDF must still be on the server
+              (kept ~24h after upload).
+            </p>
+          </section>
+        )}
 
         {/* ---------- Summary stats ---------- */}
         {isComplete && results && (
