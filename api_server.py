@@ -40,6 +40,7 @@ import job_registry
 import uuid as _uuid
 from backend.app import db
 from backend.app.auth import get_current_user, require_supabase_jwt
+import config as cfg_mod
 from config import cfg
 from pipeline import PipelineConfig, PipelineResult, run_analysis
 from secrets_loader import load_api_keys as _load_api_keys
@@ -218,13 +219,20 @@ def _run_job(job: dict, keys: dict):
         except Exception:
             pass
 
+    # Contracting trade / mode the user picked at upload ("fence" | "electrical").
+    # Keywords default to that trade's set when the client didn't send a custom
+    # list (a blank/empty list also falls back to the trade default).
+    trade = config_data.get("trade") or cfg_mod.DEFAULT_TRADE
+    trade_keywords = list(cfg_mod.trade_profile(trade)["keywords"])
+
     config = PipelineConfig(
         openai_api_key=keys.get("openai_key", ""),
         ade_api_key=keys.get("ade_key", ""),
         google_cloud_config=keys.get("google_cloud_config"),
         analysis_model=config_data.get("analysis_model", cfg.ANALYSIS_MODEL),
         classifier_model=config_data.get("classifier_model", cfg.CLASSIFIER_MODEL),
-        fence_keywords=config_data.get("fence_keywords", list(cfg.DEFAULT_FENCE_KEYWORDS)),
+        trade=trade,
+        fence_keywords=config_data.get("fence_keywords") or trade_keywords,
         use_ade=config_data.get("use_ade", True),
         highlight_fence_text=config_data.get("highlight_fence_text", True),
         enable_unified_measurement=config_data.get("enable_unified_measurement", True),

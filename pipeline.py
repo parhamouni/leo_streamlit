@@ -47,7 +47,7 @@ from utils_vector import (
     verify_scale_with_bar_fast,
     transform_coords_for_rotation,
 )
-from config import cfg
+from config import cfg, DEFAULT_TRADE, trade_profile
 
 log = logging.getLogger("pipeline")
 
@@ -74,6 +74,10 @@ class PipelineConfig:
     google_cloud_config: dict | None = None
     analysis_model: str = field(default_factory=lambda: cfg.ANALYSIS_MODEL)
     classifier_model: str = field(default_factory=lambda: cfg.CLASSIFIER_MODEL)
+    # Contracting trade ("fence" | "electrical" | …). Selects the prompt
+    # wording + detail-field schema via config.TRADE_PROFILES. `fence_keywords`
+    # holds the active trade's keyword set (name kept for backward compat).
+    trade: str = field(default_factory=lambda: DEFAULT_TRADE)
     fence_keywords: list[str] = field(default_factory=lambda: list(cfg.DEFAULT_FENCE_KEYWORDS))
     use_ade: bool = True
     highlight_fence_text: bool = True
@@ -112,6 +116,9 @@ class PipelineResult:
     unified_measurements: dict = field(default_factory=dict)
     page_categories: dict = field(default_factory=dict)
     total_pages: int = 0
+    # Contracting trade this run analysed for ("fence" | "electrical" | …).
+    # Lets the frontend label pages/stats for the right trade.
+    trade: str = "fence"
     # Pages MuPDF couldn't read (damaged/timed-out in Phase 1a). Each entry is
     # {page_idx, page_num, reason}. Surfaced to the UI so a skipped page is
     # visible instead of silently vanishing from the page list.
@@ -341,6 +348,16 @@ def run_analysis(
     progress = progress_cb or _noop_progress
     emit_page = page_cb or _noop_page
     result = PipelineResult()
+    result.trade = config.trade
+    # Resolve the trade profile once — drives prompt wording (classification,
+    # legend, detail extraction) and whether linear measurement applies.
+    tprofile = trade_profile(config.trade)
+    # Linear-length measurement (UMT) only makes sense for fences; never run
+    # it for a trade whose profile opts out, even if the request asked for it.
+    measurement_enabled = (
+        config.enable_unified_measurement
+        and tprofile.get("supports_measurement", True)
+    )
     timings: dict[str, float] = {}
     t_start = time.perf_counter()
 
@@ -354,6 +371,7 @@ def run_analysis(
             classifier=config.classifier_model,
             keywords=sorted(config.fence_keywords),
             use_ade=config.use_ade,
+            trade=config.trade,
         )
 
         llms = _create_llm_clients(config)
@@ -623,7 +641,8 @@ def run_analysis(
                     ]
                     try:
                         results = ade.llm_classify_pages_batch(
-                            llm_classifier, batch_pages, config.fence_keywords)
+                            llm_classifier, batch_pages, config.fence_keywords,
+                            profile=tprofile)
                         for pi in batch:
                             page_cls = results.get(pi, {})
                             is_fence = page_cls.get("is_fence_related", False)
@@ -884,6 +903,7 @@ def run_analysis(
                         legend_chunks, pdf_lines, ocr_lines,
                         config.fence_keywords, llm_analysis,
                         figure_chunks=figure_chunks,
+                        profile=tprofile,
                     )
                     fence_cache.put("phase3_legend", pdf_hash, params,
                                    {"entries": legend_entries}, page_idx=pi,
@@ -968,7 +988,7 @@ def run_analysis(
                                             page_idx=pi, user_scope=cache_scope)
             if cached_measure is not None:
                 page_result["measurements"] = _normalize_measurements(cached_measure)
-            elif config.enable_unified_measurement:
+            elif measurement_enabled:
                 try:
                     page_obj = doc[pi]
                     scale_val = (page_result.get("scale_info") or {}).get("verified_scale") or \
@@ -1060,7 +1080,8 @@ def run_analysis(
                         pi = r.get("page_idx", 0)
                         all_page_texts[pi] = merged_texts.get(str(pi), "")
                     element_details = ade.extract_element_details(
-                        llm_analysis, list(element_names)[:20], all_page_texts)
+                        llm_analysis, list(element_names)[:20], all_page_texts,
+                        profile=tprofile)
             except Exception as e:
                 log.warning(f"Element details extraction failed: {e}")
 
@@ -1248,6 +1269,11 @@ def _cli_main(argv: list[str] | None = None) -> int:
         help="Override analysis model (e.g. gpt-5.1, gpt-5)",
     )
     parser.add_argument(
+        "--trade",
+        default=DEFAULT_TRADE,
+        help="Contracting trade / mode (fence, electrical). Defaults the keyword set too.",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress phase progress output",
@@ -1273,7 +1299,10 @@ def _cli_main(argv: list[str] | None = None) -> int:
         "google_cloud_config": keys["google_cloud_config"],
         "use_ade": not args.no_ade,
         "enable_unified_measurement": not args.no_measurement,
+        "trade": args.trade,
     }
+    # Keywords default to the selected trade's set; --keywords overrides.
+    cfg_kwargs["fence_keywords"] = list(trade_profile(args.trade)["keywords"])
     if args.keywords:
         cfg_kwargs["fence_keywords"] = [k.strip() for k in args.keywords.split(",") if k.strip()]
     if args.analysis_model:

@@ -32,6 +32,103 @@ def _str_env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+# ---------------------------------------------------------------------------
+# Trade / contracting-mode profiles
+# ---------------------------------------------------------------------------
+# Each profile parameterizes the analysis for one contracting trade: the
+# keyword set that triggers page classification, the noun + "look for" hints
+# injected into the LLM prompts, and the per-element detail fields the spec
+# extractor pulls. The pipeline itself is trade-agnostic — adding a trade here
+# plus a matching mode option in the frontend is all that's needed to support
+# a new one (e.g. plumbing, mechanical).
+
+_FENCE_KEYWORDS = [
+    'fence', 'fencing', 'gate', 'barrier', 'guardrail', 'post', 'mesh',
+    'panel', 'chain link', 'masonry', 'fence details', 'canopy shading',
+    'adot specifications', 'mag specifications', 'rail', 'railing',
+    'bollards', 'handrails', 'wall', 'cmu',
+    'operator', 'davis', 'bacon', 'davis-bacon', 'davis – bacon',
+    'buy america', 'american', 'dug out',
+]
+
+# Electrical keyword set — the schedules / drawing types that mark a page as
+# electrical-relevant. Core terms supplied by the product owner, with a few
+# high-confidence synonyms added for recall (one-line/single-line variants,
+# receptacles≈outlets, lighting≈lights, panelboard≈panel schedule).
+_ELECTRICAL_KEYWORDS = [
+    'one line', 'one-line', 'single line', 'single-line', 'one line diagram',
+    'available power', 'loads', 'load schedule',
+    'cable schedule', 'wire schedule', 'conduit schedule',
+    'outlets', 'receptacles', 'lights', 'lighting', 'luminaire',
+    'panel schedule', 'panelboard schedule', 'panelboard',
+    'feeder', 'circuit', 'breaker', 'switchgear', 'transformer', 'grounding',
+]
+
+TRADE_PROFILES: dict = {
+    "fence": {
+        "label": "Fence",
+        "subject": "fence",  # noun used in prompt phrasing
+        "keywords": list(_FENCE_KEYWORDS),
+        "look_for": [
+            "Fence specifications, dimensions, or materials",
+            "Gate details or schedules",
+            "Barrier or guardrail references",
+            "Fence post details",
+            "Chain link, mesh, panel references",
+            "Any fence-related construction details",
+        ],
+        # Linear-length measurement (UMT) only makes sense for fences.
+        "supports_measurement": True,
+        # Fields the per-element spec extractor pulls (extract_element_details).
+        "detail_fields": [
+            {"key": "height", "desc": "fence height if found (e.g. \"6'-0\\\"\", \"8 FT\")"},
+            {"key": "post_type", "desc": "post type/size (e.g. \"2-1/2\\\" SS40 ROUND\", \"W6x9\")"},
+            {"key": "post_spacing", "desc": "post spacing (e.g. \"10'-0\\\" O.C.\", \"10 FT MAX\")"},
+            {"key": "top_rail", "desc": "top rail details"},
+            {"key": "bottom_rail", "desc": "bottom rail or tension wire details"},
+            {"key": "material", "desc": "material/coating (e.g. \"Galvanized\", \"Vinyl Coated\")"},
+            {"key": "gauge", "desc": "wire/mesh gauge (e.g. \"9 gauge\", \"11 gauge\")"},
+            {"key": "mesh_size", "desc": "mesh/opening size (e.g. \"2 inch\")"},
+            {"key": "foundation", "desc": "footing/foundation details"},
+            {"key": "gate_info", "desc": "gate details if applicable"},
+        ],
+    },
+    "electrical": {
+        "label": "Electrical",
+        "subject": "electrical",
+        "keywords": list(_ELECTRICAL_KEYWORDS),
+        "look_for": [
+            "One-line / single-line diagrams",
+            "Panel schedules or panelboard schedules",
+            "Load schedules and available power",
+            "Cable, wire, and conduit schedules",
+            "Outlet / receptacle and lighting layouts",
+            "Circuiting, feeders, breakers, or grounding details",
+        ],
+        "supports_measurement": False,
+        "detail_fields": [
+            {"key": "rating", "desc": "voltage / ampacity rating (e.g. \"208V\", \"100A\")"},
+            {"key": "phase", "desc": "phase & wires (e.g. \"3Ø 4W\", \"1Ø 3W\")"},
+            {"key": "wire_size", "desc": "conductor size (e.g. \"#12 AWG\", \"500 kcmil\")"},
+            {"key": "conduit_size", "desc": "conduit size (e.g. \"3/4\\\"\", \"2\\\"\")"},
+            {"key": "breaker", "desc": "breaker / overcurrent device (e.g. \"20A/1P\")"},
+            {"key": "load", "desc": "connected load (e.g. \"kVA\", \"kW\", \"VA\")"},
+            {"key": "circuit", "desc": "circuit number / designation"},
+            {"key": "mounting", "desc": "mounting (surface / flush)"},
+            {"key": "location", "desc": "location or area served"},
+        ],
+    },
+}
+
+DEFAULT_TRADE: str = "fence"
+
+
+def trade_profile(trade: str | None) -> dict:
+    """Resolve a trade name to its profile, falling back to the default
+    trade for unknown/empty values."""
+    return TRADE_PROFILES.get((trade or DEFAULT_TRADE), TRADE_PROFILES[DEFAULT_TRADE])
+
+
 @dataclass(frozen=True)
 class Config:
     # --- Authentication ---
@@ -118,14 +215,10 @@ class Config:
     MAX_DAILY_SPEND_USD: float = field(default_factory=lambda: _float_env("FENCE_MAX_DAILY_SPEND_USD", 0.0))  # 0 = no limit
 
     # --- Default keywords ---
-    DEFAULT_FENCE_KEYWORDS: list = field(default_factory=lambda: [
-        'fence', 'fencing', 'gate', 'barrier', 'guardrail', 'post', 'mesh',
-        'panel', 'chain link', 'masonry', 'fence details', 'canopy shading',
-        'adot specifications', 'mag specifications', 'rail', 'railing',
-        'bollards', 'handrails', 'wall', 'cmu',
-        'operator', 'davis', 'bacon', 'davis-bacon', 'davis – bacon',
-        'buy america', 'american', 'dug out',
-    ])
+    # Sourced from the "fence" trade profile so there's a single source of
+    # truth (see TRADE_PROFILES below). Kept as a Config field for backward
+    # compatibility with the many call sites that read cfg.DEFAULT_FENCE_KEYWORDS.
+    DEFAULT_FENCE_KEYWORDS: list = field(default_factory=lambda: list(_FENCE_KEYWORDS))
 
     def __post_init__(self):
         # Phase 3 workers: conservative on low-memory hosts

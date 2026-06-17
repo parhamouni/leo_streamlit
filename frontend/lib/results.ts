@@ -183,6 +183,9 @@ export type PipelineResults = {
   per_page_scale_info?: Record<string, ScaleInfo>;
   unified_measurements?: Record<string, Measurements>;
   page_categories?: Record<string, string>;
+  // Contracting trade this run analysed for ("fence" | "electrical" | …).
+  // Drives the page/stat labels in the document view.
+  trade?: string;
   total_pages?: number;
   // Pages MuPDF couldn't read (damaged / timed out during extraction). Shown
   // to the user so a skipped page is visible instead of silently dropped.
@@ -247,25 +250,55 @@ export function detectionLabel(m: DetectionMethod): {
 
 /** Truthy spec value? Used to filter empty rows from element-spec tables. */
 export function specHasContent(spec: ElementSpec): boolean {
-  const fields: (keyof ElementSpec)[] = [
-    "height",
-    "post_type",
-    "post_spacing",
-    "top_rail",
-    "bottom_rail",
-    "material",
-    "gauge",
-    "mesh_size",
-    "foundation",
-    "gate_info",
-    "detail_page",
-    "full_details",
-    "notes",
-  ];
-  return fields.some((f) => {
-    const v = spec[f];
-    return typeof v === "string" && v.trim().length > 0;
-  });
+  // Trade-agnostic: a spec has content if ANY of its string fields is
+  // non-empty. The detail-field set varies by trade (fence: height/post_type/…;
+  // electrical: rating/phase/wire_size/…), so we scan all keys rather than a
+  // fixed fence list.
+  return Object.values(spec).some(
+    (v) => typeof v === "string" && v.trim().length > 0,
+  );
+}
+
+// Fields shown in the per-element "details" popover rather than as columns.
+const SPEC_POPOVER_FIELDS = new Set(["full_details", "notes"]);
+
+/**
+ * Column keys for the element-specs table, derived from whichever spec fields
+ * actually carry data across the given specs (so the table adapts to the
+ * trade). `detail_page` is always placed last when present.
+ */
+export function specColumns(specs: ElementSpec[]): string[] {
+  const withData = new Set<string>();
+  for (const spec of specs) {
+    for (const [k, v] of Object.entries(spec)) {
+      if (
+        k !== "detail_page" &&
+        !SPEC_POPOVER_FIELDS.has(k) &&
+        typeof v === "string" &&
+        v.trim().length > 0
+      ) {
+        withData.add(k);
+      }
+    }
+  }
+  const cols = [...withData];
+  if (specs.some((s) => typeof s.detail_page === "string" && s.detail_page.trim())) {
+    cols.push("detail_page");
+  }
+  return cols;
+}
+
+/** Human label for a spec field key (e.g. "post_type" → "Post type"). */
+export function specFieldLabel(key: string): string {
+  const special: Record<string, string> = {
+    post_type: "Post type",
+    post_spacing: "Spacing",
+    mesh_size: "Mesh",
+    wire_size: "Wire size",
+    conduit_size: "Conduit",
+    detail_page: "Detail page",
+  };
+  return special[key] ?? key.charAt(0).toUpperCase() + key.slice(1).replace(/_/g, " ");
 }
 
 /**

@@ -54,7 +54,46 @@ _DOCAI_CLIENT_CACHE = None
 # Cross-submodule imports.
 from .instances import find_best_bbox
 
-def llm_extract_fence_elements_batch(llm, texts_by_id, keywords: List[str], batch_size: int = 6):
+
+# --- Trade-aware prompt helpers --------------------------------------------
+# The classification / legend / detail prompts used to hardcode "fence". They
+# now take an optional `profile` dict (config.TRADE_PROFILES[trade]) so the
+# same pipeline can analyse other trades (electrical, …). profile=None keeps
+# the original fence behavior — these inline fallbacks make that work even if
+# config can't be imported (e.g. an isolated unit test).
+_FENCE_LOOK_FOR = [
+    "Fence specifications, dimensions, or materials",
+    "Gate details or schedules",
+    "Barrier or guardrail references",
+    "Fence post details",
+    "Chain link, mesh, panel references",
+    "Any fence-related construction details",
+]
+_FENCE_DETAIL_FIELDS = [
+    {"key": "height", "desc": "fence height if found (e.g. \"6'-0\\\"\", \"8 FT\")"},
+    {"key": "post_type", "desc": "post type/size (e.g. \"2-1/2\\\" SS40 ROUND\", \"W6x9\")"},
+    {"key": "post_spacing", "desc": "post spacing (e.g. \"10'-0\\\" O.C.\", \"10 FT MAX\")"},
+    {"key": "top_rail", "desc": "top rail details"},
+    {"key": "bottom_rail", "desc": "bottom rail or tension wire details"},
+    {"key": "material", "desc": "material/coating (e.g. \"Galvanized\", \"Vinyl Coated\")"},
+    {"key": "gauge", "desc": "wire/mesh gauge (e.g. \"9 gauge\", \"11 gauge\")"},
+    {"key": "mesh_size", "desc": "mesh/opening size (e.g. \"2 inch\")"},
+    {"key": "foundation", "desc": "footing/foundation details"},
+    {"key": "gate_info", "desc": "gate details if applicable"},
+]
+
+
+def _trade_bits(profile):
+    """Resolve (subject, look_for, detail_fields) from a trade profile dict,
+    defaulting to the fence profile so profile=None preserves prior behavior."""
+    profile = profile or {}
+    subject = (profile.get("subject") or "fence").strip()
+    look_for = profile.get("look_for") or _FENCE_LOOK_FOR
+    detail_fields = profile.get("detail_fields") or _FENCE_DETAIL_FIELDS
+    return subject, look_for, detail_fields
+
+
+def llm_extract_fence_elements_batch(llm, texts_by_id, keywords: List[str], batch_size: int = 6, profile=None):
     """Extract fence-related legend entries from multiple chunks in one
     LLM round-trip. Output is attributed back to input chunk ids.
 
@@ -74,6 +113,7 @@ def llm_extract_fence_elements_batch(llm, texts_by_id, keywords: List[str], batc
 
     ids = list(texts_by_id.keys())
     hint_keywords = ", ".join(sorted(set(keywords)))
+    subject, _look_for, _fields = _trade_bits(profile)
 
     try:
         from langchain_core.messages import SystemMessage, HumanMessage  # type: ignore
@@ -83,7 +123,7 @@ def llm_extract_fence_elements_batch(llm, texts_by_id, keywords: List[str], batc
 
     system_prompt = (
         "You are an assistant reviewing engineering drawing documentation. "
-        "For EACH chunk provided, extract fence-related legend entries, callouts or "
+        f"For EACH chunk provided, extract {subject}-related legend entries, callouts or "
         "tags, and return them as paired indicator + text elements.\n\n"
         f"Only return items that clearly map to: {hint_keywords}.\n\n"
         "Respond with JSON ONLY, exactly this shape:\n"
@@ -91,7 +131,7 @@ def llm_extract_fence_elements_batch(llm, texts_by_id, keywords: List[str], batc
         '"text_element": "...", "description": "..."}]}, ...]}\n'
         "The chunk_id in each result must match the <chunk id=\"...\"> from the "
         "user message. Include one result per chunk — never skip a chunk. "
-        "If a chunk has no fence-related items, return items=[]."
+        f"If a chunk has no {subject}-related items, return items=[]."
     )
 
     # Process in batches so we don't blow past the model's context.
@@ -145,20 +185,21 @@ def llm_extract_fence_elements_batch(llm, texts_by_id, keywords: List[str], batc
             else:
                 print(f"[llm_extract_fence_elements_batch] chunk {cid} missing from batch response; falling back")
                 try:
-                    out[cid] = llm_extract_fence_elements(llm, texts_by_id[cid], keywords)
+                    out[cid] = llm_extract_fence_elements(llm, texts_by_id[cid], keywords, profile=profile)
                 except Exception as _e2:
                     out[cid] = []
     return out
 
 
-def llm_extract_fence_elements(llm, text: str, keywords: List[str], max_items: int = 100) -> List[Dict]:
+def llm_extract_fence_elements(llm, text: str, keywords: List[str], max_items: int = 100, profile=None) -> List[Dict]:
     if not llm or not text:
         return []
     hint_keywords = ", ".join(sorted(set(keywords)))
+    subject, _look_for, _fields = _trade_bits(profile)
     print(f"[DEBUG] Asking LLM to extract items from text length {len(text)}...")
 
     analysis_prompt = f"""
-You are an assistant reviewing engineering drawing documentation. Extract fence-related
+You are an assistant reviewing engineering drawing documentation. Extract {subject}-related
 legend entries, callouts or tags and provide paired indicator + text elements.
 Only return items that clearly map to: {hint_keywords}.
 
@@ -170,7 +211,7 @@ Text to analyse:
 Respond with a JSON array where each element has:
 - "indicator": the numeric or symbolic tag (e.g., "1", "F-3", "A", "3301")
 - "text_element": the textual description (e.g., "existing fence", "chain link")
-- "description": concise sentence on how the element relates to fencing
+- "description": concise sentence on how the element relates to {subject} work
 """
     try:
         raw_response = llm.invoke(analysis_prompt) if hasattr(llm, "invoke") else llm(analysis_prompt)
@@ -208,6 +249,7 @@ def extract_legend_entries(
     figure_chunks: List[Dict] = None,
     prefilled_legend_items=None,  # optional {chunk_idx: [items]} — skip LLM when hit
     prefilled_figure_items=None,  # optional {chunk_idx: [items]} — skip LLM when hit
+    profile=None,  # trade profile for prompt wording (None => fence)
 ) -> List[Dict]:
     """extract_legend_entries with optional prefilled-items kwargs.
 
@@ -284,7 +326,7 @@ def extract_legend_entries(
         if prefilled_legend_items is not None and _ci in prefilled_legend_items:
             items = prefilled_legend_items[_ci]
         else:
-            items = llm_extract_fence_elements(llm, text, fence_keywords)
+            items = llm_extract_fence_elements(llm, text, fence_keywords, profile=profile)
         _process_chunk(chunk, items, results, extraction_pass="legend")
 
     # Check quality of legend results — filter out bad indicators
@@ -304,7 +346,7 @@ def extract_legend_entries(
             if prefilled_figure_items is not None and _ci in prefilled_figure_items:
                 items = prefilled_figure_items[_ci]
             else:
-                items = llm_extract_fence_elements(llm, text, fence_keywords)
+                items = llm_extract_fence_elements(llm, text, fence_keywords, profile=profile)
             _process_chunk(chunk, items, results, extraction_pass="figure")
     
     # Pass 3: If still few results, try extracting from OCR lines with fence keywords
@@ -318,7 +360,7 @@ def extract_legend_entries(
                 fence_ocr_text.append(t)
         if fence_ocr_text:
             combined_text = "\n".join(fence_ocr_text[:50])
-            items = llm_extract_fence_elements(llm, combined_text, fence_keywords)
+            items = llm_extract_fence_elements(llm, combined_text, fence_keywords, profile=profile)
             if items:
                 # Use a page-wide bbox for OCR-sourced items
                 page_bbox = {"x0": 0, "y0": 0, "x1": 10000, "y1": 10000}
@@ -347,6 +389,7 @@ def extract_element_details(
     llm,
     element_names: List[str],
     page_texts: Dict[int, str],
+    profile=None,
 ) -> Dict[str, Dict]:
     """
     Cross-reference fence element names with detailed specifications found across pages.
@@ -382,19 +425,21 @@ def extract_element_details(
     combined_text = combined_text[:20000]
     
     elements_list = "\n".join(f"- {name}" for name in element_names)
-    
-    prompt = f"""You are reviewing engineering drawing documentation for fence construction.
 
-The following fence elements/categories were identified in the drawings:
+    subject, _look_for, detail_fields = _trade_bits(profile)
+    field_lines = "\n".join(f'- "{f["key"]}": {f["desc"]}' for f in detail_fields)
+
+    prompt = f"""You are reviewing engineering drawing documentation for {subject} work.
+
+The following {subject} elements/categories were identified in the drawings:
 {elements_list}
 
-Below is the text extracted from multiple pages of the drawing set. Some pages contain 
-plan views (showing where fences go), while others contain DETAIL pages with specifications 
-like fence height, post type, post spacing, wire gauge, top/bottom rails, materials, 
-coating, foundation details, etc.
+Below is the text extracted from multiple pages of the drawing set. Some pages contain
+plan / layout views, while others contain DETAIL pages or schedules carrying the
+specifications for these elements.
 
-Your task: For EACH element listed above, find any detailed specifications mentioned 
-anywhere in the text below. Cross-reference by indicator numbers, element names, or 
+Your task: For EACH element listed above, find any detailed specifications mentioned
+anywhere in the text below. Cross-reference by indicator numbers, element names, or
 any matching descriptions.
 
 Text from drawing pages:
@@ -404,16 +449,7 @@ Text from drawing pages:
 
 Respond with a JSON array where each element has:
 - "element_name": the element name (must match one from the list above)
-- "height": fence height if found (e.g. "6'-0\"", "8 FT")
-- "post_type": post type/size (e.g. "2-1/2\" SS40 ROUND", "W6x9")
-- "post_spacing": post spacing (e.g. "10'-0\" O.C.", "10 FT MAX")
-- "top_rail": top rail details
-- "bottom_rail": bottom rail or tension wire details
-- "material": material/coating (e.g. "Galvanized", "Vinyl Coated")
-- "gauge": wire/mesh gauge (e.g. "9 gauge", "11 gauge")
-- "mesh_size": mesh/opening size (e.g. "2 inch")
-- "foundation": footing/foundation details
-- "gate_info": gate details if applicable
+{field_lines}
 - "detail_page": page number(s) where detail was found
 - "full_details": a concise text summary of ALL specifications found for this element
 - "notes": any other relevant notes or specs
@@ -448,22 +484,17 @@ Only return the JSON array, no other text."""
                             break
                     if not matched_name:
                         matched_name = name
-                    
-                    result[matched_name] = {
-                        "height": str(item.get("height", "")).strip(),
-                        "post_type": str(item.get("post_type", "")).strip(),
-                        "post_spacing": str(item.get("post_spacing", "")).strip(),
-                        "top_rail": str(item.get("top_rail", "")).strip(),
-                        "bottom_rail": str(item.get("bottom_rail", "")).strip(),
-                        "material": str(item.get("material", "")).strip(),
-                        "gauge": str(item.get("gauge", "")).strip(),
-                        "mesh_size": str(item.get("mesh_size", "")).strip(),
-                        "foundation": str(item.get("foundation", "")).strip(),
-                        "gate_info": str(item.get("gate_info", "")).strip(),
-                        "detail_page": str(item.get("detail_page", "")).strip(),
-                        "full_details": str(item.get("full_details", "")).strip(),
-                        "notes": str(item.get("notes", "")).strip(),
+
+                    # Pull the trade's spec fields dynamically, then the
+                    # three fields every trade shares.
+                    normalized = {
+                        f["key"]: str(item.get(f["key"], "")).strip()
+                        for f in detail_fields
                     }
+                    normalized["detail_page"] = str(item.get("detail_page", "")).strip()
+                    normalized["full_details"] = str(item.get("full_details", "")).strip()
+                    normalized["notes"] = str(item.get("notes", "")).strip()
+                    result[matched_name] = normalized
     except Exception as e:
         print(f"[DETAILS] JSON parse error: {e}")
     
@@ -475,20 +506,23 @@ Only return the JSON array, no other text."""
     return result
 
 
-def llm_classify_page(llm, page_text: str, fence_keywords: List[str]) -> Dict:
+def llm_classify_page(llm, page_text: str, fence_keywords: List[str], profile=None) -> Dict:
     """
-    Use LLM to classify if a page is fence-related.
-    Similar to app.py's analyze_page but simpler.
+    Use LLM to classify whether a page is relevant to the active trade.
+    Returns an ``is_fence_related`` key regardless of trade (kept for
+    backward compatibility — the pipeline reads that field).
     """
     if not llm or not page_text:
         return {"is_fence_related": False, "confidence": 0.0, "reason": "No LLM or text"}
-    
-    # FIX 1: Increase text limit from 8000 to 16000 to capture fence content
+
+    subject, look_for, _fields = _trade_bits(profile)
+    look_for_block = "\n".join(f"- {x}" for x in look_for)
+    # FIX 1: Increase text limit from 8000 to 16000 to capture content
     # that often appears at the end of pages (legends, notes, schedules)
     text_for_llm = page_text[:16000] if len(page_text) > 16000 else page_text
     keywords_hint = ", ".join(fence_keywords[:15])
-    
-    prompt = f"""You are analyzing an engineering drawing page to determine if it contains fence-related content.
+
+    prompt = f"""You are analyzing an engineering drawing page to determine if it contains {subject}-related content.
 
 Keywords to look for: {keywords_hint}
 
@@ -497,29 +531,24 @@ Page text:
 {text_for_llm}
 </TEXT>
 
-Analyze the text and determine if this page is about fences, gates, barriers, guardrails, or related elements.
+Analyze the text and determine whether this page is about {subject} work or related elements.
 Look for:
-- Fence specifications, dimensions, or materials
-- Gate details or schedules
-- Barrier or guardrail references
-- Fence post details
-- Chain link, mesh, panel references
-- Any fence-related construction details
+{look_for_block}
 
 Respond with JSON only:
-{{"is_fence_related": true/false, "confidence": 0.0-1.0, "signals": ["keyword1", "keyword2"], "reason": "brief explanation"}}
+{{"is_relevant": true/false, "confidence": 0.0-1.0, "signals": ["keyword1", "keyword2"], "reason": "brief explanation"}}
 """
-    
+
     try:
         raw_response = llm.invoke(prompt) if hasattr(llm, "invoke") else llm(prompt)
         response_text = getattr(raw_response, "content", str(raw_response))
-        
+
         # Parse JSON from response
         json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
         if json_match:
             result = json.loads(json_match.group(0))
             return {
-                "is_fence_related": result.get("is_fence_related", False),
+                "is_fence_related": result.get("is_relevant", result.get("is_fence_related", False)),
                 "confidence": float(result.get("confidence", 0.0)),
                 "signals": result.get("signals", []),
                 "reason": result.get("reason", "")
@@ -530,7 +559,7 @@ Respond with JSON only:
     return {"is_fence_related": False, "confidence": 0.0, "reason": "LLM parsing failed"}
 
 
-def llm_classify_pages_batch(llm, pages, fence_keywords, batch_size=10):
+def llm_classify_pages_batch(llm, pages, fence_keywords, batch_size=10, profile=None):
     """Classify multiple pages in a single LLM round-trip.
 
     Prompt layout is stable-prefix-first (system message with rubric +
@@ -563,24 +592,24 @@ def llm_classify_pages_batch(llm, pages, fence_keywords, batch_size=10):
         return out
 
     kw_hint = ", ".join(fence_keywords[:15])
+    subject, look_for, _fields = _trade_bits(profile)
+    look_for_inline = "; ".join(look_for)
 
-    # Static system prompt — identical across every batch in a run, which
-    # is what OpenAI's prompt cache keys on. If this ever grows past
-    # 1024 tokens, cache hits light up automatically.
+    # Static system prompt — identical across every batch in a run (for a
+    # given trade), which is what OpenAI's prompt cache keys on. If this ever
+    # grows past 1024 tokens, cache hits light up automatically.
     system_prompt = (
         "You are analyzing engineering drawing pages to determine which "
-        "contain fence-related content.\n\n"
-        f"Fence-related terms to watch for: {kw_hint}\n\n"
+        f"contain {subject}-related content.\n\n"
+        f"{subject.capitalize()}-related terms to watch for: {kw_hint}\n\n"
         "For EACH page provided by the user, decide independently whether "
-        "it's fence-related.\n"
-        "Look for: fence specifications, dimensions, materials, gate details, "
-        "barriers, guardrails, railings, posts, chain link, mesh, panels, "
-        "bollards, handrails, CMU walls, or related construction details.\n"
-        "Do NOT flag a page as fence-related just because it mentions a "
-        "construction term that could appear in any drawing (e.g. 'post', "
-        "'rail' alone are not enough — context must point to fencing).\n\n"
+        f"it's {subject}-related.\n"
+        f"Look for: {look_for_inline}.\n"
+        "Do NOT flag a page as relevant just because it mentions a generic "
+        "construction or engineering term that could appear in any drawing — "
+        f"the context must clearly point to {subject} work.\n\n"
         "Respond with JSON ONLY, exactly this shape:\n"
-        '{"results": [{"id": <int>, "is_fence_related": true|false, '
+        '{"results": [{"id": <int>, "is_relevant": true|false, '
         '"confidence": 0.0-1.0, "signals": [...], "reason": "<brief>"}, ...]}\n'
         "The id field must match the <page id=\"N\"> from the user message. "
         "Include one result per page — never skip a page."
@@ -628,7 +657,7 @@ def llm_classify_pages_batch(llm, pages, fence_keywords, batch_size=10):
                     except (TypeError, ValueError):
                         continue
                     parsed_by_id[pid] = {
-                        "is_fence_related": bool(entry.get("is_fence_related", False)),
+                        "is_fence_related": bool(entry.get("is_relevant", entry.get("is_fence_related", False))),
                         "confidence": float(entry.get("confidence", 0.0)),
                         "signals": entry.get("signals", []) or [],
                         "reason": entry.get("reason", "") or "",
@@ -644,7 +673,7 @@ def llm_classify_pages_batch(llm, pages, fence_keywords, batch_size=10):
             else:
                 print(f"[llm_classify_pages_batch] page {idx} missing from batch response; falling back")
                 try:
-                    out[idx] = llm_classify_page(llm, text, fence_keywords)
+                    out[idx] = llm_classify_page(llm, text, fence_keywords, profile=profile)
                 except Exception as _e2:
                     out[idx] = {"is_fence_related": False, "confidence": 0.0,
                                 "reason": f"batch+fallback failed: {_e2}"}

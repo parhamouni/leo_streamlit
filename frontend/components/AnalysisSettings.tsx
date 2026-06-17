@@ -16,16 +16,40 @@ import { useEffect, useMemo, useState } from "react";
 
 const STORAGE_KEY = "leo:analysis-settings:v1";
 
-const DEFAULT_FENCE_KEYWORDS = [
-  "fence", "fencing", "gate", "barrier", "guardrail", "post", "mesh",
-  "panel", "chain link", "masonry", "fence details", "canopy shading",
-  "adot specifications", "mag specifications", "rail", "railing",
-  "bollards", "handrails", "wall", "cmu",
-  "operator", "davis", "bacon", "davis-bacon", "davis – bacon",
-  "buy america", "american", "dug out",
-];
+// Contracting trades (must mirror config.TRADE_PROFILES on the backend). Each
+// trade brings its own default keyword set; `supportsMeasurement` gates the
+// fence-only linear-measurement options.
+export const TRADES = {
+  fence: {
+    label: "Fence",
+    supportsMeasurement: true,
+    keywords: [
+      "fence", "fencing", "gate", "barrier", "guardrail", "post", "mesh",
+      "panel", "chain link", "masonry", "fence details", "canopy shading",
+      "adot specifications", "mag specifications", "rail", "railing",
+      "bollards", "handrails", "wall", "cmu",
+      "operator", "davis", "bacon", "davis-bacon", "davis – bacon",
+      "buy america", "american", "dug out",
+    ],
+  },
+  electrical: {
+    label: "Electrical",
+    supportsMeasurement: false,
+    keywords: [
+      "one line", "one-line", "single line", "single-line", "one line diagram",
+      "available power", "loads", "load schedule",
+      "cable schedule", "wire schedule", "conduit schedule",
+      "outlets", "receptacles", "lights", "lighting", "luminaire",
+      "panel schedule", "panelboard schedule", "panelboard",
+      "feeder", "circuit", "breaker", "switchgear", "transformer", "grounding",
+    ],
+  },
+} as const;
+
+export type TradeId = keyof typeof TRADES;
 
 export type AnalysisSettings = {
+  trade: TradeId;
   use_ade: boolean;
   highlight_fence_text: boolean;
   enable_unified_measurement: boolean;
@@ -35,12 +59,13 @@ export type AnalysisSettings = {
 };
 
 const DEFAULTS: AnalysisSettings = {
+  trade: "fence",
   use_ade: true,
   highlight_fence_text: true,
   enable_unified_measurement: true,
   enable_nonlayer_suggestions: false,
   display_image_dpi: 150,
-  fence_keywords: DEFAULT_FENCE_KEYWORDS,
+  fence_keywords: [...TRADES.fence.keywords],
 };
 
 function loadFromStorage(): AnalysisSettings {
@@ -90,10 +115,32 @@ export function AnalysisSettingsPanel({
   const [open, setOpen] = useState(false);
   const [keywordsText, setKeywordsText] = useState(settings.fence_keywords.join(", "));
 
+  const trade: TradeId = settings.trade ?? "fence";
+  const tradeMeta = TRADES[trade] ?? TRADES.fence;
+  const tradeLabel = tradeMeta.label;
+
   // Resync keyword text if the parent settings change (e.g. on reset).
   useEffect(() => {
     setKeywordsText(settings.fence_keywords.join(", "));
   }, [settings.fence_keywords]);
+
+  // Switching trade swaps in that trade's default keyword set (fence keywords
+  // are useless for electrical and vice-versa) and disables linear measurement
+  // for trades that don't support it.
+  function switchTrade(next: TradeId) {
+    if (next === trade) return;
+    const meta = TRADES[next];
+    const nextKeywords = [...meta.keywords];
+    setSettings({
+      ...settings,
+      trade: next,
+      fence_keywords: nextKeywords,
+      enable_unified_measurement: meta.supportsMeasurement
+        ? settings.enable_unified_measurement
+        : false,
+    });
+    setKeywordsText(nextKeywords.join(", "));
+  }
 
   const nonDefaultCount =
     (settings.use_ade !== DEFAULTS.use_ade ? 1 : 0) +
@@ -146,6 +193,31 @@ export function AnalysisSettingsPanel({
       </summary>
 
       <div className="px-4 pb-4 pt-2 space-y-4 border-t">
+        {/* Analysis mode / contracting trade */}
+        <div>
+          <label className="text-sm text-gray-700 block mb-1.5">Analysis mode</label>
+          <div className="inline-flex rounded-lg border bg-gray-50 p-0.5">
+            {(Object.keys(TRADES) as TradeId[]).map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => switchTrade(t)}
+                className={`px-3 py-1 text-sm rounded-md transition ${
+                  trade === t
+                    ? "bg-white shadow text-gray-900 font-medium"
+                    : "text-gray-600 hover:text-gray-900"
+                }`}
+              >
+                {TRADES[t].label}
+              </button>
+            ))}
+          </div>
+          <div className="text-xs text-gray-500 mt-1">
+            Which trade to detect. Switching mode loads that trade&apos;s default
+            keywords.
+          </div>
+        </div>
+
         <ToggleRow
           label="Use ADE detection"
           help="LandingAI ADE for legend & figure extraction. Off = keyword-only, much faster but lower recall."
@@ -153,23 +225,27 @@ export function AnalysisSettingsPanel({
           onChange={(v) => setField("use_ade", v)}
         />
         <ToggleRow
-          label="Highlight fence text in PDF"
+          label={`Highlight ${tradeLabel.toLowerCase()} text in PDF`}
           help="Annotate the highlighted PDF with green/purple/orange boxes for legend/figure/keyword hits."
           checked={settings.highlight_fence_text}
           onChange={(v) => setField("highlight_fence_text", v)}
         />
-        <ToggleRow
-          label="Run unified measurement"
-          help="Auto-measure fence-line lengths in feet. Off = no per-page totals; faster."
-          checked={settings.enable_unified_measurement}
-          onChange={(v) => setField("enable_unified_measurement", v)}
-        />
-        <ToggleRow
-          label="Suggest non-layer fence elements"
-          help="Experimental: try to recover fence runs from pages with no CAD layer info. May add noise."
-          checked={settings.enable_nonlayer_suggestions}
-          onChange={(v) => setField("enable_nonlayer_suggestions", v)}
-        />
+        {tradeMeta.supportsMeasurement && (
+          <>
+            <ToggleRow
+              label="Run unified measurement"
+              help="Auto-measure fence-line lengths in feet. Off = no per-page totals; faster."
+              checked={settings.enable_unified_measurement}
+              onChange={(v) => setField("enable_unified_measurement", v)}
+            />
+            <ToggleRow
+              label="Suggest non-layer fence elements"
+              help="Experimental: try to recover fence runs from pages with no CAD layer info. May add noise."
+              checked={settings.enable_nonlayer_suggestions}
+              onChange={(v) => setField("enable_nonlayer_suggestions", v)}
+            />
+          </>
+        )}
 
         <div className="flex items-center gap-3">
           <label className="text-sm text-gray-700 w-44 shrink-0">
@@ -193,7 +269,7 @@ export function AnalysisSettingsPanel({
 
         <div>
           <label className="text-sm text-gray-700 block mb-1">
-            Fence keywords ({settings.fence_keywords.length})
+            {tradeLabel} keywords ({settings.fence_keywords.length})
           </label>
           <textarea
             value={keywordsText}
@@ -204,7 +280,7 @@ export function AnalysisSettingsPanel({
             placeholder="comma- or newline-separated keywords"
           />
           <div className="text-xs text-gray-500 mt-1">
-            Words/phrases that trigger fence-page classification when found in OCR or native text.
+            Words/phrases that trigger {tradeLabel.toLowerCase()}-page classification when found in OCR or native text.
           </div>
         </div>
 

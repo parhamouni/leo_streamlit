@@ -22,6 +22,8 @@ import {
   cleanElementKey,
   detectionLabel,
   detectionMethod,
+  specColumns,
+  specFieldLabel,
   specHasContent,
   type DimensionMeasurement,
   type ElementSpec,
@@ -432,7 +434,10 @@ export default function DocumentDetailPage() {
   }
 
   const onDownloadHighlighted = () =>
-    downloadFromJob("highlighted-pdf", `fence_${doc?.original_filename ?? "document.pdf"}`);
+    downloadFromJob(
+      "highlighted-pdf",
+      `${(results?.trade ?? "fence").toLowerCase()}_${doc?.original_filename ?? "document.pdf"}`,
+    );
   const onDownloadMeasurementPdf = () =>
     downloadFromJob(
       "measurement-pdf",
@@ -508,6 +513,13 @@ export default function DocumentDetailPage() {
   if (!doc) return null;
 
   // ---- derived ----
+  // Trade-aware labels: "fence" pages are really "pages relevant to the
+  // analysed trade". subjCap → "Fence"/"Electrical"; otherLabel → "Non-fence".
+  const tradeRaw = (results?.trade ?? "fence").toLowerCase();
+  const subjCap = tradeRaw.charAt(0).toUpperCase() + tradeRaw.slice(1);
+  const otherLabel = `Non-${tradeRaw}`;
+  const supportsMeasurement = tradeRaw === "fence";
+
   const fencePages = (results?.fence_pages ?? []).filter(
     (p): p is FencePage => p && typeof p === "object",
   );
@@ -628,17 +640,19 @@ export default function DocumentDetailPage() {
               label="Total pages"
               value={String(totalCount || results.total_pages || doc.total_pages || "—")}
             />
-            <StatCard label="Fence pages" value={String(fencePages.length)} accent="green" />
-            <StatCard label="Non-fence pages" value={String(nonFencePages.length)} accent="gray" />
-            <StatCard
-              label="Total fence length"
-              value={
-                displayedTotalLengthFt > 0
-                  ? `${displayedTotalLengthFt.toFixed(1)} ft`
-                  : "—"
-              }
-              accent={displayedTotalLengthFt > 0 ? "green" : "gray"}
-            />
+            <StatCard label={`${subjCap} pages`} value={String(fencePages.length)} accent="green" />
+            <StatCard label={`${otherLabel} pages`} value={String(nonFencePages.length)} accent="gray" />
+            {supportsMeasurement && (
+              <StatCard
+                label="Total fence length"
+                value={
+                  displayedTotalLengthFt > 0
+                    ? `${displayedTotalLengthFt.toFixed(1)} ft`
+                    : "—"
+                }
+                accent={displayedTotalLengthFt > 0 ? "green" : "gray"}
+              />
+            )}
           </section>
         )}
 
@@ -679,7 +693,7 @@ export default function DocumentDetailPage() {
         )}
 
         {/* ---------- Cross-page measurement summary (Sprint 4 / C8) ---------- */}
-        {isComplete && results && doc?.latest_job_id && fencePages.length > 0 && (
+        {isComplete && results && doc?.latest_job_id && fencePages.length > 0 && supportsMeasurement && (
           <MeasurementSummary
             jobId={doc.latest_job_id}
             refreshSignal={measurementRefresh}
@@ -715,10 +729,10 @@ export default function DocumentDetailPage() {
               <h2 className="font-medium">Pages</h2>
               <div className="flex gap-1 text-xs">
                 <FilterChip active={filter === "fence"} onClick={() => setFilter("fence")}>
-                  Fence ({fencePages.length})
+                  {subjCap} ({fencePages.length})
                 </FilterChip>
                 <FilterChip active={filter === "nonfence"} onClick={() => setFilter("nonfence")}>
-                  Non-fence ({nonFencePages.length})
+                  {otherLabel} ({nonFencePages.length})
                 </FilterChip>
                 <FilterChip active={filter === "all"} onClick={() => setFilter("all")}>
                   All ({totalCount})
@@ -729,7 +743,7 @@ export default function DocumentDetailPage() {
             <div className="divide-y">
               {filter === "fence" &&
                 (fencePages.length === 0 ? (
-                  <Empty msg="No fence pages detected." />
+                  <Empty msg={`No ${tradeRaw} pages detected.`} />
                 ) : (
                   fencePages.map((p) => (
                     <FencePageCard
@@ -745,7 +759,7 @@ export default function DocumentDetailPage() {
                 ))}
               {filter === "nonfence" &&
                 (nonFencePages.length === 0 ? (
-                  <Empty msg="No non-fence pages." />
+                  <Empty msg={`No ${otherLabel.toLowerCase()} pages.`} />
                 ) : (
                   nonFencePages.map((p) => (
                     <NonFencePageCard
@@ -957,8 +971,9 @@ function LivePageRow({ row, jobId }: { row: PageRow; jobId?: string | null }) {
     );
   }
 
-  // Phase 1c stub — minimal placeholder.
-  const label = row.is_fence_page ? "fence" : "non-fence";
+  // Phase 1c stub — minimal placeholder. The analysed trade isn't known
+  // mid-run (results.json doesn't exist yet), so use trade-neutral wording.
+  const label = row.is_fence_page ? "relevant" : "other";
   const labelCls = row.is_fence_page
     ? "bg-blue-100 text-blue-700"
     : "bg-gray-100 text-gray-600";
@@ -1488,15 +1503,12 @@ function DimensionLines({ dims }: { dims?: DimensionMeasurement[] }) {
 }
 
 function ElementSpecsTable({ specs }: { specs: [string, ElementSpec][] }) {
-  const cols: Array<{ key: keyof ElementSpec; label: string }> = [
-    { key: "height", label: "Height" },
-    { key: "post_type", label: "Post type" },
-    { key: "post_spacing", label: "Spacing" },
-    { key: "material", label: "Material" },
-    { key: "gauge", label: "Gauge" },
-    { key: "mesh_size", label: "Mesh" },
-    { key: "detail_page", label: "Detail page" },
-  ];
+  // Columns adapt to the trade: derived from whichever fields actually carry
+  // data (fence → height/post_type/…, electrical → rating/phase/wire_size/…).
+  const cols = specColumns(specs.map(([, s]) => s)).map((key) => ({
+    key,
+    label: specFieldLabel(key),
+  }));
 
   return (
     <div className="overflow-x-auto">
