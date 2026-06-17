@@ -333,6 +333,12 @@ def _run_job(job: dict, keys: dict):
             "unified_measurements": result.unified_measurements,
             "page_categories": result.page_categories,
             "total_pages": result.total_pages,
+            # trade drives the document view's mode labels/badge + the
+            # re-analyze "current mode" detection; broken_pages drives the
+            # damaged-pages banner. Both must be persisted or the frontend
+            # can't tell which trade ran (defaults to fence).
+            "trade": result.trade,
+            "broken_pages": result.broken_pages,
             "timings": result.timings,
             "error": result.error,
         }
