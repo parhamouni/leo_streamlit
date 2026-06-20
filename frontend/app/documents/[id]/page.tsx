@@ -253,7 +253,11 @@ export default function DocumentDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<"fence" | "all" | "nonfence">("fence");
-  const [downloading, setDownloading] = useState(false);
+  // Which export is currently downloading (path segment), or null. Per-kind
+  // so each button shows its own state; still single-in-flight so we don't
+  // fire several heavy exports at once.
+  const [downloadingKind, setDownloadingKind] = useState<string | null>(null);
+  const downloading = downloadingKind !== null;
   const [pagesSoFar, setPagesSoFar] = useState<PageRow[]>([]);
   const [measurementRefresh, setMeasurementRefresh] = useState(0);
   const [measurementSummary, setMeasurementSummary] =
@@ -439,7 +443,8 @@ export default function DocumentDetailPage() {
     filenameFallback: string,
   ) {
     if (!doc?.latest_job_id) return;
-    setDownloading(true);
+    if (downloadingKind) return; // one heavy export at a time
+    setDownloadingKind(pathSegment);
     try {
       const resp = await apiFetch(
         `/api/jobs/${doc.latest_job_id}/${pathSegment}`,
@@ -453,15 +458,27 @@ export default function DocumentDetailPage() {
       const a = document.createElement("a");
       a.href = url;
       a.download = filename;
+      a.rel = "noopener";
       document.body.appendChild(a);
       a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      // Defer revoking the object URL + removing the anchor. Revoking
+      // synchronously right after click() can abort the download before the
+      // browser has read the blob — that's why downloading two/three files
+      // back-to-back previously only saved "one or the other". Cleanup after
+      // a delay is safe; the blob is freed once the timer fires.
+      window.setTimeout(() => {
+        try {
+          document.body.removeChild(a);
+        } catch {
+          /* already removed */
+        }
+        URL.revokeObjectURL(url);
+      }, 30_000);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(`Download failed: ${msg}`);
     } finally {
-      setDownloading(false);
+      setDownloadingKind(null);
     }
   }
 
@@ -651,7 +668,9 @@ export default function DocumentDetailPage() {
                     disabled={downloading}
                     className="rounded bg-black text-white px-4 py-2 text-sm hover:bg-gray-800 disabled:opacity-60"
                   >
-                    {downloading ? "Preparing…" : "Download highlighted PDF"}
+                    {downloadingKind === "highlighted-pdf"
+                      ? "Preparing…"
+                      : "Download highlighted PDF"}
                   </button>
                   <div className="flex gap-1.5">
                     <button
@@ -660,7 +679,9 @@ export default function DocumentDetailPage() {
                       className="flex-1 rounded border border-gray-300 px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-100 disabled:opacity-60"
                       title="Measurement lines with saved UMT edits when available"
                     >
-                      Measurement PDF
+                      {downloadingKind === "measurement-pdf"
+                        ? "Preparing…"
+                        : "Measurement PDF"}
                     </button>
                     <button
                       onClick={onDownloadMeasurementExcel}
@@ -668,7 +689,9 @@ export default function DocumentDetailPage() {
                       className="flex-1 rounded border border-gray-300 px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-100 disabled:opacity-60"
                       title="Measurement rows with saved UMT edits when available"
                     >
-                      Measurement Excel
+                      {downloadingKind === "measurement-excel"
+                        ? "Preparing…"
+                        : "Measurement Excel"}
                     </button>
                   </div>
                 </div>
