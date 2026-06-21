@@ -672,10 +672,6 @@ async def reanalyze_job(
     was analysed before re-runs from cache — fast and no new LLM spend, which
     is what makes "do it again if not done already" cheap.
     """
-    old = job_registry.get_job(job_id)
-    if not old or old.get("user_id") != user_id:
-        raise HTTPException(404, "Job not found")
-
     trade = (trade or "").strip().lower()
     if trade not in cfg_mod.TRADE_PROFILES:
         raise HTTPException(
@@ -683,37 +679,58 @@ async def reanalyze_job(
             f"Unknown trade '{trade}'. Choose one of: {', '.join(cfg_mod.TRADE_PROFILES)}.",
         )
 
-    pdf_path = old.get("pdf_path")
+    # Source PDF + metadata: prefer the live SQLite job, but fall back to the
+    # Postgres document when the job has aged out of the registry. That lets an
+    # older (reconstructed) document still be re-analysed as long as its
+    # uploaded PDF is on disk — the job row expiring no longer blocks it.
+    old = job_registry.get_job(job_id)
+    document_id: str | None = None
+    if old is not None:
+        if old.get("user_id") != user_id:
+            raise HTTPException(404, "Job not found")
+        pdf_path = old.get("pdf_path")
+        filename = old.get("filename") or "document.pdf"
+        pdf_hash = old.get("pdf_hash")
+        try:
+            new_cfg = json.loads(old.get("config_json") or "{}")
+        except Exception:
+            new_cfg = {}
+    else:
+        document_id = db.get_document_id_by_job(job_id) if _is_uuid(user_id) else None
+        doc = db.get_document(document_id, user_id) if document_id else None
+        if not doc:
+            raise HTTPException(404, "Job not found")
+        storage_path = doc.get("storage_path") or ""
+        pdf_path = str(Path(cfg.PDF_TMP_DIR) / storage_path) if storage_path else None
+        filename = doc.get("original_filename") or "document.pdf"
+        pdf_hash = None
+        new_cfg = {}
+
     if not pdf_path or not Path(pdf_path).exists():
         raise HTTPException(
             409,
-            "The original PDF is no longer on the server (uploads are cleaned "
-            f"up after a day). Re-upload it to analyse in "
-            f"{cfg_mod.trade_profile(trade)['label']} mode.",
+            "The original PDF is no longer on the server. Re-upload it to "
+            f"analyse in {cfg_mod.trade_profile(trade)['label']} mode.",
         )
 
-    # Carry over the prior run's settings; swap the trade + its keyword set.
-    try:
-        new_cfg = json.loads(old.get("config_json") or "{}")
-    except Exception:
-        new_cfg = {}
+    # Swap the trade + its keyword set, keep the rest of the prior settings.
     new_cfg["trade"] = trade
     new_cfg["fence_keywords"] = list(cfg_mod.trade_profile(trade)["keywords"])
 
     new_job_id = job_registry.create_job(
         user_id=user_id,
-        filename=old.get("filename") or "document.pdf",
-        pdf_hash=old.get("pdf_hash"),
+        filename=filename,
+        pdf_hash=pdf_hash,
         pdf_path=pdf_path,
         config_json=json.dumps(new_cfg, default=str),
     )
 
     # Mirror under the SAME Postgres document so the document view picks the
     # new job up as "latest". Legacy X-User-Id jobs have no Postgres doc.
-    document_id = None
     if _is_uuid(user_id):
         try:
-            document_id = db.get_document_id_by_job(job_id)
+            if document_id is None:
+                document_id = db.get_document_id_by_job(job_id)
             if document_id:
                 db.insert_job(document_id, user_id, status="queued", job_id=new_job_id)
         except Exception:

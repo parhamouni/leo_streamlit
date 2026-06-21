@@ -725,53 +725,39 @@ export default function DocumentDetailPage() {
         {/* ---------- Re-analyze in another mode ---------- */}
         {isComplete && results && (
           <section className="bg-white rounded-lg shadow p-4">
-            {results.reconstructed ? (
-              <>
-                <span className="text-sm font-medium text-gray-800">
-                  Re-analyze in another mode
-                </span>
-                <p className="text-xs text-gray-500 mt-2">
-                  Not available for this older run — its source PDF has expired
-                  from the server (kept ~24h after upload). Re-upload the file
-                  from the dashboard to analyse it in another mode.
-                </p>
-              </>
-            ) : (
-              <>
-                <div className="flex flex-wrap items-center gap-3">
-                  <span className="text-sm font-medium text-gray-800">
-                    Re-analyze in another mode
-                  </span>
-                  {(Object.keys(TRADES) as TradeId[]).map((t) => {
-                    const isCurrent = t === tradeRaw;
-                    return (
-                      <button
-                        key={t}
-                        type="button"
-                        disabled={isCurrent || reanalyzing}
-                        onClick={() => onReanalyze(t)}
-                        className={`px-3 py-1 text-sm rounded-md border transition ${
-                          isCurrent
-                            ? "border-transparent bg-gray-100 text-gray-500 cursor-default"
-                            : "border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-60"
-                        }`}
-                      >
-                        {isCurrent
-                          ? `✓ ${TRADES[t].label} (current)`
-                          : reanalyzing
-                            ? "Starting…"
-                            : `Run ${TRADES[t].label} analysis`}
-                      </button>
-                    );
-                  })}
-                </div>
-                <p className="text-xs text-gray-500 mt-2">
-                  Re-runs analysis on this PDF — no re-upload. The view switches
-                  to the selected mode; a mode you&apos;ve run before re-loads
-                  from cache (fast, no extra cost).
-                </p>
-              </>
-            )}
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-sm font-medium text-gray-800">
+                Re-analyze in another mode
+              </span>
+              {(Object.keys(TRADES) as TradeId[]).map((t) => {
+                const isCurrent = t === tradeRaw;
+                return (
+                  <button
+                    key={t}
+                    type="button"
+                    disabled={isCurrent || reanalyzing}
+                    onClick={() => onReanalyze(t)}
+                    className={`px-3 py-1 text-sm rounded-md border transition ${
+                      isCurrent
+                        ? "border-transparent bg-gray-100 text-gray-500 cursor-default"
+                        : "border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-60"
+                    }`}
+                  >
+                    {isCurrent
+                      ? `✓ ${TRADES[t].label} (current)`
+                      : reanalyzing
+                        ? "Starting…"
+                        : `Run ${TRADES[t].label} analysis`}
+                  </button>
+                );
+              })}
+            </div>
+            <p className="text-xs text-gray-500 mt-2">
+              Re-runs analysis on this PDF — no re-upload (as long as the
+              original is still on the server). The view switches to the
+              selected mode; a mode you&apos;ve run before re-loads from cache
+              (fast, no extra cost).
+            </p>
           </section>
         )}
 
