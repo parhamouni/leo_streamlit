@@ -366,12 +366,24 @@ def run_analysis(
         pdf_hash = _sha256_file(pdf_path_str)
         cache_scope = config.cache_scope or f"pipeline_{pdf_hash[:16]}"
 
+        # Trade-SPECIFIC cache key (page classification + legend/instance
+        # extraction depend on the trade's keywords + prompt wording).
         params = fence_cache.params_hash(
             model=config.analysis_model,
             classifier=config.classifier_model,
             keywords=sorted(config.fence_keywords),
             use_ade=config.use_ade,
             trade=config.trade,
+        )
+        # Trade-INDEPENDENT cache key for the heavy raw-extraction phases whose
+        # output doesn't depend on the trade: native text (1a), OCR (1b), ADE
+        # page parse (2), and scale detection (3-scale). Keying these without
+        # keywords/trade lets a document analysed in one mode reuse that work
+        # in another — e.g. running electrical after fence skips re-running ADE
+        # and OCR entirely.
+        params_base = fence_cache.params_hash(
+            model=config.analysis_model,
+            use_ade=config.use_ade,
         )
 
         llms = _create_llm_clients(config)
@@ -409,7 +421,7 @@ def run_analysis(
         # was safe, so a hit could let a get_drawings()-damaged page slip
         # through to Phase 3. v2 entries are written only after every
         # probe op succeeds in _extract_one_phase1a.
-        cached_1a = fence_cache.get("phase1a_v2", pdf_hash, params, user_scope=cache_scope)
+        cached_1a = fence_cache.get("phase1a_v2", pdf_hash, params_base, user_scope=cache_scope)
         if cached_1a:
             page_texts = cached_1a.get("page_texts", {})
             page_dims = cached_1a.get("page_dims", {})
@@ -464,7 +476,7 @@ def run_analysis(
                 "page_dims": page_dims,
                 "broken": {str(pi): broken_page_reasons[pi] for pi in broken_pages},
             }
-            fence_cache.put("phase1a_v2", pdf_hash, params, cache_data, user_scope=cache_scope)
+            fence_cache.put("phase1a_v2", pdf_hash, params_base, cache_data, user_scope=cache_scope)
 
         timings["phase1a"] = time.perf_counter() - t1a
         progress("phase1a", 15, f"Phase 1a done ({timings['phase1a']:.1f}s)")
@@ -488,7 +500,7 @@ def run_analysis(
                     continue
                 native_text = page_texts.get(str(pi), "")
                 if len(native_text.strip()) < 50:
-                    cached_ocr = fence_cache.get("phase1b_v2", pdf_hash, params,
+                    cached_ocr = fence_cache.get("phase1b_v2", pdf_hash, params_base,
                                                   page_idx=pi, user_scope=cache_scope)
                     if cached_ocr is not None:
                         ocr_texts_by_page[str(pi)] = cached_ocr.get("ocr_text", "")
@@ -522,7 +534,7 @@ def run_analysis(
                                 ln.get("text", "") for ln in lines).strip()
                             ocr_texts_by_page[str(pi)] = text
                             ocr_lines_by_page[pi] = lines
-                            fence_cache.put("phase1b_v2", pdf_hash, params,
+                            fence_cache.put("phase1b_v2", pdf_hash, params_base,
                                            {"ocr_text": text, "lines": lines},
                                            page_idx=pi, user_scope=cache_scope)
                         processed_ocr += len(batch)
@@ -547,7 +559,7 @@ def run_analysis(
                                 ).strip()
                                 ocr_texts_by_page[str(pi)] = text
                                 ocr_lines_by_page[pi] = ocr_lines
-                                fence_cache.put("phase1b_v2", pdf_hash, params,
+                                fence_cache.put("phase1b_v2", pdf_hash, params_base,
                                                {"ocr_text": text, "lines": ocr_lines},
                                                page_idx=pi, user_scope=cache_scope)
                             except Exception:
@@ -764,7 +776,7 @@ def run_analysis(
         if config.use_ade and config.ade_api_key:
             pages_needing_ade: list[int] = []
             for pi in fence_page_indices:
-                cached_ade = fence_cache.get("phase2", pdf_hash, params,
+                cached_ade = fence_cache.get("phase2", pdf_hash, params_base,
                                             page_idx=pi, user_scope=cache_scope)
                 if cached_ade is not None:
                     ade_chunks_by_page[pi] = cached_ade.get("chunks", [])
@@ -789,13 +801,13 @@ def run_analysis(
                                 resp, 0,
                                 dims.get("width", 612),
                                 dims.get("height", 792))
-                        fence_cache.put("phase2", pdf_hash, params,
+                        fence_cache.put("phase2", pdf_hash, params_base,
                                        {"chunks": chunks}, page_idx=pi,
                                        user_scope=cache_scope)
                         return pi, chunks
                     except Exception as e:
                         log.warning(f"Phase 2 ADE page {pi}: {e}")
-                        fence_cache.put("phase2", pdf_hash, params,
+                        fence_cache.put("phase2", pdf_hash, params_base,
                                        {"chunks": []}, page_idx=pi,
                                        user_scope=cache_scope)
                         return pi, []
@@ -964,7 +976,7 @@ def run_analysis(
             page_result["keyword_matches"] = kw_result.get("matched_lines", []) or []
 
             # Scale detection
-            cached_scale = fence_cache.get("phase3_scale", pdf_hash, params,
+            cached_scale = fence_cache.get("phase3_scale", pdf_hash, params_base,
                                           page_idx=pi, user_scope=cache_scope)
             if cached_scale is not None:
                 page_result["scale_info"] = cached_scale
@@ -976,7 +988,7 @@ def run_analysis(
                         llm=llm_scale or llm_analysis,
                     )
                     page_result["scale_info"] = scale_info or {}
-                    fence_cache.put("phase3_scale", pdf_hash, params,
+                    fence_cache.put("phase3_scale", pdf_hash, params_base,
                                    scale_info or {}, page_idx=pi,
                                    user_scope=cache_scope)
                 except Exception as e:
