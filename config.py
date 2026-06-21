@@ -194,7 +194,7 @@ class Config:
     # --- API Server (new: FastAPI backend) ---
     API_SERVER_URL: str = field(default_factory=lambda: _str_env("FENCE_API_URL", "http://127.0.0.1:8503"))
     API_WORKER_COUNT: int = field(default_factory=lambda: _int_env("FENCE_API_WORKER_COUNT", 1, hi=8))
-    RESULTS_TTL_HOURS: int = field(default_factory=lambda: _int_env("FENCE_RESULTS_TTL_HOURS", 24, hi=168))
+    RESULTS_TTL_HOURS: int = field(default_factory=lambda: _int_env("FENCE_RESULTS_TTL_HOURS", 720, hi=8760))
     RESULTS_DIR: str = field(default_factory=lambda: os.path.expanduser(_str_env("FENCE_RESULTS_DIR", "~/.leo/results")))
 
     # --- Web-app migration: Supabase auth (orthogonal to streamlit AUTH_MODE) ---

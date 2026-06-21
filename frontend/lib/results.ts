@@ -192,6 +192,10 @@ export type PipelineResults = {
   broken_pages?: { page_idx: number; page_num: number; reason: string }[];
   timings?: Record<string, number>;
   error?: string | null;
+  // True when the payload was rebuilt from persisted page_results because the
+  // per-job artifacts (results.json, highlighted PDF, source PDF) expired.
+  // Downloads aren't available in this state.
+  reconstructed?: boolean;
 };
 
 // --- helpers ---

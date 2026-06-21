@@ -661,7 +661,14 @@ export default function DocumentDetailPage() {
                   }
                 }}
               />
-              {isComplete && (
+              {isComplete && results?.reconstructed && (
+                <div className="max-w-xs text-xs text-gray-500 border border-gray-200 rounded p-2">
+                  Showing saved results. The downloadable files (highlighted &
+                  measurement PDFs/Excel) have expired for this older run —
+                  re-analyze to regenerate them.
+                </div>
+              )}
+              {isComplete && !results?.reconstructed && (
                 <div className="flex flex-col gap-1.5 items-stretch">
                   <button
                     onClick={onDownloadHighlighted}

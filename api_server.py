@@ -292,11 +292,18 @@ def _run_job(job: dict, keys: dict):
         if not document_id:
             return
         try:
+            # Stamp the trade into each page payload. page_results persist in
+            # Postgres long after the per-job results.json is cleaned up, so
+            # this is what lets an expired document still reconstruct its
+            # results *and* know which mode it ran in (see _results_from_pages).
+            rj_in = page.get("result_json")
+            if isinstance(rj_in, dict):
+                rj_in = {**rj_in, "_trade": trade}
             db.upsert_page_result(
                 document_id=document_id,
                 page_number=int(page["page_number"]),
                 is_fence_page=bool(page.get("is_fence_page", False)),
-                result_json=page.get("result_json"),
+                result_json=rj_in,
             )
             rj = page.get("result_json") or {}
             phase = rj.get("phase") or (
@@ -822,6 +829,58 @@ def _slim_chunk(c):
     return out
 
 
+def _results_from_pages(job_id: str, user_id: str) -> dict | None:
+    """Reconstruct a results payload from the persisted Postgres page_results
+    when the per-job results.json is gone (the job TTL cleans up SQLite rows +
+    results_dir, but page_results live on). Lets an old completed document
+    still render its per-page results long after its job artifacts expired.
+
+    Ownership is enforced by list_page_results (joins through documents.user_id).
+    The cross-page extras that only existed in results.json (element specs,
+    unified measurements, timings) come back empty — the per-page cards, which
+    are the bulk of the view, are fully reconstructed."""
+    try:
+        document_id = db.get_document_id_by_job(job_id)
+        rows = db.list_page_results(document_id, user_id) if document_id else None
+    except Exception:
+        log.exception("results reconstruction: page_results lookup failed")
+        rows = None
+    if not rows:
+        return None
+
+    fence_pages: list[dict] = []
+    non_fence_pages: list[dict] = []
+    broken_pages: list[dict] = []
+    trade: str | None = None
+    for r in rows:
+        rj = r.get("result_json") or {}
+        if isinstance(rj, dict):
+            trade = trade or rj.get("_trade")
+            if rj.get("phase") == "broken":
+                broken_pages.append({
+                    "page_idx": rj.get("page_idx"),
+                    "page_num": rj.get("page_num") or r.get("page_number"),
+                    "reason": rj.get("error") or "extraction failed",
+                })
+                continue
+        (fence_pages if r.get("is_fence_page") else non_fence_pages).append(rj)
+
+    return {
+        "fence_pages": fence_pages,
+        "non_fence_pages": non_fence_pages,
+        "element_details": {},
+        "per_page_scale_info": {},
+        "unified_measurements": {},
+        "page_categories": {},
+        "total_pages": len(rows),
+        "trade": trade or "fence",
+        "broken_pages": broken_pages,
+        "timings": {},
+        "error": None,
+        "reconstructed": True,
+    }
+
+
 @app.get("/api/jobs/{job_id}/results")
 async def get_results(
     job_id: str,
@@ -834,19 +893,27 @@ async def get_results(
     `ade_chunks`, and truncates oversized chunk text bodies). Pass
     ?full=1 for the unmodified original — needed by legacy Streamlit
     UMT and other older clients.
+
+    Falls back to reconstructing from Postgres page_results when the job's
+    on-disk results.json has been cleaned up by the TTL, so old documents
+    don't render blank.
     """
     job = job_registry.get_job(job_id)
-    if job is None:
-        raise HTTPException(404, "Job not found")
-    if job["user_id"] != user_id:
-        raise HTTPException(403, "Access denied")
-    if job["status"] != "completed":
-        raise HTTPException(409, f"Job is {job['status']}, not completed")
+    if job is not None:
+        if job["user_id"] != user_id:
+            raise HTTPException(403, "Access denied")
+        if job["status"] != "completed":
+            raise HTTPException(409, f"Job is {job['status']}, not completed")
+        results = job_registry.load_results(job_id)
+        if results is not None:
+            return results if full else _slim_results(results)
 
-    results = job_registry.load_results(job_id)
-    if results is None:
-        raise HTTPException(404, "Results not found on disk")
-    return results if full else _slim_results(results)
+    # SQLite job row gone (TTL) or results.json missing — rebuild from the
+    # persisted per-page rows in Postgres.
+    rebuilt = _results_from_pages(job_id, user_id)
+    if rebuilt is None:
+        raise HTTPException(404, "Results not found")
+    return rebuilt if full else _slim_results(rebuilt)
 
 
 # Subprocess worker for safe PDF page rasterization. Some PDFs (especially
