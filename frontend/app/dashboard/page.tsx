@@ -28,6 +28,7 @@ type Document = {
   error_message: string | null;
   job_started_at: string | null;
   phase_started_at: string | null;
+  trade?: string | null;
 };
 
 type DocumentList = { documents: Document[] };
@@ -391,6 +392,7 @@ export default function DashboardPage() {
               <thead className="bg-gray-50 text-gray-500 text-xs uppercase">
                 <tr>
                   <th className="text-left px-4 py-2 font-medium">Filename</th>
+                  <th className="text-left px-4 py-2 font-medium">Mode</th>
                   <th className="text-left px-4 py-2 font-medium">Status</th>
                   <th className="text-left px-4 py-2 font-medium">Pages</th>
                   <th className="text-left px-4 py-2 font-medium">Uploaded</th>
@@ -415,6 +417,21 @@ export default function DashboardPage() {
                           {d.id.slice(0, 8)}
                         </div>
                       </Link>
+                    </td>
+                    <td className="px-4 py-3">
+                      {d.trade ? (
+                        <span
+                          className={`text-xs px-2 py-0.5 rounded font-medium ${
+                            d.trade.toLowerCase() === "fence"
+                              ? "bg-green-100 text-green-700"
+                              : "bg-amber-100 text-amber-700"
+                          }`}
+                        >
+                          {d.trade.charAt(0).toUpperCase() + d.trade.slice(1)}
+                        </span>
+                      ) : (
+                        <span className="text-xs text-gray-400">—</span>
+                      )}
                     </td>
                     <td className="px-4 py-3">
                       <StatusBadge status={d.job_status} />

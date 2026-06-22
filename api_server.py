@@ -939,16 +939,32 @@ _job_trade_cache: dict[str, str] = {}
 
 
 def _job_trade(job_id: str, user_id: str) -> str:
-    """Best-effort analysis mode for a completed job, read from its saved
-    results (falls back to page_results reconstruction, then 'fence')."""
+    """Best-effort analysis mode for a job. Cheapest source first: the SQLite
+    job's config_json (small, present for any job within the registry TTL),
+    then the saved results.json, then page_results reconstruction, then
+    'fence'. Cached — a job's trade never changes."""
+    if not job_id:
+        return "fence"
     cached = _job_trade_cache.get(job_id)
     if cached:
         return cached
     trade = None
-    res = job_registry.load_results(job_id)
-    if isinstance(res, dict) and res.get("trade"):
-        trade = str(res["trade"])
-    else:
+    # 1. cheap: SQLite job config_json
+    try:
+        j = job_registry.get_job(job_id)
+        if j and j.get("config_json"):
+            cfg = json.loads(j["config_json"])
+            if cfg.get("trade"):
+                trade = str(cfg["trade"])
+    except Exception:
+        pass
+    # 2. saved results.json
+    if not trade:
+        res = job_registry.load_results(job_id)
+        if isinstance(res, dict) and res.get("trade"):
+            trade = str(res["trade"])
+    # 3. reconstruct from page_results
+    if not trade:
         rebuilt = _results_from_pages(job_id, user_id)
         if rebuilt and rebuilt.get("trade"):
             trade = str(rebuilt["trade"])
@@ -2698,7 +2714,17 @@ def list_documents(user_id: str = Depends(require_supabase_jwt)):
     except Exception:
         log.exception("Postgres document list failed; falling back to SQLite jobs")
         documents = []
-    return {"documents": _merge_sqlite_fallback_documents(user_id, documents)}
+    docs = _merge_sqlite_fallback_documents(user_id, documents)
+    # Tag each row with the analysis mode it was run in, so the dashboard can
+    # show Fence/Electrical per file. Cheap + cached (see _job_trade).
+    for d in docs:
+        jid = d.get("latest_job_id")
+        if jid:
+            try:
+                d["trade"] = _job_trade(str(jid), user_id)
+            except Exception:
+                d["trade"] = None
+    return {"documents": docs}
 
 
 @app.get("/api/documents/{document_id}")
