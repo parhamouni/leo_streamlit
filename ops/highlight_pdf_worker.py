@@ -60,6 +60,29 @@ def _emit(obj) -> None:
         pass
 
 
+def _has_drawable(res) -> bool:
+    """True if the page has at least one highlight that would actually be
+    drawn — a definition / instance / keyword box with a valid bbox, or a
+    measurement line with valid endpoints.
+
+    Pages classified as relevant but carrying nothing drawable (e.g. an
+    LLM-misclassified page, or one whose extraction found no elements) would
+    otherwise be inserted as blank pages in the "highlighted" PDF — the
+    "selected but not highlighted" pages users were seeing.
+    """
+    for key in ("definitions", "instances", "keyword_matches"):
+        for it in res.get(key) or []:
+            if isinstance(it, dict) and all(k in it for k in ("x0", "y0", "x1", "y1")):
+                return True
+    for ln in res.get("fence_lines") or []:
+        if isinstance(ln, dict):
+            s, e = ln.get("start"), ln.get("end")
+            if (isinstance(s, (list, tuple)) and len(s) == 2
+                    and isinstance(e, (list, tuple)) and len(e) == 2):
+                return True
+    return False
+
+
 def main() -> int:
     t0 = time.perf_counter()
     out_path = ""
@@ -91,9 +114,15 @@ def main() -> int:
             key=lambda x: x.get("page_index_in_original_doc", float("inf")),
         )
 
+        skipped_blank = 0
         for res in sorted_pages:
             page_idx = res.get("page_index_in_original_doc")
             if page_idx is None:
+                continue
+            # Only include pages that actually have something to highlight — a
+            # "highlighted PDF" shouldn't contain blank, unhighlighted pages.
+            if not _has_drawable(res):
+                skipped_blank += 1
                 continue
             try:
                 output_doc.insert_pdf(input_doc, from_page=page_idx, to_page=page_idx)
