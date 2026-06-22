@@ -485,6 +485,27 @@ def get_document_id_by_job(job_id: str) -> str | None:
     return str(row["document_id"]) if row else None
 
 
+def list_document_jobs(
+    document_id: str, user_id: str, only_completed: bool = True
+) -> list[dict[str, Any]]:
+    """List a document's jobs (ownership enforced via documents.user_id),
+    newest first. Used to enumerate which modes a document has been analysed
+    in — each job's trade is read from its saved results."""
+    status_clause = "and j.status = 'completed'" if only_completed else ""
+    with pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            select j.id, j.status, j.created_at, j.finished_at
+            from jobs j
+            join documents d on d.id = j.document_id
+            where j.document_id = %s and d.user_id = %s {status_clause}
+            order by j.created_at desc
+            """,
+            (document_id, user_id),
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # page_results — live per-page rows the worker upserts as the pipeline runs
 # ---------------------------------------------------------------------------

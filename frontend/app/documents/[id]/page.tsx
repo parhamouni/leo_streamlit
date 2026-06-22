@@ -263,6 +263,15 @@ export default function DocumentDetailPage() {
   const [measurementSummary, setMeasurementSummary] =
     useState<SummaryResponse | null>(null);
   const [umtPages, setUmtPages] = useState<Record<string, UmtPageState>>({});
+  // Analysis modes this document has completed results for (Fence/Electrical).
+  // `activeJobId` is the job whose results are currently shown — defaults to
+  // the latest, switchable via the mode tabs.
+  const [modes, setModes] = useState<{ trade: string; job_id: string }[]>([]);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+  activeJobIdRef.current = activeJobId;
+  // The job whose results are currently displayed (selected mode, else latest).
+  const viewedJobId = activeJobId ?? doc?.latest_job_id ?? null;
 
   // Auth
   useEffect(() => {
@@ -291,10 +300,29 @@ export default function DocumentDetailPage() {
         setDoc(found);
         setError(null);
 
+        // Which analysis modes have completed results (Fence/Electrical tabs).
+        let modeList: { trade: string; job_id: string }[] = [];
+        try {
+          const m = await apiJson<{ modes: { trade: string; job_id: string }[] }>(
+            `/api/documents/${docId}/modes`,
+          );
+          modeList = m.modes ?? [];
+        } catch {
+          modeList = [];
+        }
+        setModes(modeList);
+
         if (found.job_status === "completed" && found.latest_job_id) {
+          // View the user's selected mode if it's still valid, else the latest.
+          const selected = activeJobIdRef.current;
+          const viewJobId =
+            selected && modeList.some((x) => x.job_id === selected)
+              ? selected
+              : found.latest_job_id;
+          if (viewJobId !== activeJobIdRef.current) setActiveJobId(viewJobId);
           const [r, umt] = await Promise.all([
-            apiJson<PipelineResults>(`/api/jobs/${found.latest_job_id}/results`),
-            apiJson<UmtState>(`/api/jobs/${found.latest_job_id}/umt-state`).catch(
+            apiJson<PipelineResults>(`/api/jobs/${viewJobId}/results`),
+            apiJson<UmtState>(`/api/jobs/${viewJobId}/umt-state`).catch(
               () => ({ version: 1, pages: {} }),
             ),
           ]);
@@ -322,6 +350,27 @@ export default function DocumentDetailPage() {
     },
     [docId],
   );
+
+  // Switch the displayed analysis mode — loads that run's results without
+  // re-analysing. Each mode is a separate completed job.
+  const selectMode = useCallback(async (jobId: string) => {
+    if (jobId === activeJobIdRef.current) return;
+    setActiveJobId(jobId);
+    setError(null);
+    try {
+      const [r, umt] = await Promise.all([
+        apiJson<PipelineResults>(`/api/jobs/${jobId}/results`),
+        apiJson<UmtState>(`/api/jobs/${jobId}/umt-state`).catch(() => ({
+          version: 1,
+          pages: {},
+        })),
+      ]);
+      setResults(r);
+      setUmtPages(umt.pages ?? {});
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
 
   useEffect(() => {
     if (authReady) refresh(false);
@@ -442,12 +491,12 @@ export default function DocumentDetailPage() {
     pathSegment: string,
     filenameFallback: string,
   ) {
-    if (!doc?.latest_job_id) return;
+    if (!viewedJobId) return;
     if (downloadingKind) return; // one heavy export at a time
     setDownloadingKind(pathSegment);
     try {
       const resp = await apiFetch(
-        `/api/jobs/${doc.latest_job_id}/${pathSegment}`,
+        `/api/jobs/${viewedJobId}/${pathSegment}`,
       );
       const blob = await resp.blob();
       // Honour Content-Disposition filename when present.
@@ -532,12 +581,12 @@ export default function DocumentDetailPage() {
   );
 
   useEffect(() => {
-    if (doc?.job_status === "completed" && doc.latest_job_id) {
+    if (doc?.job_status === "completed" && viewedJobId) {
       markMeasurementsChanged();
     } else {
       setMeasurementSummary(null);
     }
-  }, [doc?.job_status, doc?.latest_job_id, markMeasurementsChanged]);
+  }, [doc?.job_status, viewedJobId, markMeasurementsChanged]);
 
   if (!authReady || (loading && !doc)) {
     return (
@@ -722,6 +771,38 @@ export default function DocumentDetailPage() {
           </div>
         )}
 
+        {/* ---------- Mode view tabs (both runs kept side-by-side) ---------- */}
+        {isComplete && modes.length > 1 && (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm text-gray-600">View mode:</span>
+            <div className="inline-flex rounded-lg border bg-gray-50 p-0.5">
+              {modes.map((m) => {
+                const active = m.job_id === viewedJobId;
+                const label =
+                  m.trade.charAt(0).toUpperCase() + m.trade.slice(1);
+                return (
+                  <button
+                    key={m.job_id}
+                    type="button"
+                    onClick={() => selectMode(m.job_id)}
+                    aria-pressed={active}
+                    className={`px-3 py-1 text-sm rounded-md transition ${
+                      active
+                        ? "bg-white shadow text-gray-900 font-medium"
+                        : "text-gray-600 hover:text-gray-900"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+            <span className="text-xs text-gray-400">
+              both runs kept — switch without re-analysing
+            </span>
+          </div>
+        )}
+
         {/* ---------- Re-analyze in another mode ---------- */}
         {isComplete && results && (
           <section className="bg-white rounded-lg shadow p-4">
@@ -821,9 +902,9 @@ export default function DocumentDetailPage() {
         )}
 
         {/* ---------- Cross-page measurement summary (Sprint 4 / C8) ---------- */}
-        {isComplete && results && doc?.latest_job_id && fencePages.length > 0 && supportsMeasurement && (
+        {isComplete && results && viewedJobId && fencePages.length > 0 && supportsMeasurement && (
           <MeasurementSummary
-            jobId={doc.latest_job_id}
+            jobId={viewedJobId}
             refreshSignal={measurementRefresh}
             onDataChange={setMeasurementSummary}
           />
@@ -877,7 +958,7 @@ export default function DocumentDetailPage() {
                     <FencePageCard
                       key={p.page_num}
                       page={p}
-                      jobId={doc.latest_job_id}
+                      jobId={viewedJobId}
                       umtPageState={umtPages[`page_${p.page_num}`]}
                       summaryPage={measurementSummaryByPage.get(p.page_num)}
                       onMeasurementsSaved={markMeasurementsChanged}
@@ -893,7 +974,7 @@ export default function DocumentDetailPage() {
                     <NonFencePageCard
                       key={p.page_num}
                       page={p}
-                      jobId={doc.latest_job_id}
+                      jobId={viewedJobId}
                     />
                   ))
                 ))}
@@ -903,7 +984,7 @@ export default function DocumentDetailPage() {
                     <FencePageCard
                       key={`f-${p.page_num}`}
                       page={p}
-                      jobId={doc.latest_job_id}
+                      jobId={viewedJobId}
                       umtPageState={umtPages[`page_${p.page_num}`]}
                       summaryPage={measurementSummaryByPage.get(p.page_num)}
                       onMeasurementsSaved={markMeasurementsChanged}
@@ -914,7 +995,7 @@ export default function DocumentDetailPage() {
                     <NonFencePageCard
                       key={`n-${p.page_num}`}
                       page={p}
-                      jobId={doc.latest_job_id}
+                      jobId={viewedJobId}
                     />
                   ))}
                 </>

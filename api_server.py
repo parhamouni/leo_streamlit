@@ -933,6 +933,60 @@ async def get_results(
     return rebuilt if full else _slim_results(rebuilt)
 
 
+# A completed job's trade never changes, so cache it (avoids re-reading the
+# multi-MB results.json on every /modes poll).
+_job_trade_cache: dict[str, str] = {}
+
+
+def _job_trade(job_id: str, user_id: str) -> str:
+    """Best-effort analysis mode for a completed job, read from its saved
+    results (falls back to page_results reconstruction, then 'fence')."""
+    cached = _job_trade_cache.get(job_id)
+    if cached:
+        return cached
+    trade = None
+    res = job_registry.load_results(job_id)
+    if isinstance(res, dict) and res.get("trade"):
+        trade = str(res["trade"])
+    else:
+        rebuilt = _results_from_pages(job_id, user_id)
+        if rebuilt and rebuilt.get("trade"):
+            trade = str(rebuilt["trade"])
+    trade = trade or "fence"
+    _job_trade_cache[job_id] = trade
+    return trade
+
+
+@app.get("/api/documents/{document_id}/modes")
+async def get_document_modes(
+    document_id: str, user_id: str = Depends(get_current_user)
+):
+    """List the analysis modes a document has completed results for — the
+    latest completed job per trade. Drives the Fence/Electrical tabs on the
+    document view so both runs are viewable without re-analysing.
+
+    No DB schema dependency: trades are read from each job's saved results
+    (Path B). Returns e.g. {"modes": [{"trade":"fence","job_id":...}, ...]}.
+    """
+    try:
+        jobs = db.list_document_jobs(document_id, user_id, only_completed=True)
+    except Exception:
+        log.exception("get_document_modes: list_document_jobs failed")
+        jobs = []
+    by_trade: dict[str, dict] = {}
+    for j in jobs:  # newest first
+        jid = str(j.get("id"))
+        trade = _job_trade(jid, user_id)
+        if trade not in by_trade:  # first seen per trade == newest
+            by_trade[trade] = {
+                "trade": trade,
+                "job_id": jid,
+                "created_at": j.get("created_at"),
+            }
+    modes = sorted(by_trade.values(), key=lambda m: (m["trade"] != "fence", m["trade"]))
+    return {"modes": modes}
+
+
 # Subprocess worker for safe PDF page rasterization. Some PDFs (especially
 # those with very dense vector content) can crash MuPDF at the C level,
 # which would take down the entire API server if rendered in-process.
