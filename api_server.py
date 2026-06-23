@@ -2111,6 +2111,17 @@ def _generate_measurement_pdf_in_subprocess(
     return pdf_bytes, fname
 
 
+# Returned (as HTTP 422, not 500) when a document has no fence lines to
+# export — neither auto-detected nor manually drawn. This is a normal
+# outcome (e.g. a report whose "fence" pages have no CAD fence layers), not
+# a server fault, so it must not be retried as a transient 5xx by the client.
+NO_MEASUREMENTS_MSG = (
+    "No measurements to export — no fence lines were detected on this "
+    "document. Draw or assign lines in the measurement editor to populate "
+    "this export."
+)
+
+
 @app.get("/api/jobs/{job_id}/measurement-pdf")
 async def get_measurement_pdf(
     job_id: str,
@@ -2158,6 +2169,13 @@ async def get_measurement_pdf(
     except ExportWorkerError as e:
         log.warning("measurement-pdf vector failed job=%s: %s", job_id[:8], e)
         raise HTTPException(500, f"Measurement PDF export state failed: {e}")
+
+    # No auto-detected or user-drawn lines anywhere → nothing to overlay.
+    # Short-circuit before the subprocess, which would otherwise spend
+    # minutes re-rendering dense pages just to produce a blank overlay.
+    if not line_assignments and not user_drawn:
+        log.info("measurement-pdf no-lines job=%s", job_id[:8])
+        raise HTTPException(422, NO_MEASUREMENTS_MSG)
 
     try:
         pdf_bytes, fname = await asyncio.to_thread(
@@ -2234,6 +2252,12 @@ async def get_measurement_excel(
     except ExportWorkerError as e:
         log.warning("measurement-excel vector failed job=%s: %s", job_id[:8], e)
         raise HTTPException(500, f"Measurement Excel export state failed: {e}")
+
+    # No auto-detected or user-drawn lines anywhere → no rows to write.
+    if not line_assignments and not user_drawn:
+        log.info("measurement-excel no-lines job=%s", job_id[:8])
+        raise HTTPException(422, NO_MEASUREMENTS_MSG)
+
     element_details = (results or {}).get("element_details") or {}
 
     from exports import generate_measurement_spreadsheet
@@ -2248,12 +2272,11 @@ async def get_measurement_excel(
         lines_by_page=lines_by_page,
     )
     if not xlsx_bytes:
-        raise HTTPException(
-            500,
-            "No measurement rows were generated — likely because no fence "
-            "lines were auto-detected. After UMT (Sprint 4) ships, manual "
-            "edits will populate this export.",
-        )
+        # Belt-and-suspenders: the early no-lines check above normally
+        # catches this, but generate_measurement_spreadsheet can also drop
+        # every candidate row (e.g. all lines below min length). Still a
+        # "nothing to export" outcome, not a server fault.
+        raise HTTPException(422, NO_MEASUREMENTS_MSG)
 
     base = (job.get("filename") or "document.pdf").rsplit(".", 1)[0]
     fname = f"{base}_measurements.xlsx"

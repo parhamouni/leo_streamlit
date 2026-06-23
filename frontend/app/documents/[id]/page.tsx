@@ -524,8 +524,19 @@ export default function DocumentDetailPage() {
         URL.revokeObjectURL(url);
       }, 30_000);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(`Download failed: ${msg}`);
+      // 422 = "nothing to export" (no fence lines detected/drawn). That's a
+      // normal outcome, not a failure — surface the server's plain-language
+      // detail rather than a scary "Download failed: API 500".
+      if (e instanceof ApiError && e.status === 422) {
+        const detail =
+          e.body && typeof e.body === "object" && "detail" in e.body
+            ? String((e.body as { detail: unknown }).detail)
+            : "No measurements to export for this document.";
+        setError(detail);
+      } else {
+        const msg = e instanceof Error ? e.message : String(e);
+        setError(`Download failed: ${msg}`);
+      }
     } finally {
       setDownloadingKind(null);
     }

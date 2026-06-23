@@ -81,6 +81,91 @@ def completed_export_job(job_registry_temp, tmp_path):
     return job_id
 
 
+@pytest.fixture
+def skipped_export_job(job_registry_temp, tmp_path):
+    """A completed job whose fence pages have no measurable lines.
+
+    Mirrors a report whose 'fence' pages carry no CAD fence layers and
+    had measurement skipped — the export should report 'nothing to
+    export' (422), not a server fault (500)."""
+    pdf_path = tmp_path / "drainage.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n% test placeholder\n")
+
+    job_id = job_registry_temp.create_job(
+        user_id=USER_ID,
+        filename="drainage.pdf",
+        pdf_path=str(pdf_path),
+    )
+    job_registry_temp.update_job(
+        job_id,
+        status="completed",
+        completed_at=1700000000,
+        total_pages=1,
+        fence_count=1,
+        non_fence_count=0,
+    )
+    job_registry_temp.save_results(
+        job_id,
+        {
+            "fence_pages": [
+                {
+                    "page_idx": 0,
+                    "page_num": 1,
+                    "scale_info": {"verified_scale": 360},
+                    "measurements": {
+                        "all_fence_lines": [],
+                        "layer_to_category": {},
+                        "measurement_method": "skipped",
+                        "skip_reason": "non-layer suggestions disabled and no fence layers found",
+                    },
+                    "legend_entries": [],
+                    "instances": [],
+                }
+            ],
+            "non_fence_pages": [],
+            "per_page_scale_info": {"page_1": {"verified_scale": 360}},
+            "element_details": {},
+        },
+    )
+    return job_id
+
+
+def test_measurement_excel_no_lines_returns_422(
+    api_server_module, app_client, skipped_export_job
+):
+    resp = app_client.get(
+        f"/api/jobs/{skipped_export_job}/measurement-excel",
+        headers={"X-User-Id": USER_ID},
+    )
+    assert resp.status_code == 422
+    assert "No measurements to export" in resp.text
+
+
+def test_measurement_pdf_no_lines_returns_422_without_subprocess(
+    api_server_module, app_client, skipped_export_job, monkeypatch
+):
+    calls = []
+
+    def fake_helper(**kwargs):
+        calls.append(kwargs)
+        return b"%PDF should-not-run", "x.pdf"
+
+    monkeypatch.setattr(
+        api_server_module,
+        "_generate_measurement_pdf_in_subprocess",
+        fake_helper,
+    )
+
+    resp = app_client.get(
+        f"/api/jobs/{skipped_export_job}/measurement-pdf",
+        headers={"X-User-Id": USER_ID},
+    )
+    assert resp.status_code == 422
+    assert "No measurements to export" in resp.text
+    # The expensive overlay subprocess must be short-circuited.
+    assert calls == []
+
+
 def test_measurement_pdf_uses_subprocess_helper(
     api_server_module, app_client, completed_export_job, monkeypatch
 ):
