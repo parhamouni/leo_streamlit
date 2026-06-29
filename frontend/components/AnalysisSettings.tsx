@@ -126,13 +126,18 @@ export function TradeModeSelector({
   function switchTrade(next: TradeId) {
     if (next === trade) return;
     const meta = TRADES[next];
+    // Preserve the user's measurement preference across trade switches. Do NOT
+    // force it off for non-measurement trades: the value is persisted in
+    // localStorage, so forcing it off here meant a fence→electrical→fence
+    // round-trip stuck `enable_unified_measurement` at false for all later
+    // fence jobs — silently killing every measurement export (422 "nothing to
+    // export"). The backend already refuses measurement for trades whose
+    // profile opts out (pipeline.py: tprofile.supports_measurement), so the
+    // frontend never needs to clobber the user's intent.
     setSettings({
       ...settings,
       trade: next,
       fence_keywords: [...meta.keywords],
-      enable_unified_measurement: meta.supportsMeasurement
-        ? settings.enable_unified_measurement
-        : false,
     });
   }
 
