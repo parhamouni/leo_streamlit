@@ -16,6 +16,9 @@ import { useEffect, useMemo, useState } from "react";
 
 const STORAGE_KEY = "leo:analysis-settings:v1";
 
+// Marker for the one-time "stuck measurement" repair (see repairStuckMeasurement).
+const MEASUREMENT_REPAIR_KEY = "leo:analysis-settings:measurement-repair:v1";
+
 // Contracting trades (must mirror config.TRADE_PROFILES on the backend). Each
 // trade brings its own default keyword set; `supportsMeasurement` gates the
 // fence-only linear-measurement options.
@@ -68,13 +71,38 @@ const DEFAULTS: AnalysisSettings = {
   fence_keywords: [...TRADES.fence.keywords],
 };
 
+/**
+ * One-time, per-browser repair for the fence→electrical→fence bug that left
+ * `enable_unified_measurement` stuck `false` in localStorage (see the comment
+ * in switchTrade). Re-enables measurement for users currently sitting in a
+ * measurement-supporting trade with it turned off — the exact state the bug
+ * produced — so they don't have to hit "Reset to defaults" by hand.
+ *
+ * Guarded by MEASUREMENT_REPAIR_KEY so it runs exactly once: a user who later
+ * turns measurement off on purpose is not overridden on subsequent loads.
+ */
+function repairStuckMeasurement(settings: AnalysisSettings): AnalysisSettings {
+  try {
+    if (window.localStorage.getItem(MEASUREMENT_REPAIR_KEY)) return settings;
+    window.localStorage.setItem(MEASUREMENT_REPAIR_KEY, "1");
+    const supportsMeasurement =
+      TRADES[settings.trade]?.supportsMeasurement ?? false;
+    if (supportsMeasurement && !settings.enable_unified_measurement) {
+      return { ...settings, enable_unified_measurement: true };
+    }
+  } catch {
+    // localStorage unavailable (Safari private mode etc.) — skip the repair.
+  }
+  return settings;
+}
+
 function loadFromStorage(): AnalysisSettings {
   if (typeof window === "undefined") return DEFAULTS;
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return DEFAULTS;
     const parsed = JSON.parse(raw);
-    return { ...DEFAULTS, ...parsed };
+    return repairStuckMeasurement({ ...DEFAULTS, ...parsed });
   } catch {
     return DEFAULTS;
   }
