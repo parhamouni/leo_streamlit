@@ -74,24 +74,48 @@ def generate_measurement_pdf(
                         return mw - y1, x0, mw - y0, x1
                     return x0, y0, x1, y1
 
+                # Draw everything into ONE shape committed once per page.
+                # page.draw_line/draw_rect/draw_circle each create *and commit*
+                # their own shape, and every commit re-parses the whole page
+                # content stream (wrap_contents → _count_q_balance). That's
+                # O(n²): a dense page can carry tens of thousands of auto lines
+                # (one report hit 24k on a single page), which blew past the
+                # 600s worker timeout and surfaced as "Download failed: Failed
+                # to fetch". Batching the draws and committing once is O(n).
+                shape = page_out.new_shape()
+
+                def_rects = []
                 for d in res_data.get("definitions", []):
                     if all(k in d for k in ("x0", "y0", "x1", "y1")):
                         r = fitz.Rect(*_rot(d["x0"], d["y0"], d["x1"], d["y1"]))
                         r.normalize()
                         if not r.is_empty and r.is_valid:
-                            page_out.draw_rect(r, color=(0, 0.9, 0), width=2.0, overlay=True)
+                            def_rects.append(r)
+                if def_rects:
+                    for r in def_rects:
+                        shape.draw_rect(r)
+                    shape.finish(color=(0, 0.9, 0), width=2.0)
 
+                inst_rects = []
                 for inst in res_data.get("instances", []):
                     if all(k in inst for k in ("x0", "y0", "x1", "y1")):
                         r = fitz.Rect(*_rot(inst["x0"], inst["y0"], inst["x1"], inst["y1"]))
                         r.normalize()
                         if not r.is_empty and r.is_valid:
-                            page_out.draw_rect(r, color=(0.9, 0, 0.9), width=2.0, overlay=True)
+                            inst_rects.append(r)
+                if inst_rects:
+                    for r in inst_rects:
+                        shape.draw_rect(r)
+                    shape.finish(color=(0.9, 0, 0.9), width=2.0)
 
                 categories = page_categories.get(page_key, {})
                 pa = line_assignments.get(page_key, {})
                 lines = res_data.get("auto_lines", [])
 
+                # Group auto lines by stroke color so each color batch needs a
+                # single finish() — a finish per line would emit one graphics
+                # group per segment (24k of them on the worst page).
+                segs_by_color: dict[tuple, list] = {}
                 for line_idx_str, category in pa.items():
                     idx = int(line_idx_str) if isinstance(line_idx_str, str) else line_idx_str
                     if idx < len(lines):
@@ -106,7 +130,11 @@ def generate_measurement_pdf(
                             sx, sy = line.start
                             ex, ey = line.end
                         ax0, ay0, ax1, ay1 = _rot(sx, sy, ex, ey)
-                        page_out.draw_line((ax0, ay0), (ax1, ay1), color=color, width=3.0, overlay=True)
+                        segs_by_color.setdefault(color, []).append(((ax0, ay0), (ax1, ay1)))
+                for color, segs in segs_by_color.items():
+                    for p1, p2 in segs:
+                        shape.draw_line(p1, p2)
+                    shape.finish(color=color, width=3.0)
 
                 for ul in user_drawn_lines.get(page_key, []):
                     cat = ul.get("category")
@@ -116,9 +144,13 @@ def generate_measurement_pdf(
                     sx, sy = ul["start"]
                     ex, ey = ul["end"]
                     ax0, ay0, ax1, ay1 = _rot(sx, sy, ex, ey)
-                    page_out.draw_line((ax0, ay0), (ax1, ay1), color=color, width=3.0, overlay=True)
-                    page_out.draw_circle((ax0, ay0), 3, color=color, fill=color, overlay=True)
-                    page_out.draw_circle((ax1, ay1), 3, color=color, fill=color, overlay=True)
+                    shape.draw_line((ax0, ay0), (ax1, ay1))
+                    shape.finish(color=color, width=3.0)
+                    shape.draw_circle((ax0, ay0), 3)
+                    shape.draw_circle((ax1, ay1), 3)
+                    shape.finish(color=color, fill=color)
+
+                shape.commit(overlay=True)
 
             except Exception as e:
                 log.warning(f"Measurement PDF page {page_idx}: {e}")
