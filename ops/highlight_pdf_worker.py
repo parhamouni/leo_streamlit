@@ -238,7 +238,13 @@ def main() -> int:
         # file the parent then mistakes for a complete result.
         tmp_path = out_path + ".tmp"
         with open(tmp_path, "wb") as f:
-            f.write(output_doc.tobytes(garbage=2, deflate=True))
+            # garbage=4, not garbage=2: insert_pdf is called once per page, so
+            # a raster/font/XObject shared across many source pages is copied
+            # per page. garbage=2 leaves those duplicates and an image-heavy
+            # deck balloons to hundreds of MB / multiple GB (e.g. a 3.7 GB
+            # highlighted PDF the client's browser can't download). garbage=4
+            # does cross-object compaction and dedups them back to one copy.
+            f.write(output_doc.tobytes(garbage=4, deflate=True))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, out_path)

@@ -21,7 +21,6 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1172,13 +1171,27 @@ def _generate_highlighted_pdf(
                 "fence_pages": worker_pages,
                 "highlight_fence_text": config.highlight_fence_text,
             }
-            proc = subprocess.run(
-                [sys.executable, worker_script],
-                input=json.dumps(task, default=str).encode(),
-                capture_output=True,
-                timeout=cfg.HIGHLIGHT_PDF_TIMEOUT,
-            )
-            if proc.returncode == 0 and os.path.exists(out_path):
+            try:
+                proc = subprocess.run(
+                    [sys.executable, worker_script],
+                    input=json.dumps(task, default=str).encode(),
+                    capture_output=True,
+                    timeout=cfg.HIGHLIGHT_PDF_TIMEOUT,
+                )
+            except subprocess.TimeoutExpired:
+                # The worker was killed at the timeout. Fall through to the
+                # inline fallback below so the client still gets a fence PDF —
+                # otherwise result.highlighted_pdf_bytes stays None, the file is
+                # never written, and /highlighted-pdf 404s ("gives nothing")
+                # while the Excel still works. This runs in the job worker
+                # thread, not the API event loop, so a slow fallback only
+                # delays this one job.
+                log.warning(
+                    "Highlight worker timed out after %ss; using inline fallback",
+                    cfg.HIGHLIGHT_PDF_TIMEOUT,
+                )
+                proc = None
+            if proc is not None and proc.returncode == 0 and os.path.exists(out_path):
                 try:
                     with open(out_path, "rb") as f:
                         return f.read()
@@ -1187,50 +1200,60 @@ def _generate_highlighted_pdf(
                         os.unlink(out_path)
                     except Exception:
                         pass
-            log.warning(
-                "Highlight worker failed (rc=%s): %s",
-                proc.returncode,
-                proc.stderr[:500] if proc.stderr else "no stderr",
-            )
+            if proc is not None:
+                log.warning(
+                    "Highlight worker failed (rc=%s): %s",
+                    proc.returncode,
+                    proc.stderr[:500] if proc.stderr else "no stderr",
+                )
             try:
                 os.unlink(out_path)
             except Exception:
                 pass
 
-        doc = fitz.open(pdf_path)
-        fence_page_set = {r["page_idx"] for r in fence_results if "page_idx" in r}
+        # Inline fallback: the worker is unavailable, errored, or timed out.
+        # Build a fence-pages-ONLY document (never the whole source — that both
+        # leaks non-fence pages and, being a full copy of a 100-200 MB deck, is
+        # itself undownloadable) and serialize with garbage=4 so resources
+        # shared across pages are de-duplicated instead of copied per page.
+        # Coordinates use raw bbox (no rotation reversal), so this is best-
+        # effort placement for the failure path; the worker handles rotation.
+        src = fitz.open(pdf_path)
+        out_doc = fitz.open()
+        try:
+            for page_result in sorted(
+                fence_results, key=lambda r: r.get("page_idx", 0)
+            ):
+                pi = page_result.get("page_idx")
+                if pi is None or pi < 0 or pi >= src.page_count:
+                    continue
+                out_doc.insert_pdf(src, from_page=pi, to_page=pi)
+                page = out_doc.load_page(len(out_doc) - 1)
 
-        for page_result in fence_results:
-            pi = page_result.get("page_idx")
-            if pi is None or pi >= doc.page_count:
-                continue
-            page = doc[pi]
+                for defn in page_result.get("definitions", []):
+                    bbox = defn.get("bbox")
+                    if bbox and len(bbox) == 4:
+                        annot = page.add_rect_annot(fitz.Rect(bbox))
+                        annot.set_colors(stroke=cfg.HIGHLIGHT_COLOR_UI)
+                        annot.set_border(width=cfg.HIGHLIGHT_WIDTH_UI)
+                        annot.update()
 
-            for defn in page_result.get("definitions", []):
-                bbox = defn.get("bbox")
-                if bbox and len(bbox) == 4:
-                    rect = fitz.Rect(bbox)
-                    annot = page.add_rect_annot(rect)
-                    annot.set_colors(stroke=cfg.HIGHLIGHT_COLOR_UI)
-                    annot.set_border(width=cfg.HIGHLIGHT_WIDTH_UI)
-                    annot.update()
+                # Stage-1 highlighter only draws keyword/instance/legend
+                # rectangles. Fence-line strokes are stage 2 (measurement PDF).
+                for inst in page_result.get("instances", []):
+                    bbox = inst.get("bbox")
+                    if bbox and len(bbox) == 4:
+                        annot = page.add_rect_annot(fitz.Rect(bbox))
+                        annot.set_colors(stroke=cfg.HIGHLIGHT_COLOR_INSTANCE)
+                        annot.set_border(width=cfg.HIGHLIGHT_WIDTH_UI)
+                        annot.update()
 
-            # Stage-1 highlighter only draws keyword/instance/legend
-            # rectangles. Fence-line strokes are stage 2 (measurement PDF).
-
-            for inst in page_result.get("instances", []):
-                bbox = inst.get("bbox")
-                if bbox and len(bbox) == 4:
-                    rect = fitz.Rect(bbox)
-                    annot = page.add_rect_annot(rect)
-                    annot.set_colors(stroke=cfg.HIGHLIGHT_COLOR_INSTANCE)
-                    annot.set_border(width=cfg.HIGHLIGHT_WIDTH_UI)
-                    annot.update()
-
-        out = BytesIO()
-        doc.save(out)
-        doc.close()
-        return out.getvalue()
+            if len(out_doc) == 0:
+                return None
+            return out_doc.tobytes(garbage=4, deflate=True)
+        finally:
+            src.close()
+            out_doc.close()
 
     except Exception as e:
         log.warning(f"Highlighted PDF generation failed: {e}")

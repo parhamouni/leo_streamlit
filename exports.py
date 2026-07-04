@@ -159,7 +159,15 @@ def generate_measurement_pdf(
         fname = f"{base}_measurements{ext}"
 
         try:
-            pdf_bytes = output_doc.tobytes(garbage=2, deflate=True)
+            # garbage=4 (full cross-object compaction), not garbage=2. The
+            # page loop calls insert_pdf once per page, and each insert has its
+            # own dedup scope — so a raster/font/XObject shared across N source
+            # pages is copied N times. garbage=2 only cleans within a stream and
+            # leaves those duplicates, ballooning image-heavy CAD decks to
+            # multiple GB (one 50-page report serialized to 6.8 GB, undownloadable
+            # in the browser). garbage=4 collapses the duplicate objects back to
+            # one, cutting size by up to Nx.
+            pdf_bytes = output_doc.tobytes(garbage=4, deflate=True)
         except Exception:
             pdf_bytes = None
 
