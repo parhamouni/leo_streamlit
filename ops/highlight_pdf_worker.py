@@ -106,8 +106,15 @@ def main() -> int:
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"source PDF not found: {pdf_path}")
 
+        # Draw the overlays on the SOURCE doc, then select() down to the
+        # fence pages and save. The previous approach — insert_pdf once per
+        # page into a fresh doc, then tobytes(garbage=4) — duplicated every
+        # shared resource per page, so a ~300-page scanned deck ballooned to
+        # ~18 GB RSS and the garbage=4 compaction of that doc blew the
+        # 1800s timeout (2026-07-07 incident: 137 fence pages, worker killed,
+        # client got no fence PDF). select() keeps pages in place sharing
+        # their resources: same deck now builds in ~36s at ~80 MB peak.
         input_doc = fitz.open(pdf_path)
-        output_doc = fitz.open()
 
         sorted_pages = sorted(
             fence_pages,
@@ -115,9 +122,14 @@ def main() -> int:
         )
 
         skipped_blank = 0
+        kept_indices: list[int] = []
         for res in sorted_pages:
             page_idx = res.get("page_index_in_original_doc")
             if page_idx is None:
+                continue
+            if page_idx < 0 or page_idx >= input_doc.page_count:
+                continue
+            if page_idx in kept_indices:
                 continue
             # Only include pages that actually have something to highlight — a
             # "highlighted PDF" shouldn't contain blank, unhighlighted pages.
@@ -125,8 +137,10 @@ def main() -> int:
                 skipped_blank += 1
                 continue
             try:
-                output_doc.insert_pdf(input_doc, from_page=page_idx, to_page=page_idx)
-                page_out = output_doc.load_page(len(output_doc) - 1)
+                page_out = input_doc.load_page(page_idx)
+                # Keep the page even if an individual draw below fails —
+                # same semantics as the old insert-first approach.
+                kept_indices.append(page_idx)
 
                 rotation   = page_out.rotation
                 mediabox_w = page_out.mediabox.width
@@ -231,30 +245,25 @@ def main() -> int:
                 print(f"[highlight_pdf_worker] page {page_idx + 1} draw error: {pg_e}",
                       file=sys.stderr)
 
-        if len(output_doc) == 0:
+        if not kept_indices:
             raise RuntimeError("output PDF has 0 pages — nothing to write")
+
+        input_doc.select(kept_indices)
 
         # Atomic write so a crashed serialization can't leave a half
         # file the parent then mistakes for a complete result.
+        # garbage=3 (drop objects orphaned by select, merge duplicates) is
+        # enough here: unlike insert_pdf, select() never duplicates shared
+        # resources, so the expensive garbage=4 stream-level dedup that the
+        # old approach needed buys nothing and dominates wall time on
+        # image-heavy decks. save() also streams to disk instead of building
+        # the whole file in memory like tobytes().
         tmp_path = out_path + ".tmp"
-        with open(tmp_path, "wb") as f:
-            # garbage=4, not garbage=2: insert_pdf is called once per page, so
-            # a raster/font/XObject shared across many source pages is copied
-            # per page. garbage=2 leaves those duplicates and an image-heavy
-            # deck balloons to hundreds of MB / multiple GB (e.g. a 3.7 GB
-            # highlighted PDF the client's browser can't download). garbage=4
-            # does cross-object compaction and dedups them back to one copy.
-            f.write(output_doc.tobytes(garbage=4, deflate=True))
-            f.flush()
-            os.fsync(f.fileno())
+        input_doc.save(tmp_path, garbage=3, deflate=True)
         os.replace(tmp_path, out_path)
 
         try:
             input_doc.close()
-        except Exception:
-            pass
-        try:
-            output_doc.close()
         except Exception:
             pass
 
