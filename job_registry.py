@@ -72,7 +72,13 @@ CREATE TABLE IF NOT EXISTS jobs (
 _MIGRATE_COLUMNS = [
     ("config_json", "TEXT"),
     ("queue_position", "INTEGER"),
+    ("requeue_count", "INTEGER NOT NULL DEFAULT 0"),
 ]
+
+# How many times an orphaned 'running' job may be re-queued after an API
+# restart before it is considered a poison pill (e.g. it OOM-kills the
+# service every time it runs) and marked failed instead.
+MAX_ORPHAN_REQUEUES = 2
 
 # Statuses considered "active" (never expire from get_user_jobs).
 _ACTIVE_STATUSES = ("queued", "running", "phases_ready")
@@ -221,7 +227,7 @@ def update_job(job_id: str, **fields: Any) -> None:
         "user_id", "filename", "pdf_hash", "pdf_path", "status",
         "created_at", "started_at", "completed_at", "expires_at",
         "total_pages", "fence_count", "non_fence_count", "results_dir",
-        "error_msg", "config_json", "queue_position",
+        "error_msg", "config_json", "queue_position", "requeue_count",
     }
     unknown = set(fields) - _KNOWN_COLUMNS
     if unknown:
@@ -240,6 +246,20 @@ def update_job(job_id: str, **fields: Any) -> None:
         except Exception:
             db.execute("ROLLBACK")
             raise
+
+
+def list_failed_since(ts: int) -> list[dict]:
+    """Jobs marked failed at or after unix timestamp `ts`.
+
+    Used by API startup to mirror guard-failed jobs into Postgres.
+    """
+    db = _db()
+    with _lock:
+        rows = db.execute(
+            "SELECT * FROM jobs WHERE status = 'failed' AND completed_at >= ?",
+            (ts,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_job(job_id: str) -> dict | None:
@@ -489,20 +509,36 @@ def mark_stale_running_as_failed(max_age_seconds: int = 7200) -> int:
     return count
 
 
-def requeue_orphaned_running() -> int:
+def requeue_orphaned_running() -> tuple[int, int]:
     """Move 'running' jobs back to 'queued' status (orphaned by API restart).
 
     Called on API startup. Worker threads die when uvicorn exits, so any
     job left in 'running' state is orphaned. Re-queue at the front so it
-    resumes (cached phases are reused via fence_cache). Returns count.
+    resumes (cached phases are reused via fence_cache).
+
+    Poison-pill guard: a job already re-queued MAX_ORPHAN_REQUEUES times is
+    one that keeps taking the service down with it (e.g. OOM-kill); it is
+    marked failed instead of being re-queued forever.
+
+    Returns (requeued_count, poisoned_count).
     """
     db = _db()
+    now = int(time.time())
     with _lock:
         db.execute("BEGIN IMMEDIATE")
         try:
-            # Place orphans ahead of any newly-queued work
+            poisoned = db.execute(
+                "UPDATE jobs SET status = 'failed', started_at = NULL, "
+                "error_msg = 'Analysis crashed the server repeatedly "
+                "(likely out of memory); not retried', "
+                "completed_at = ? "
+                "WHERE status = 'running' AND requeue_count >= ?",
+                (now, MAX_ORPHAN_REQUEUES),
+            ).rowcount
+            # Place surviving orphans ahead of any newly-queued work
             cursor = db.execute(
                 "UPDATE jobs SET status = 'queued', started_at = NULL, "
+                "requeue_count = requeue_count + 1, "
                 "queue_position = COALESCE("
                 "  (SELECT MIN(queue_position) FROM jobs WHERE status = 'queued'), 1"
                 ") - 1 "
@@ -513,7 +549,7 @@ def requeue_orphaned_running() -> int:
         except Exception:
             db.execute("ROLLBACK")
             raise
-    return count
+    return count, poisoned
 
 
 def save_results(job_id: str, results: dict) -> None:

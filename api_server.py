@@ -437,13 +437,32 @@ def _ttl_cleanup_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Re-queue jobs orphaned by previous API restart (clean recovery)
-    requeued = job_registry.requeue_orphaned_running()
+    startup_ts = int(time.time())
+    requeued, poisoned = job_registry.requeue_orphaned_running()
     if requeued:
         log.info(f"Startup: re-queued {requeued} orphaned running jobs")
+    if poisoned:
+        log.warning(
+            f"Startup: {poisoned} orphaned jobs exceeded the re-queue cap "
+            "and were marked failed (poison-pill guard)"
+        )
     # Catch ancient stale rows that pre-date the requeue logic
     stale = job_registry.mark_stale_running_as_failed(max_age_seconds=7200)
     if stale:
         log.info(f"Startup: marked {stale} stale running jobs as failed")
+    # Best-effort Postgres mirror for jobs failed by the startup guards, so
+    # the dashboard doesn't show them as running forever.
+    if poisoned or stale:
+        for j in job_registry.list_failed_since(startup_ts):
+            try:
+                db.update_job_progress(
+                    j["job_id"],
+                    status="failed",
+                    error_message=j.get("error_msg"),
+                    finished_at_now=True,
+                )
+            except Exception:
+                pass
 
     global _worker_thread
     _shutdown_event.clear()

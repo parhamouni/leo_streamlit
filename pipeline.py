@@ -1218,6 +1218,22 @@ def _generate_highlighted_pdf(
         # shared across pages are de-duplicated instead of copied per page.
         # Coordinates use raw bbox (no rotation reversal), so this is best-
         # effort placement for the failure path; the worker handles rotation.
+        #
+        # Bounded: unlike the worker subprocess, this runs inside the API
+        # process where MuPDF holds the GIL and its allocations count against
+        # the service cgroup. On large scanned decks the copy+serialize can
+        # reach tens of GB and wedge every request, so past the ceiling we
+        # give up on the highlighted PDF instead of taking the service down
+        # (the /highlighted-pdf endpoint already handles the missing file).
+        if len(fence_results) > cfg.HIGHLIGHT_INLINE_MAX_PAGES:
+            log.warning(
+                "Skipping inline highlight fallback: %d fence pages exceeds "
+                "HIGHLIGHT_INLINE_MAX_PAGES=%d; job will complete without "
+                "highlighted.pdf",
+                len(fence_results),
+                cfg.HIGHLIGHT_INLINE_MAX_PAGES,
+            )
+            return None
         src = fitz.open(pdf_path)
         out_doc = fitz.open()
         try:

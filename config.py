@@ -162,6 +162,12 @@ class Config:
     ANALYSIS_MODEL: str = field(default_factory=lambda: _str_env("FENCE_ANALYSIS_MODEL", "gpt-5.1"))
     CLASSIFIER_MODEL: str = field(default_factory=lambda: _str_env("FENCE_CLASSIFIER_MODEL", "gpt-5-mini"))
     HIGHLIGHT_PDF_TIMEOUT: int = field(default_factory=lambda: _int_env("FENCE_HIGHLIGHT_PDF_TIMEOUT", 600, hi=1800))
+    # Inline (in-process) highlight fallback ceiling. MuPDF holds the GIL, so
+    # building a big fence-pages doc in-process can starve the whole API for
+    # minutes and, on scanned decks, reach tens of GB of RSS (2026-07-07
+    # incident: two ~300-page volumes wedged the service at the 32G cgroup
+    # cap). Above this many fence pages we skip the fallback entirely.
+    HIGHLIGHT_INLINE_MAX_PAGES: int = field(default_factory=lambda: _int_env("FENCE_HIGHLIGHT_INLINE_MAX_PAGES", 40, hi=500))
     DETAILS_TIMEOUT: int = field(default_factory=lambda: _int_env("FENCE_DETAILS_TIMEOUT", 120, hi=600))
 
     # Phase 3

@@ -82,9 +82,43 @@ def test_requeue_orphaned_running(job_registry_temp):
     job_id = jr.create_job(user_id="u", filename="a", pdf_path="/tmp/a", config_json="{}")
     jr.update_job(job_id, status="running")
 
-    moved = jr.requeue_orphaned_running()
+    moved, poisoned = jr.requeue_orphaned_running()
     assert moved == 1
-    assert jr.get_job(job_id)["status"] == "queued"
+    assert poisoned == 0
+    job = jr.get_job(job_id)
+    assert job["status"] == "queued"
+    assert job["requeue_count"] == 1
+
+
+def test_requeue_poison_pill_guard(job_registry_temp):
+    """A job that has already been re-queued MAX_ORPHAN_REQUEUES times
+    (i.e. it keeps crashing the service) is failed, not re-queued again."""
+    jr = job_registry_temp
+    job_id = jr.create_job(user_id="u", filename="a", pdf_path="/tmp/a", config_json="{}")
+
+    for expected_count in (1, 2):
+        jr.update_job(job_id, status="running")
+        moved, poisoned = jr.requeue_orphaned_running()
+        assert (moved, poisoned) == (1, 0)
+        assert jr.get_job(job_id)["requeue_count"] == expected_count
+
+    jr.update_job(job_id, status="running")
+    moved, poisoned = jr.requeue_orphaned_running()
+    assert (moved, poisoned) == (0, 1)
+    job = jr.get_job(job_id)
+    assert job["status"] == "failed"
+    assert "crashed the server" in job["error_msg"]
+
+
+def test_list_failed_since(job_registry_temp):
+    jr = job_registry_temp
+    job_id = jr.create_job(user_id="u", filename="a", pdf_path="/tmp/a", config_json="{}")
+    import time as _time
+
+    now = int(_time.time())
+    jr.update_job(job_id, status="failed", completed_at=now)
+    assert [j["job_id"] for j in jr.list_failed_since(now - 1)] == [job_id]
+    assert jr.list_failed_since(now + 10) == []
 
 
 def test_save_and_load_results(job_registry_temp):
