@@ -498,8 +498,14 @@ app.add_middleware(
     allow_origin_regex=_cors_origin_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-User-Id"],
-    expose_headers=["Content-Disposition", "X-Page-Number", "X-Image-Source"],
+    # Range: the frontend downloads big artifacts in ranged chunks because
+    # some client-side security software kills large single responses
+    # mid-stream (2026-07-08: consistent cuts at ~14 MB).
+    allow_headers=["Authorization", "Content-Type", "X-User-Id", "Range"],
+    expose_headers=[
+        "Content-Disposition", "Content-Range", "Accept-Ranges",
+        "X-Page-Number", "X-Image-Source",
+    ],
 )
 
 

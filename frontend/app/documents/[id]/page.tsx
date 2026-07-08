@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useParams } from "next/navigation";
 import Link from "next/link";
 import { supabase } from "@/lib/supabase";
-import { apiFetch, apiJson, ApiError } from "@/lib/api";
+import { apiFetch, apiFetchBlob, apiJson, ApiError } from "@/lib/api";
 import {
   etaSeconds,
   formatEta,
@@ -257,6 +257,7 @@ export default function DocumentDetailPage() {
   // so each button shows its own state; still single-in-flight so we don't
   // fire several heavy exports at once.
   const [downloadingKind, setDownloadingKind] = useState<string | null>(null);
+  const [downloadPct, setDownloadPct] = useState<number | null>(null);
   const downloading = downloadingKind !== null;
   const [pagesSoFar, setPagesSoFar] = useState<PageRow[]>([]);
   const [measurementRefresh, setMeasurementRefresh] = useState(0);
@@ -494,11 +495,15 @@ export default function DocumentDetailPage() {
     if (!viewedJobId) return;
     if (downloadingKind) return; // one heavy export at a time
     setDownloadingKind(pathSegment);
+    setDownloadPct(null);
     try {
-      const resp = await apiFetch(
+      // Ranged-chunk download: survives client-side security software that
+      // kills large single responses mid-stream (see apiFetchBlob).
+      const { blob, response: resp } = await apiFetchBlob(
         `/api/jobs/${viewedJobId}/${pathSegment}`,
+        (received, total) =>
+          setDownloadPct(Math.round((received / total) * 100)),
       );
-      const blob = await resp.blob();
       // Honour Content-Disposition filename when present.
       const cd = resp.headers.get("Content-Disposition") || "";
       const m = /filename="?([^"]+)"?/.exec(cd);
@@ -539,6 +544,7 @@ export default function DocumentDetailPage() {
       }
     } finally {
       setDownloadingKind(null);
+      setDownloadPct(null);
     }
   }
 
@@ -736,7 +742,9 @@ export default function DocumentDetailPage() {
                     className="rounded bg-black text-white px-4 py-2 text-sm hover:bg-gray-800 disabled:opacity-60"
                   >
                     {downloadingKind === "highlighted-pdf"
-                      ? "Preparing…"
+                      ? downloadPct !== null
+                        ? `Downloading… ${downloadPct}%`
+                        : "Preparing…"
                       : "Download highlighted PDF"}
                   </button>
                   <div className="flex gap-1.5">
@@ -747,7 +755,9 @@ export default function DocumentDetailPage() {
                       title="Measurement lines with saved UMT edits when available"
                     >
                       {downloadingKind === "measurement-pdf"
-                        ? "Preparing…"
+                        ? downloadPct !== null
+                          ? `${downloadPct}%`
+                          : "Preparing…"
                         : "Measurement PDF"}
                     </button>
                     <button
