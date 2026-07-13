@@ -41,8 +41,10 @@ function sleep(ms: number) {
  */
 export async function apiFetch(
   path: string,
-  init: RequestInit = {},
+  init: RequestInit & { retryTransient?: boolean } = {},
 ): Promise<Response> {
+  const { retryTransient = true, ...fetchInit } = init;
+  init = fetchInit;
   const { data } = await supabase().auth.getSession();
   const token = data.session?.access_token;
 
@@ -53,7 +55,7 @@ export async function apiFetch(
 
   const url = path.startsWith("http") ? path : `${apiBase}${path}`;
   const method = (init.method ?? "GET").toUpperCase();
-  const canRetry = RETRY_METHODS.has(method);
+  const canRetry = retryTransient && RETRY_METHODS.has(method);
   const backoffsMs = canRetry ? [300, 800, 2000] : [];
 
   let lastResp: Response | null = null;
@@ -115,9 +117,14 @@ export async function apiFetchBlob(
   path: string,
   onProgress?: (receivedBytes: number, totalBytes: number) => void,
 ): Promise<{ blob: Blob; response: Response }> {
+  // retryTransient: false — a 504 here means a heavy server-side render
+  // (e.g. measurement PDF on a huge deck) hit the gateway timeout; the
+  // render is still burning CPU, and transparently re-firing it pins the
+  // server for another 10 minutes per retry. Surface it instead.
   const first = await apiFetch(path, {
     headers: { Range: `bytes=0-${DOWNLOAD_CHUNK_BYTES - 1}` },
     cache: "no-store",
+    retryTransient: false,
   });
   if (first.status !== 206) {
     return { blob: await first.blob(), response: first };
@@ -141,6 +148,7 @@ export async function apiFetchBlob(
         const resp = await apiFetch(path, {
           headers: { Range: `bytes=${received}-${end}` },
           cache: "no-store",
+          retryTransient: false,
         });
         if (resp.status !== 206) {
           throw new ApiError(

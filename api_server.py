@@ -1719,6 +1719,14 @@ def _auto_export_for_page(fp: dict) -> tuple[dict, dict, list]:
         }
 
     measurements = fp.get("measurements") or {}
+    # Honour the pipeline's decision to skip auto-measurement on this page
+    # (utils_ade/measure.py caps at MAX_FENCE_LINES=5000). The skipped result
+    # still carries the raw all_fence_lines list — 18k+ segments of dense
+    # hatch/site-plan noise on real decks — and exporting it made the
+    # measurement-PDF render chew >10 min and 504 (2026-07-13, 425-page GMP3
+    # set). Skipped pages contribute categories only, no lines.
+    if measurements.get("measurement_method") == "skipped":
+        return cats, {}, []
     all_lines = measurements.get("all_fence_lines") or []
     layer_to_cat = measurements.get("layer_to_category") or {}
     any_layer_mapped = bool(layer_to_cat)
