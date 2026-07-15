@@ -59,12 +59,16 @@ def test_keeps_only_drawable_fence_pages(src_pdf, tmp_path):
     }
     rc, out = _run_worker(task)
     assert rc == 0 and out["ok"] is True
+    assert out["kept_pages"] == 1
+    assert out["skipped_blank"] == 1
 
     doc = fitz.open(str(out_path))
-    assert doc.page_count == 1
+    # Page 0 is the legend page; the kept fence page follows it.
+    assert doc.page_count == 2
+    assert "Legend" in doc.load_page(0).get_text()
     # The kept page is original page 2, and the definition rect was drawn.
-    assert "page 2" in doc.load_page(0).get_text()
-    drawings = doc.load_page(0).get_drawings()
+    assert "page 2" in doc.load_page(1).get_text()
+    drawings = doc.load_page(1).get_drawings()
     greens = [
         d for d in drawings
         if d.get("color") and tuple(round(c, 1) for c in d["color"]) == (0.0, 0.9, 0.0)
@@ -91,7 +95,52 @@ def test_out_of_range_and_duplicate_indices_ignored(src_pdf, tmp_path):
     rc, out = _run_worker(task)
     assert rc == 0 and out["ok"] is True
     doc = fitz.open(str(out_path))
+    assert doc.page_count == 2  # legend + one kept page
+    doc.close()
+
+
+def test_legend_can_be_disabled(src_pdf, tmp_path):
+    out_path = tmp_path / "highlighted.pdf"
+    task = {
+        "pdf_path": str(src_pdf),
+        "out_path": str(out_path),
+        "legend": False,
+        "fence_pages": [
+            {"page_index_in_original_doc": 0,
+             "definitions": [{"x0": 10, "y0": 10, "x1": 100, "y1": 50}],
+             "instances": [], "keyword_matches": []},
+        ],
+    }
+    rc, out = _run_worker(task)
+    assert rc == 0 and out["ok"] is True
+    doc = fitz.open(str(out_path))
     assert doc.page_count == 1
+    doc.close()
+
+
+def test_measured_lines_page_kept_and_stamped(src_pdf, tmp_path):
+    """A page with no boxes but has_measured_lines=True must be kept
+    (not dropped as blank) and stamped with a pointer to the measurement
+    PDF — the 'Excel lists lines but the fence PDF skips the page' bug."""
+    out_path = tmp_path / "highlighted.pdf"
+    task = {
+        "pdf_path": str(src_pdf),
+        "out_path": str(out_path),
+        "fence_pages": [
+            {"page_index_in_original_doc": 1,
+             "definitions": [], "instances": [], "keyword_matches": [],
+             "has_measured_lines": True},
+        ],
+    }
+    rc, out = _run_worker(task)
+    assert rc == 0 and out["ok"] is True
+    assert out["kept_pages"] == 1
+    assert out["skipped_blank"] == 0
+
+    doc = fitz.open(str(out_path))
+    assert doc.page_count == 2  # legend + the stamped page
+    text = doc.load_page(1).get_text()
+    assert "Measured fence lines detected" in text
     doc.close()
 
 

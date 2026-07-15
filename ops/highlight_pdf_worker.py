@@ -50,6 +50,11 @@ import os
 import sys
 import time
 import traceback
+from pathlib import Path
+
+# Add project root to sys.path so `from exports import ...` resolves
+# regardless of where Python was invoked from.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def _emit(obj) -> None:
@@ -69,11 +74,18 @@ def _has_drawable(res) -> bool:
     LLM-misclassified page, or one whose extraction found no elements) would
     otherwise be inserted as blank pages in the "highlighted" PDF — the
     "selected but not highlighted" pages users were seeing.
+
+    A page whose only content is measured fence lines (has_measured_lines,
+    set by the pipeline) also counts: the lines themselves are drawn on the
+    measurement PDF, but dropping the page here made customers think Leo
+    missed it — it gets kept and stamped with a pointer instead.
     """
     for key in ("definitions", "instances", "keyword_matches"):
         for it in res.get(key) or []:
             if isinstance(it, dict) and all(k in it for k in ("x0", "y0", "x1", "y1")):
                 return True
+    if res.get("has_measured_lines"):
+        return True
     for ln in res.get("fence_lines") or []:
         if isinstance(ln, dict):
             s, e = ln.get("start"), ln.get("end")
@@ -241,6 +253,19 @@ def main() -> int:
                         (msx, msy), (mex, mey),
                         color=(0, 1, 1), width=3.0, overlay=True,
                     )
+
+                # Pages with measured lines get a pointer note instead of the
+                # line strokes themselves — drawing thousands of segments here
+                # is the cyan-flood/perf problem this worker deliberately
+                # avoids (see pipeline._generate_highlighted_pdf).
+                if res.get("has_measured_lines"):
+                    fs = min(18, max(8, page_out.rect.width / 220))
+                    note = ("Measured fence lines detected on this page — "
+                            "see the measurement PDF and Excel for line markings.")
+                    page_out.insert_text(
+                        (12, fs * 1.6), note, fontname="helv", fontsize=fs,
+                        color=(0.8, 0, 0), rotate=rotation, overlay=True,
+                    )
             except Exception as pg_e:
                 print(f"[highlight_pdf_worker] page {page_idx + 1} draw error: {pg_e}",
                       file=sys.stderr)
@@ -249,6 +274,34 @@ def main() -> int:
             raise RuntimeError("output PDF has 0 pages — nothing to write")
 
         input_doc.select(kept_indices)
+
+        # Legend page up front explaining what this artifact is (a detection
+        # overview, not the measurement drawing) and its color coding.
+        if task.get("legend", True):
+            try:
+                from exports import insert_legend_page
+                insert_legend_page(
+                    input_doc,
+                    title="Fence Detection Overview — Legend",
+                    source_name=task.get("uploaded_name") or "document.pdf",
+                    line_swatches=[],
+                    box_swatches=[
+                        ("Fence legend / definition callout", (0, 0.9, 0)),
+                        ("Fence instance", (0.9, 0, 0.9)),
+                        ("Fence keyword match", (1.0, 0.65, 0)),
+                    ],
+                    notes=[
+                        "This document is a detection overview: it shows the "
+                        "pages where fence-related content was found and boxes "
+                        "the evidence.",
+                        "Line measurements and lengths are NOT drawn here — "
+                        "they are in the measurement PDF and the Excel export, "
+                        "cross-referenced by the 'Line #' column.",
+                    ],
+                )
+            except Exception as lg_e:
+                print(f"[highlight_pdf_worker] legend page failed: {lg_e}",
+                      file=sys.stderr)
 
         # Atomic write so a crashed serialization can't leave a half
         # file the parent then mistakes for a complete result.
@@ -272,6 +325,8 @@ def main() -> int:
             "ok": True,
             "out_path": out_path,
             "size_bytes": size_bytes,
+            "kept_pages": len(kept_indices),
+            "skipped_blank": skipped_blank,
             "wall_s": round(time.perf_counter() - t0, 3),
             "error": None,
         })

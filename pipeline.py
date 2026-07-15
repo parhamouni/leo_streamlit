@@ -1159,15 +1159,24 @@ def _generate_highlighted_pdf(
                 pi = r.get("page_idx")
                 if pi is None:
                     continue
+                measurements = r.get("measurements") or {}
                 worker_pages.append({
                     "page_index_in_original_doc": pi,
                     "definitions": r.get("definitions") or [],
                     "instances": r.get("instances") or [],
                     "keyword_matches": r.get("keyword_matches") or [],
+                    # Lets the worker keep (and stamp) pages whose only fence
+                    # evidence is measured lines — without this they were
+                    # dropped as "blank" while the Excel listed their lines.
+                    "has_measured_lines": bool(
+                        measurements.get("all_fence_lines")
+                        and measurements.get("measurement_method") != "skipped"
+                    ),
                 })
             task = {
                 "pdf_path": pdf_path,
                 "out_path": out_path,
+                "uploaded_name": os.path.basename(pdf_path),
                 "fence_pages": worker_pages,
                 "highlight_fence_text": config.highlight_fence_text,
             }
@@ -1192,6 +1201,29 @@ def _generate_highlighted_pdf(
                 )
                 proc = None
             if proc is not None and proc.returncode == 0 and os.path.exists(out_path):
+                # Surface the worker's page accounting — without this,
+                # blank-skipped pages were invisible in the logs and
+                # "why is page X missing from the fence PDF?" tickets were
+                # undiagnosable after the fact.
+                try:
+                    payload = None
+                    for line in (proc.stdout or b"").decode(
+                            "utf-8", errors="replace").splitlines():
+                        try:
+                            payload = json.loads(line)
+                        except Exception:
+                            continue
+                    if isinstance(payload, dict) and payload.get("ok"):
+                        log.info(
+                            "Highlight worker ok: kept_pages=%s skipped_blank=%s "
+                            "size_bytes=%s wall_s=%s",
+                            payload.get("kept_pages"),
+                            payload.get("skipped_blank"),
+                            payload.get("size_bytes"),
+                            payload.get("wall_s"),
+                        )
+                except Exception:
+                    pass
                 try:
                     with open(out_path, "rb") as f:
                         return f.read()

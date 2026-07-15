@@ -64,7 +64,7 @@ def main() -> int:
         except Exception:
             pass
 
-        from exports import generate_measurement_pdf
+        from exports import MIN_LINE_PTS, generate_measurement_pdf
 
         out_path = task["out_path"]
 
@@ -75,6 +75,8 @@ def main() -> int:
             user_drawn_lines=task.get("user_drawn_lines") or {},
             page_categories=task.get("page_categories") or {},
             uploaded_pdf_name=task.get("uploaded_pdf_name") or "document.pdf",
+            min_line_pts=task.get("min_line_pts", MIN_LINE_PTS),
+            max_labels_per_page=task.get("max_labels_per_page", 150),
         )
         if not pdf_bytes:
             raise RuntimeError(

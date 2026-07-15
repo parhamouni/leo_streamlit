@@ -1335,7 +1335,14 @@ async def get_page_vector_lines(
 
     # Match pipeline auto fence lines → vector indices → category.
     measurements = (target or {}).get("measurements") or {}
-    all_fence_lines = measurements.get("all_fence_lines") or []
+    # Honour the pipeline's decision to skip auto-measurement on this page
+    # (MAX_FENCE_LINES cap — see _auto_export_for_page / commit 3cca2bb).
+    # Without this, opening the canvas on a skipped page seeds 18k+ noise
+    # assignments that autosave persists into umt_state, and the UMT export
+    # path re-creates the dense-page 504 the skip exists to prevent.
+    measurement_skipped = measurements.get("measurement_method") == "skipped"
+    all_fence_lines = [] if measurement_skipped else (
+        measurements.get("all_fence_lines") or [])
     layer_to_cat: dict[str, str] = measurements.get("layer_to_category") or {}
     any_layer_mapped = bool(layer_to_cat)
     FALLBACK_CAT = "Auto-detected"
@@ -1396,6 +1403,8 @@ async def get_page_vector_lines(
         "auto_categories": auto_categories,
         "auto_assignments": {} if source_missing else auto_assignments,
         "source_missing": source_missing,
+        "measurement_skipped": measurement_skipped,
+        "skip_reason": measurements.get("skip_reason") if measurement_skipped else None,
     }
 
 
@@ -1677,6 +1686,10 @@ _CATEGORY_PALETTE = [
     (255, 255, 0),   (0, 255, 255),  (255, 105, 180), (173, 255, 47),
 ]
 
+# Ceiling on lines exported from one page via saved UMT state — matches
+# MAX_FENCE_LINES in utils_ade/measure.py. See _umt_export_for_page.
+MAX_EXPORT_LINES_PER_PAGE = 5000
+
 
 def _scale_inches_to_points_per_foot(scale_inches: Any) -> float:
     """Convert architectural scale inches to PDF points per real foot.
@@ -1794,7 +1807,20 @@ def _umt_export_for_page(
 
     page_assignments: dict[str, str] = {}
     auto_lines: list[dict] = []
-    for idx_str, cat in (page_state.get("line_assignments") or {}).items():
+    saved_assignments = page_state.get("line_assignments") or {}
+    for idx_str, cat in saved_assignments.items():
+        # Cap what a single page can export. umt_state files saved before the
+        # page-vector-lines skipped-page guard can carry 18k+ noise
+        # assignments (dense hatch seeded on a measurement-skipped page);
+        # exporting them re-creates the dense-page 504 that commit 3cca2bb
+        # fixed on the auto path. 5000 matches MAX_FENCE_LINES in
+        # utils_ade/measure.py.
+        if len(auto_lines) >= MAX_EXPORT_LINES_PER_PAGE:
+            log.warning(
+                "UMT export: capping page assignments at %d (saved %d)",
+                MAX_EXPORT_LINES_PER_PAGE, len(saved_assignments),
+            )
+            break
         try:
             i = int(idx_str)
         except (TypeError, ValueError):
@@ -2077,6 +2103,8 @@ def _generate_measurement_pdf_in_subprocess(
     import tempfile
     import uuid
 
+    from exports import MIN_LINE_PTS
+
     if not _MEASUREMENT_PDF_WORKER.exists():
         raise RuntimeError(f"Measurement PDF worker missing: {_MEASUREMENT_PDF_WORKER}")
 
@@ -2091,6 +2119,8 @@ def _generate_measurement_pdf_in_subprocess(
         "user_drawn_lines": user_drawn_lines,
         "page_categories": page_categories,
         "uploaded_pdf_name": uploaded_pdf_name,
+        "min_line_pts": MIN_LINE_PTS,
+        "max_labels_per_page": 150,
     }
 
     try:
