@@ -200,33 +200,59 @@ export default function DashboardPage() {
     };
   }, [router]);
 
+  // Latest docs, readable from stable callbacks without re-creating them.
+  const docsRef = useRef<Document[] | null>(null);
+  docsRef.current = docs;
+
   const refresh = useCallback(async (silent = false) => {
     if (!silent) setInitialLoading(true);
-    const controller = new AbortController();
-    const timeout = window.setTimeout(
-      () => controller.abort(),
-      DOCUMENT_REFRESH_TIMEOUT_MS,
-    );
+    // One slow response must not paint a failure banner over a healthy
+    // dashboard. While heavy analyses run, /api/documents can occasionally
+    // exceed the timeout (busy DB/CPU on the server) — clients saw
+    // "Failed to load documents" mid-batch even though every job was fine.
+    // Interactive loads retry with backoff before surfacing an error;
+    // background polls just skip the tick and let the next one recover.
+    const attempts = silent ? 1 : 3;
     try {
-      const data = await apiJson<DocumentList>("/api/documents", {
-        signal: controller.signal,
-      });
-      setDocs(data.documents);
-      setError(null);
-    } catch (e) {
-      const msg =
-        e instanceof DOMException && e.name === "AbortError"
-          ? "The document list request timed out. The API may be busy or wedged; try refreshing again."
-          : e instanceof Error && e.name === "AbortError"
-            ? "The document list request timed out. The API may be busy or wedged; try refreshing again."
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        const controller = new AbortController();
+        const timeout = window.setTimeout(
+          () => controller.abort(),
+          DOCUMENT_REFRESH_TIMEOUT_MS,
+        );
+        try {
+          const data = await apiJson<DocumentList>("/api/documents", {
+            signal: controller.signal,
+          });
+          setDocs(data.documents);
+          setError(null);
+          return;
+        } catch (e) {
+          if (attempt < attempts) {
+            await new Promise((r) => setTimeout(r, 1500 * attempt));
+            continue;
+          }
+          // A background poll over an already-rendered list: keep showing
+          // the (slightly stale) list; the next poll refreshes it.
+          if (silent && docsRef.current) return;
+          const timedOut =
+            (e instanceof DOMException || e instanceof Error) &&
+            e.name === "AbortError";
+          const msg = timedOut
+            ? "The document list is taking longer than usual — the server " +
+              "is probably busy analysing documents. Your uploads are not " +
+              "affected; try again in a moment."
             : e instanceof ApiError
               ? `API ${e.status}: ${typeof e.body === "string" ? e.body : JSON.stringify(e.body)}`
               : e instanceof Error
                 ? e.message
                 : String(e);
-      setError(msg);
+          setError(msg);
+        } finally {
+          window.clearTimeout(timeout);
+        }
+      }
     } finally {
-      window.clearTimeout(timeout);
       if (!silent) setInitialLoading(false);
     }
   }, []);
@@ -239,9 +265,6 @@ export default function DashboardPage() {
 
   // Live polling — runs while any job is queued or running. Pauses when
   // the tab is hidden, resumes immediately when it becomes visible again.
-  const docsRef = useRef<Document[] | null>(null);
-  docsRef.current = docs;
-
   useEffect(() => {
     if (!authReady || !docs) return;
     const anyActive = docs.some(isActive);
