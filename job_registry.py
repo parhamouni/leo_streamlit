@@ -360,6 +360,61 @@ def cleanup_expired_jobs() -> int:
     return len(ids)
 
 
+def cleanup_orphaned_jobs(min_age_seconds: int = 3600) -> int:
+    """Remove completed-job rows whose on-disk results no longer exist.
+
+    Keeps the registry aligned with the filesystem: a completed job whose
+    results.json is gone (manual cleanup, incident surgery, a wiped volume)
+    can serve neither results nor downloads — every click on it dead-ends.
+    Dropping the row lets the frontend fall back to the Postgres-backed
+    reconstructed view, whose UI offers re-analyze / re-upload instead.
+
+    Only jobs completed more than min_age_seconds ago are considered, so a
+    job between "results being written" and "row updated" can't be swept.
+    Returns the number of rows deleted.
+    """
+    now = int(time.time())
+    db = _db()
+
+    with _lock:
+        rows = db.execute(
+            "SELECT job_id, results_dir FROM jobs "
+            "WHERE status = 'completed' AND completed_at < ?",
+            (now - min_age_seconds,),
+        ).fetchall()
+
+    orphans = [
+        (r["job_id"], r["results_dir"])
+        for r in rows
+        if not r["results_dir"]
+        or not (Path(r["results_dir"]) / "results.json").exists()
+    ]
+    if not orphans:
+        return 0
+
+    ids = [job_id for job_id, _ in orphans]
+    with _lock:
+        placeholders = ", ".join("?" for _ in ids)
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            db.execute(f"DELETE FROM jobs WHERE job_id IN ({placeholders})", ids)
+            db.execute("COMMIT")
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
+
+    # Clear any half-populated directory remnants (results.json gone but
+    # e.g. a stray progress.json or artifact left behind).
+    for _job_id, d in orphans:
+        if d:
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+
+    return len(ids)
+
+
 def write_progress(
     job_id: str,
     phase: str,

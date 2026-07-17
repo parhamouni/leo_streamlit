@@ -428,6 +428,15 @@ def _ttl_cleanup_loop():
                 log.info(f"TTL cleanup: removed {removed} expired jobs")
         except Exception as e:
             log.error(f"TTL cleanup failed: {e}")
+        try:
+            orphaned = job_registry.cleanup_orphaned_jobs()
+            if orphaned:
+                log.info(
+                    f"Orphan cleanup: removed {orphaned} jobs whose results "
+                    "are gone from disk"
+                )
+        except Exception as e:
+            log.error(f"Orphan cleanup failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +604,30 @@ async def create_job(
             log.exception("dedup lookup failed; falling through to fresh upload")
             existing = None
         if existing and existing.get("job_status") != "failed":
+            # Heal before bouncing. The document's source PDF lives in
+            # PDF_TMP_DIR (/tmp), which systemd-tmpfiles reaps at ~30d; once
+            # it's gone, measurement-pdf and re-analyze tell the user to
+            # "re-upload it" — but this dedup used to return the SAME broken
+            # document without ever writing the re-uploaded bytes to disk, an
+            # unrecoverable loop. The path is derived from the hash, so both
+            # the Postgres storage_path and any surviving SQLite job row
+            # point at exactly this location: restoring the bytes here fixes
+            # every reference at once, history included.
+            dedup_path = Path(cfg.PDF_TMP_DIR) / user_id / f"job_{pdf_hash[:16]}.pdf"
+            try:
+                if not dedup_path.exists():
+                    dedup_path.parent.mkdir(parents=True, exist_ok=True)
+                    dedup_path.write_bytes(pdf_bytes)
+                    log.info(
+                        "dedup: restored missing source PDF for document %s",
+                        existing["id"],
+                    )
+                else:
+                    # Refresh the tmpfiles age clock — a document the user
+                    # actively re-uploads shouldn't expire under them.
+                    os.utime(dedup_path)
+            except OSError:
+                log.exception("dedup: could not restore source PDF")
             return {
                 "job_id": existing.get("latest_job_id"),
                 "document_id": existing["id"],
