@@ -68,7 +68,13 @@ def main() -> int:
 
         out_path = task["out_path"]
 
-        pdf_bytes, _fname = generate_measurement_pdf(
+        # Stream the PDF to a sibling .tmp, then rename — atomic, so a
+        # killed/crashed serialization can't leave a half file the parent
+        # mistakes for a complete artifact. Saving to disk (instead of
+        # returning bytes) keeps the finished PDF out of this process's
+        # AND the parent's memory.
+        tmp_path = out_path + ".tmp"
+        generate_measurement_pdf(
             pdf_path=task["pdf_path"],
             fence_pages=task.get("fence_pages") or [],
             line_assignments=task.get("line_assignments") or {},
@@ -77,20 +83,13 @@ def main() -> int:
             uploaded_pdf_name=task.get("uploaded_pdf_name") or "document.pdf",
             min_line_pts=task.get("min_line_pts", MIN_LINE_PTS),
             max_labels_per_page=task.get("max_labels_per_page", 150),
+            out_path=tmp_path,
         )
-        if not pdf_bytes:
+        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
             raise RuntimeError(
-                "generate_measurement_pdf returned no bytes — source PDF "
+                "generate_measurement_pdf produced no output — source PDF "
                 "missing or no fence pages to render"
             )
-
-        # Atomic write so a crashed serialization can't leave a half
-        # file the parent then mistakes for a complete result.
-        tmp_path = out_path + ".tmp"
-        with open(tmp_path, "wb") as f:
-            f.write(pdf_bytes)
-            f.flush()
-            os.fsync(f.fileno())
         os.replace(tmp_path, out_path)
 
         _emit({

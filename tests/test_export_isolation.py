@@ -130,6 +130,21 @@ def skipped_export_job(job_registry_temp, tmp_path):
     return job_id
 
 
+def _poll_measurement_pdf(client, job_id, timeout_s=10.0):
+    """GET measurement-pdf until the background build resolves (non-202)."""
+    import time
+
+    deadline = time.time() + timeout_s
+    while True:
+        resp = client.get(
+            f"/api/jobs/{job_id}/measurement-pdf",
+            headers={"X-User-Id": USER_ID},
+        )
+        if resp.status_code != 202 or time.time() > deadline:
+            return resp
+        time.sleep(0.02)
+
+
 def test_measurement_excel_no_lines_returns_422(
     api_server_module, app_client, skipped_export_job
 ):
@@ -148,7 +163,6 @@ def test_measurement_pdf_no_lines_returns_422_without_subprocess(
 
     def fake_helper(**kwargs):
         calls.append(kwargs)
-        return b"%PDF should-not-run", "x.pdf"
 
     monkeypatch.setattr(
         api_server_module,
@@ -156,24 +170,21 @@ def test_measurement_pdf_no_lines_returns_422_without_subprocess(
         fake_helper,
     )
 
-    resp = app_client.get(
-        f"/api/jobs/{skipped_export_job}/measurement-pdf",
-        headers={"X-User-Id": USER_ID},
-    )
+    resp = _poll_measurement_pdf(app_client, skipped_export_job)
     assert resp.status_code == 422
     assert "No measurements to export" in resp.text
     # The expensive overlay subprocess must be short-circuited.
     assert calls == []
 
 
-def test_measurement_pdf_uses_subprocess_helper(
+def test_measurement_pdf_builds_artifact_via_subprocess_helper(
     api_server_module, app_client, completed_export_job, monkeypatch
 ):
     calls = []
 
     def fake_helper(**kwargs):
         calls.append(kwargs)
-        return b"%PDF isolated", "source_measurement.pdf"
+        Path(kwargs["out_path"]).write_bytes(b"%PDF isolated")
 
     monkeypatch.setattr(
         api_server_module,
@@ -181,14 +192,70 @@ def test_measurement_pdf_uses_subprocess_helper(
         fake_helper,
     )
 
-    resp = app_client.get(
+    first = app_client.get(
         f"/api/jobs/{completed_export_job}/measurement-pdf",
         headers={"X-User-Id": USER_ID},
     )
+    assert first.status_code == 202  # build started in the background
 
+    resp = _poll_measurement_pdf(app_client, completed_export_job)
     assert resp.status_code == 200
     assert resp.content == b"%PDF isolated"
+    assert "source_measurement.pdf" in resp.headers.get("content-disposition", "")
     assert len(calls) == 1
+
+    # Cached artifact: later downloads (and their ranged chunks) must not
+    # trigger a rebuild.
+    again = app_client.get(
+        f"/api/jobs/{completed_export_job}/measurement-pdf",
+        headers={"X-User-Id": USER_ID},
+    )
+    assert again.status_code == 200
+    assert len(calls) == 1
+
+
+def test_measurement_pdf_umt_edit_invalidates_cached_artifact(
+    api_server_module, app_client, completed_export_job, monkeypatch
+):
+    builds = []
+
+    def fake_helper(**kwargs):
+        builds.append(kwargs)
+        Path(kwargs["out_path"]).write_bytes(f"%PDF build {len(builds)}".encode())
+
+    monkeypatch.setattr(
+        api_server_module,
+        "_generate_measurement_pdf_in_subprocess",
+        fake_helper,
+    )
+    # With saved UMT edits the export state re-extracts vector lines via the
+    # vector worker; stub it — the fixture's source.pdf is a placeholder.
+    monkeypatch.setattr(
+        api_server_module,
+        "_extract_export_vector_lines",
+        lambda **_kw: {
+            0: [{"start": [0, 0], "end": [720, 0], "length_pts": 720, "layer": "FENCE"}]
+        },
+    )
+
+    resp = _poll_measurement_pdf(app_client, completed_export_job)
+    assert resp.status_code == 200
+    assert len(builds) == 1
+
+    put = app_client.put(
+        f"/api/jobs/{completed_export_job}/umt-state/1",
+        json={
+            "categories": {"Fence": {"keyword": "Fence", "color": [0, 255, 0]}},
+            "line_assignments": {"0": "Fence"},
+            "user_drawn_lines": [],
+        },
+        headers={"X-User-Id": USER_ID},
+    )
+    assert put.status_code == 200
+
+    resp = _poll_measurement_pdf(app_client, completed_export_job)
+    assert resp.status_code == 200
+    assert len(builds) == 2
 
 
 def test_measurement_pdf_timeout_returns_504_and_health_stays_available(
@@ -203,15 +270,20 @@ def test_measurement_pdf_timeout_returns_504_and_health_stays_available(
         fake_helper,
     )
 
-    resp = app_client.get(
-        f"/api/jobs/{completed_export_job}/measurement-pdf",
-        headers={"X-User-Id": USER_ID},
-    )
+    resp = _poll_measurement_pdf(app_client, completed_export_job)
     health = app_client.get("/api/healthz")
 
     assert resp.status_code == 504
     assert "measurement worker timeout" in resp.text
     assert health.status_code == 200
+
+    # The failure is surfaced once, then cleared — the next request must
+    # start a fresh build rather than replaying the stale error.
+    retry_first = app_client.get(
+        f"/api/jobs/{completed_export_job}/measurement-pdf",
+        headers={"X-User-Id": USER_ID},
+    )
+    assert retry_first.status_code == 202
 
 
 def test_measurement_pdf_worker_failure_returns_500(
@@ -226,29 +298,26 @@ def test_measurement_pdf_worker_failure_returns_500(
         fake_helper,
     )
 
-    resp = app_client.get(
-        f"/api/jobs/{completed_export_job}/measurement-pdf",
-        headers={"X-User-Id": USER_ID},
-    )
+    resp = _poll_measurement_pdf(app_client, completed_export_job)
 
     assert resp.status_code == 500
     assert "worker exploded" in resp.text
 
 
-def test_measurement_pdf_helper_removes_worker_output(
+def test_measurement_pdf_helper_leaves_artifact_at_out_path(
     api_server_module, tmp_path, monkeypatch
 ):
     worker = tmp_path / "measurement_pdf_worker.py"
     worker.write_text("# placeholder\n")
     monkeypatch.setattr(api_server_module, "_MEASUREMENT_PDF_WORKER", worker)
 
-    written_paths: list[Path] = []
-
     def fake_run(_cmd, *, input, **_kwargs):
         task = json.loads(input)
         out_path = Path(task["out_path"])
-        out_path.write_bytes(b"%PDF worker output")
-        written_paths.append(out_path)
+        # Mirror the real worker: atomic .tmp + rename.
+        tmp = Path(str(out_path) + ".tmp")
+        tmp.write_bytes(b"%PDF worker output")
+        tmp.rename(out_path)
         return SimpleNamespace(
             returncode=0,
             stdout=json.dumps({"ok": True, "out_path": str(out_path), "wall_s": 0.01}),
@@ -257,19 +326,19 @@ def test_measurement_pdf_helper_removes_worker_output(
 
     monkeypatch.setattr(api_server_module.subprocess, "run", fake_run)
 
-    pdf_bytes, fname = api_server_module._generate_measurement_pdf_in_subprocess(
+    artifact = tmp_path / "measurement.pdf"
+    api_server_module._generate_measurement_pdf_in_subprocess(
         pdf_path=str(tmp_path / "source.pdf"),
         fence_pages=[],
         line_assignments={},
         user_drawn_lines={},
         page_categories={},
         uploaded_pdf_name="source.pdf",
+        out_path=str(artifact),
     )
 
-    assert pdf_bytes == b"%PDF worker output"
-    assert fname == "source_measurement.pdf"
-    assert written_paths
-    assert all(not p.exists() for p in written_paths)
+    assert artifact.read_bytes() == b"%PDF worker output"
+    assert not Path(str(artifact) + ".tmp").exists()
 
 
 def test_export_state_with_umt_edits_uses_vector_worker(

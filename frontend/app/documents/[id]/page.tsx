@@ -499,11 +499,30 @@ export default function DocumentDetailPage() {
     try {
       // Ranged-chunk download: survives client-side security software that
       // kills large single responses mid-stream (see apiFetchBlob).
-      const { blob, response: resp } = await apiFetchBlob(
+      // A 202 means the server is building the artifact in the background
+      // (measurement PDF on big decks takes minutes — far longer than the
+      // gateway timeout allows a single request to hang). Poll until it
+      // flips to a real file; the button shows "Preparing…" meanwhile.
+      const buildDeadline = Date.now() + 35 * 60 * 1000;
+      let result = await apiFetchBlob(
         `/api/jobs/${viewedJobId}/${pathSegment}`,
         (received, total) =>
           setDownloadPct(Math.round((received / total) * 100)),
       );
+      while (result.response.status === 202) {
+        if (Date.now() > buildDeadline) {
+          throw new Error(
+            "the export is still being prepared — please try again later",
+          );
+        }
+        await new Promise((r) => setTimeout(r, 3000));
+        result = await apiFetchBlob(
+          `/api/jobs/${viewedJobId}/${pathSegment}`,
+          (received, total) =>
+            setDownloadPct(Math.round((received / total) * 100)),
+        );
+      }
+      const { blob, response: resp } = result;
       // Honour Content-Disposition filename when present.
       const cd = resp.headers.get("Content-Disposition") || "";
       const m = /filename="?([^"]+)"?/.exec(cd);

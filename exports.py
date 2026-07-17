@@ -197,6 +197,7 @@ def generate_measurement_pdf(
     uploaded_pdf_name: str = "document.pdf",
     min_line_pts: float = MIN_LINE_PTS,
     max_labels_per_page: int = 150,
+    out_path: str | None = None,
 ) -> tuple[bytes | None, str]:
     """Generate a PDF with measurement lines overlaid by category color.
 
@@ -206,31 +207,45 @@ def generate_measurement_pdf(
     Pages with more than max_labels_per_page lines get a corner note
     instead of per-line labels.
 
-    Returns (pdf_bytes, filename) or (None, filename) on failure.
+    Returns (pdf_bytes, filename), or (None, filename) on failure. When
+    out_path is given the PDF is streamed to that file instead and the
+    bytes element is always None — callers must check the file exists.
     """
-    input_doc = None
-    output_doc = None
+    doc = None
     try:
         if not pdf_path or not os.path.exists(pdf_path):
             return None, "measurements.pdf"
 
-        input_doc = fitz.open(pdf_path)
-        output_doc = fitz.open()
+        # Draw the overlays on the SOURCE doc, then select() down to the
+        # fence pages and serialize. The previous approach — insert_pdf once
+        # per page into a fresh doc — gave every insert its own dedup scope,
+        # so fonts/rasters shared across N source pages were copied N times:
+        # a 224-page civil set ballooned the export worker past 20 GB RSS and
+        # the garbage=4 compaction that duplication then required blew the
+        # 1800s worker timeout (2026-07-17; same class as the 2026-07-07
+        # highlight-worker incident, fixed the same way — see
+        # ops/highlight_pdf_worker.py). select() keeps pages in place sharing
+        # their resources.
+        doc = fitz.open(pdf_path)
 
         sorted_pages = sorted(fence_pages, key=lambda x: x.get("page_idx", x.get("page_index_in_original_doc", 0)))
 
+        kept_indices: list[int] = []
         rendered_page_keys: list[str] = []
         for res_data in sorted_pages:
             page_idx = res_data.get("page_idx", res_data.get("page_index_in_original_doc"))
             page_num = res_data.get("page_num", res_data.get("page_number"))
             if page_idx is None:
                 continue
+            if page_idx < 0 or page_idx >= doc.page_count or page_idx in kept_indices:
+                continue
 
             page_key = f"page_{page_num}"
             try:
-                output_doc.insert_pdf(input_doc, from_page=page_idx, to_page=page_idx)
+                page_out = doc.load_page(page_idx)
+                # Keep the page even if an individual draw below fails.
+                kept_indices.append(page_idx)
                 rendered_page_keys.append(page_key)
-                page_out = output_doc.load_page(len(output_doc) - 1)
 
                 rotation = page_out.rotation
                 mw = page_out.mediabox.width
@@ -244,6 +259,20 @@ def generate_measurement_pdf(
                     elif rotation == 270:
                         return mw - y1, x0, mw - y0, x1
                     return x0, y0, x1, y1
+
+                # Display → MediaBox for a single point. Line endpoints must
+                # map independently: the rect-style _rot above normalizes to
+                # (top-left, bottom-right) and so mis-pairs the y components
+                # of the two endpoints on 90°/270° pages (see the same pair
+                # of helpers in ops/highlight_pdf_worker.py).
+                def _rot_pt(x, y):
+                    if rotation == 90:
+                        return y, mh - x
+                    elif rotation == 180:
+                        return mw - x, mh - y
+                    elif rotation == 270:
+                        return mw - y, x
+                    return x, y
 
                 # Draw everything into ONE shape committed once per page.
                 # page.draw_line/draw_rect/draw_circle each create *and commit*
@@ -299,7 +328,8 @@ def generate_measurement_pdf(
                 user_pts_by_color: dict[tuple, list] = {}
                 for nl in numbered:
                     color = _cat_color(nl.category)
-                    ax0, ay0, ax1, ay1 = _rot(*nl.start, *nl.end)
+                    ax0, ay0 = _rot_pt(*nl.start)
+                    ax1, ay1 = _rot_pt(*nl.end)
                     segs_by_color.setdefault(color, []).append(((ax0, ay0), (ax1, ay1)))
                     if nl.source == "user":
                         user_pts_by_color.setdefault(color, []).extend(
@@ -321,7 +351,8 @@ def generate_measurement_pdf(
                     halos = []
                     texts = []
                     for nl in numbered:
-                        ax0, ay0, ax1, ay1 = _rot(*nl.start, *nl.end)
+                        ax0, ay0 = _rot_pt(*nl.start)
+                        ax1, ay1 = _rot_pt(*nl.end)
                         mx, my = (ax0 + ax1) / 2, (ay0 + ay1) / 2
                         dx, dy = ax1 - ax0, ay1 - ay0
                         seg_len = (dx * dx + dy * dy) ** 0.5 or 1.0
@@ -358,6 +389,8 @@ def generate_measurement_pdf(
             except Exception as e:
                 log.warning(f"Measurement PDF page {page_idx}: {e}")
 
+        doc.select(kept_indices)
+
         # Legend page up front so the color coding and Line # cross-reference
         # are explained inside the document itself.
         try:
@@ -372,7 +405,7 @@ def generate_measurement_pdf(
                     seen.add((cat_name, rgb))
                     line_swatches.append((cat_name, rgb))
             insert_legend_page(
-                output_doc,
+                doc,
                 title="Fence Measurements — Legend",
                 source_name=uploaded_pdf_name or "document.pdf",
                 line_swatches=line_swatches,
@@ -397,16 +430,18 @@ def generate_measurement_pdf(
         base, ext = os.path.splitext(uploaded_pdf_name or "document.pdf")
         fname = f"{base}_measurements{ext}"
 
+        # garbage=3 (drop objects orphaned by select, merge duplicates) is
+        # enough here: unlike insert_pdf, select() never duplicates shared
+        # resources, so the stream-level garbage=4 dedup the old approach
+        # depended on buys nothing and dominated wall time on image-heavy
+        # decks. save(out_path) additionally streams to disk instead of
+        # building the whole file in memory like tobytes().
+        if out_path:
+            doc.save(out_path, garbage=3, deflate=True)
+            return None, fname
+
         try:
-            # garbage=4 (full cross-object compaction), not garbage=2. The
-            # page loop calls insert_pdf once per page, and each insert has its
-            # own dedup scope — so a raster/font/XObject shared across N source
-            # pages is copied N times. garbage=2 only cleans within a stream and
-            # leaves those duplicates, ballooning image-heavy CAD decks to
-            # multiple GB (one 50-page report serialized to 6.8 GB, undownloadable
-            # in the browser). garbage=4 collapses the duplicate objects back to
-            # one, cutting size by up to Nx.
-            pdf_bytes = output_doc.tobytes(garbage=4, deflate=True)
+            pdf_bytes = doc.tobytes(garbage=3, deflate=True)
         except Exception:
             pdf_bytes = None
 
@@ -416,10 +451,8 @@ def generate_measurement_pdf(
         log.warning(f"Measurement PDF generation failed: {e}")
         return None, "measurements.pdf"
     finally:
-        if input_doc:
-            input_doc.close()
-        if output_doc:
-            output_doc.close()
+        if doc:
+            doc.close()
 
 
 def _lookup_element_details(category: str, element_details: dict) -> dict:

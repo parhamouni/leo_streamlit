@@ -2093,24 +2093,24 @@ def _generate_measurement_pdf_in_subprocess(
     user_drawn_lines: dict,
     page_categories: dict,
     uploaded_pdf_name: str,
-) -> tuple[bytes, str]:
-    """Run measurement-PDF generation outside uvicorn.
+    out_path: str,
+) -> None:
+    """Run measurement-PDF generation outside uvicorn, writing to out_path.
 
     PyMuPDF can enter unbounded C-level loops on malformed content streams.
     If that happens in the API process, even `/api/healthz` stops responding.
     The worker process gives us an OS-level kill switch.
-    """
-    import tempfile
-    import uuid
 
+    The worker writes the finished PDF to out_path atomically (.tmp +
+    rename), so out_path either doesn't exist or is complete — the bytes
+    never pass through this process's memory (a 224-page deck produces a
+    100+ MB artifact).
+    """
     from exports import MIN_LINE_PTS
 
     if not _MEASUREMENT_PDF_WORKER.exists():
         raise RuntimeError(f"Measurement PDF worker missing: {_MEASUREMENT_PDF_WORKER}")
 
-    base = (uploaded_pdf_name or "document.pdf").rsplit(".", 1)[0]
-    fname = f"{base}_measurement.pdf"
-    out_path = str(Path(tempfile.gettempdir()) / f"measurement_{uuid.uuid4().hex}.pdf")
     task = {
         "pdf_path": pdf_path,
         "out_path": out_path,
@@ -2132,8 +2132,9 @@ def _generate_measurement_pdf_in_subprocess(
             timeout=cfg.HIGHLIGHT_PDF_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
+        # Only the .tmp can be partial — the rename to out_path is atomic,
+        # so if the worker got that far the artifact is complete and kept.
         try:
-            Path(out_path).unlink(missing_ok=True)
             Path(out_path + ".tmp").unlink(missing_ok=True)
         except Exception:
             pass
@@ -2153,25 +2154,14 @@ def _generate_measurement_pdf_in_subprocess(
         if not err:
             err = (proc.stderr or "measurement worker failed").strip()[:500]
         try:
-            Path(out_path).unlink(missing_ok=True)
             Path(out_path + ".tmp").unlink(missing_ok=True)
         except Exception:
             pass
         raise RuntimeError(err)
 
-    worker_out = Path(str(payload.get("out_path") or out_path))
-    try:
-        pdf_bytes = worker_out.read_bytes()
-    finally:
-        try:
-            worker_out.unlink(missing_ok=True)
-            Path(str(worker_out) + ".tmp").unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    if not pdf_bytes:
-        raise RuntimeError("Measurement PDF worker returned an empty file")
-    return pdf_bytes, fname
+    out = Path(out_path)
+    if not out.exists() or out.stat().st_size == 0:
+        raise RuntimeError("Measurement PDF worker produced no output file")
 
 
 # Returned (as HTTP 422, not 500) when a document has no fence lines to
@@ -2185,6 +2175,130 @@ NO_MEASUREMENTS_MSG = (
 )
 
 
+# Measurement-PDF builds run in a background thread and land as an on-disk
+# artifact (<results_dir>/measurement.pdf) served via FileResponse. The old
+# build-inside-the-GET design could not work for big decks: nginx cuts the
+# connection at proxy_read_timeout (600s) while the build legitimately runs
+# longer, the browser surfaced "Failed to fetch", and every retry spawned
+# another full rebuild (2026-07-17: a 224-page set left two orphaned ~20 GB
+# workers building PDFs nobody could receive). Now the GET returns 202 while
+# a build is running, the frontend polls, and the finished artifact is served
+# in ranged chunks and cached for later clicks.
+#
+# job_id -> {"status": "building", "stale": bool}
+#         | {"status": "failed", "code": int, "detail": str}
+# The dict is process-local, which is safe because uvicorn runs one worker.
+_measurement_builds: dict[str, dict] = {}
+_measurement_builds_lock = threading.Lock()
+
+
+def _measurement_pdf_artifact(job: dict) -> Path | None:
+    """Where this job's measurement-PDF artifact lives (may not exist yet)."""
+    if not job.get("results_dir"):
+        return None
+    return Path(job["results_dir"]) / "measurement.pdf"
+
+
+def invalidate_measurement_pdf(job_id: str) -> None:
+    """Drop the cached measurement-PDF artifact after a UMT edit.
+
+    If a build is currently running it is marked stale instead — its output
+    would bake in the pre-edit line set, so the builder discards it on
+    completion and the next poll starts a fresh build.
+    """
+    with _measurement_builds_lock:
+        state = _measurement_builds.get(job_id)
+        if state and state.get("status") == "building":
+            state["stale"] = True
+        else:
+            _measurement_builds.pop(job_id, None)
+    job = job_registry.get_job(job_id)
+    artifact = _measurement_pdf_artifact(job) if job else None
+    if artifact is not None:
+        try:
+            artifact.unlink(missing_ok=True)
+        except OSError as e:
+            log.warning("measurement-pdf invalidate failed job=%s: %s", job_id[:8], e)
+
+
+def _measurement_pdf_build(
+    job_id: str,
+    results: dict,
+    pdf_path: str,
+    uploaded_name: str,
+    artifact: Path,
+) -> None:
+    """Build the measurement-PDF artifact (runs on a daemon thread)."""
+    code, detail = 500, "Measurement PDF generation failed"
+    try:
+        fence_pages_out, line_assignments, user_drawn, page_cats, _scale, _lines = (
+            _build_export_state(job_id, results, pdf_path)
+        )
+        # No auto-detected or user-drawn lines anywhere → nothing to overlay.
+        # Short-circuit before the subprocess, which would otherwise spend
+        # minutes re-rendering dense pages just to produce a blank overlay.
+        if not line_assignments and not user_drawn:
+            log.info("measurement-pdf no-lines job=%s", job_id[:8])
+            code, detail = 422, NO_MEASUREMENTS_MSG
+            raise _MeasurementBuildFailed()
+        _generate_measurement_pdf_in_subprocess(
+            pdf_path=pdf_path,
+            fence_pages=fence_pages_out,
+            line_assignments=line_assignments,
+            user_drawn_lines=user_drawn,
+            page_categories=page_cats,
+            uploaded_pdf_name=uploaded_name,
+            out_path=str(artifact),
+        )
+    except _MeasurementBuildFailed:
+        pass
+    except ExportWorkerTimeout as e:
+        log.warning("measurement-pdf vector timeout job=%s: %s", job_id[:8], e)
+        code, detail = 504, str(e)
+    except ExportWorkerError as e:
+        log.warning("measurement-pdf vector failed job=%s: %s", job_id[:8], e)
+        code, detail = 500, f"Measurement PDF export state failed: {e}"
+    except TimeoutError as e:
+        log.warning("measurement-pdf timed out job=%s: %s", job_id[:8], e)
+        code, detail = 504, str(e)
+    except Exception as e:
+        log.warning("measurement-pdf failed job=%s: %s", job_id[:8], e)
+        code, detail = 500, f"Measurement PDF generation failed: {e}"
+    else:
+        with _measurement_builds_lock:
+            state = _measurement_builds.pop(job_id, None)
+            stale = bool(state and state.get("stale"))
+        if stale:
+            # A UMT edit landed mid-build; this output no longer matches.
+            try:
+                artifact.unlink(missing_ok=True)
+            except OSError:
+                pass
+            log.info("measurement-pdf stale discard job=%s", job_id[:8])
+        else:
+            log.info(
+                "measurement-pdf done job=%s bytes=%d",
+                job_id[:8],
+                artifact.stat().st_size if artifact.exists() else 0,
+            )
+        return
+
+    # Failure path: keep the error for the next poll to surface — unless the
+    # state went stale, in which case just clear so the next poll rebuilds.
+    with _measurement_builds_lock:
+        state = _measurement_builds.get(job_id)
+        if state and state.get("stale"):
+            _measurement_builds.pop(job_id, None)
+        else:
+            _measurement_builds[job_id] = {
+                "status": "failed", "code": code, "detail": detail,
+            }
+
+
+class _MeasurementBuildFailed(Exception):
+    """Internal: jump to the failure path with code/detail already set."""
+
+
 @app.get("/api/jobs/{job_id}/measurement-pdf")
 async def get_measurement_pdf(
     job_id: str,
@@ -2192,22 +2306,43 @@ async def get_measurement_pdf(
 ):
     """Measurement-overlay PDF (Sprint 3 / C5).
 
-    Wraps `exports.generate_measurement_pdf`. Until UMT (Sprint 4) ships,
-    this only contains auto-detected lines pre-assigned via the layer →
-    category map. User edits are not yet captured."""
+    Serves the cached artifact when present (FileResponse → ranged chunks
+    work). Otherwise starts a background build and answers 202; the client
+    polls until the artifact is ready or the build records a failure."""
     job = job_registry.get_job(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
     if job["user_id"] != user_id:
         raise HTTPException(403, "Access denied")
 
+    artifact = _measurement_pdf_artifact(job)
+    if artifact is not None and artifact.exists():
+        base = (job.get("filename") or "document.pdf").rsplit(".", 1)[0]
+        return FileResponse(
+            str(artifact),
+            media_type="application/pdf",
+            filename=f"{base}_measurement.pdf",
+            headers={"Cache-Control": "private, no-store"},
+        )
+
+    with _measurement_builds_lock:
+        state = _measurement_builds.get(job_id)
+        if state and state["status"] == "building":
+            return JSONResponse(
+                {"status": "building", "detail": "Measurement PDF is being prepared"},
+                status_code=202,
+            )
+        if state and state["status"] == "failed":
+            # Surface once, then clear so the next request retries the build.
+            _measurement_builds.pop(job_id, None)
+            raise HTTPException(state["code"], state["detail"])
+
     # PDF generation overlays measurement lines on top of the page's
     # native vector content. If the original PDF is gone we can't
-    # cleanly fall back to the highlighted PDF — `insert_pdf` would
-    # carry the cyan fence overlays into the output and the resulting
-    # doubly-decorated, deflate-compressed PDF takes minutes on dense
-    # pages. Ask the user to re-upload instead. (Excel works either
-    # way — it only consumes coords, not the visual content.)
+    # cleanly fall back to the highlighted PDF — it would carry the cyan
+    # fence overlays into the output. Ask the user to re-upload instead.
+    # (Excel works either way — it only consumes coords, not the visual
+    # content.)
     pdf_path = job.get("pdf_path")
     if not pdf_path or not Path(pdf_path).exists():
         raise HTTPException(
@@ -2221,58 +2356,29 @@ async def get_measurement_pdf(
     if results is None:
         raise HTTPException(404, "Results not available — job may still be running")
 
-    log.info("measurement-pdf start job=%s", job_id[:8])
-    try:
-        fence_pages_out, line_assignments, user_drawn, page_cats, _scale, _lines = (
-            await asyncio.to_thread(_build_export_state, job_id, results, pdf_path)
-        )
-    except ExportWorkerTimeout as e:
-        log.warning("measurement-pdf vector timeout job=%s: %s", job_id[:8], e)
-        raise HTTPException(504, str(e))
-    except ExportWorkerError as e:
-        log.warning("measurement-pdf vector failed job=%s: %s", job_id[:8], e)
-        raise HTTPException(500, f"Measurement PDF export state failed: {e}")
+    if artifact is None:
+        raise HTTPException(500, "Job has no results directory for the artifact")
 
-    # No auto-detected or user-drawn lines anywhere → nothing to overlay.
-    # Short-circuit before the subprocess, which would otherwise spend
-    # minutes re-rendering dense pages just to produce a blank overlay.
-    if not line_assignments and not user_drawn:
-        log.info("measurement-pdf no-lines job=%s", job_id[:8])
-        raise HTTPException(422, NO_MEASUREMENTS_MSG)
+    with _measurement_builds_lock:
+        # Re-check under the lock — another request may have won the race.
+        if _measurement_builds.get(job_id, {}).get("status") == "building":
+            return JSONResponse(
+                {"status": "building", "detail": "Measurement PDF is being prepared"},
+                status_code=202,
+            )
+        _measurement_builds[job_id] = {"status": "building", "stale": False}
 
-    try:
-        pdf_bytes, fname = await asyncio.to_thread(
-            _generate_measurement_pdf_in_subprocess,
-            pdf_path=pdf_path,
-            fence_pages=fence_pages_out,
-            line_assignments=line_assignments,
-            user_drawn_lines=user_drawn,
-            page_categories=page_cats,
-            uploaded_pdf_name=job.get("filename") or "document.pdf",
-        )
-    except TimeoutError as e:
-        log.warning("Measurement PDF timed out for job %s: %s", job_id[:8], e)
-        raise HTTPException(504, str(e))
-    except Exception as e:
-        log.warning("Measurement PDF failed for job %s: %s", job_id[:8], e)
-        raise HTTPException(500, f"Measurement PDF generation failed: {e}")
-
-    if not pdf_bytes:
-        raise HTTPException(500, "Measurement PDF generation returned no bytes")
-
-    log.info(
-        "measurement-pdf done job=%s pages=%d bytes=%d",
-        job_id[:8],
-        len(fence_pages_out),
-        len(pdf_bytes),
-    )
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'attachment; filename="{fname}"',
-            "Cache-Control": "private, no-store",
-        },
+    log.info("measurement-pdf build start job=%s", job_id[:8])
+    threading.Thread(
+        target=_measurement_pdf_build,
+        args=(job_id, results, pdf_path,
+              job.get("filename") or "document.pdf", artifact),
+        name=f"measurement-pdf-{job_id[:8]}",
+        daemon=True,
+    ).start()
+    return JSONResponse(
+        {"status": "building", "detail": "Measurement PDF is being prepared"},
+        status_code=202,
     )
 
 
@@ -2626,6 +2732,9 @@ async def put_umt_page_state(
         raise HTTPException(400, str(e))
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
+    # Edits change the exported line set — the cached measurement PDF (and
+    # its Line # labels, which must stay in sync with the Excel) is stale.
+    invalidate_measurement_pdf(job_id)
     return full
 
 
@@ -2638,7 +2747,9 @@ async def delete_umt_page_state(
     """Clear UMT edits for one page (used by the 'Clear auto' button)."""
     _job_for_user(job_id, user_id)
     from backend.app import umt_state
-    return umt_state.delete_page(job_id, page_num)
+    full = umt_state.delete_page(job_id, page_num)
+    invalidate_measurement_pdf(job_id)
+    return full
 
 
 @app.get("/api/jobs/{job_id}/progress")
@@ -2732,6 +2843,8 @@ async def delete_job(
         except Exception:
             pass
     job_registry.delete_job(job_id)
+    with _measurement_builds_lock:
+        _measurement_builds.pop(job_id, None)
 
     # Also remove the Postgres document row (cascades to its jobs row,
     # page_results, artifacts via FK ON DELETE CASCADE). Skip silently
