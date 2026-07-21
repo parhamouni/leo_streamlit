@@ -2106,6 +2106,12 @@ def _build_export_state(
 
         fp_out = dict(fp)
         fp_out["auto_lines"] = auto_lines
+        # Surface the dense-page skip as top-level fields so exports.py can
+        # annotate the page without depending on the pipeline's nested schema.
+        meas = fp.get("measurements") or {}
+        if meas.get("measurement_method") == "skipped":
+            fp_out["measurement_skipped"] = True
+            fp_out["skip_reason"] = meas.get("skip_reason")
         fence_pages_out.append(fp_out)
 
     return (
@@ -2209,7 +2215,7 @@ NO_MEASUREMENTS_MSG = (
 
 
 # Measurement-PDF builds run in a background thread and land as an on-disk
-# artifact (<results_dir>/measurement.pdf) served via FileResponse. The old
+# artifact (<results_dir>/measurement_v{N}.pdf) served via FileResponse. The old
 # build-inside-the-GET design could not work for big decks: nginx cuts the
 # connection at proxy_read_timeout (600s) while the build legitimately runs
 # longer, the browser surfaced "Failed to fetch", and every retry spawned
@@ -2225,11 +2231,16 @@ _measurement_builds: dict[str, dict] = {}
 _measurement_builds_lock = threading.Lock()
 
 
+# Bump when generate_measurement_pdf's output changes (stamps, notes, …):
+# the artifact path is the cache key, so old builds must miss, not serve.
+_MEASUREMENT_PDF_VERSION = 2
+
+
 def _measurement_pdf_artifact(job: dict) -> Path | None:
     """Where this job's measurement-PDF artifact lives (may not exist yet)."""
     if not job.get("results_dir"):
         return None
-    return Path(job["results_dir"]) / "measurement.pdf"
+    return Path(job["results_dir"]) / f"measurement_v{_MEASUREMENT_PDF_VERSION}.pdf"
 
 
 def invalidate_measurement_pdf(job_id: str) -> None:
@@ -2263,6 +2274,13 @@ def _measurement_pdf_build(
 ) -> None:
     """Build the measurement-PDF artifact (runs on a daemon thread)."""
     code, detail = 500, "Measurement PDF generation failed"
+    # Drop artifacts from older generator versions so they don't accumulate.
+    try:
+        for stale in artifact.parent.glob("measurement*.pdf"):
+            if stale.name != artifact.name:
+                stale.unlink(missing_ok=True)
+    except OSError:
+        pass
     try:
         fence_pages_out, line_assignments, user_drawn, page_cats, _scale, _lines = (
             _build_export_state(job_id, results, pdf_path)

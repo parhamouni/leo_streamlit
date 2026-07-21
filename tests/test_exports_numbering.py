@@ -180,7 +180,11 @@ def test_pdf_density_cap_replaces_labels_with_note(export_inputs):
     text = doc.load_page(1).get_text()
     assert "labels omitted" in text
     words = {w[4] for w in doc.load_page(1).get_text("words")}
-    assert "1" not in words  # per-line labels suppressed
+    # Per-line labels suppressed. "1" appears in the "Page 1 of 1" stamp
+    # and "3" in the note's line count, so "2" is the only number that
+    # could only come from a per-line label.
+    assert "2" not in words
+    assert "Page 1 of 1" in text
     doc.close()
 
 
@@ -196,6 +200,7 @@ def test_pdf_labels_on_rotated_page(tmp_path, export_inputs):
     out = _render_pdf(export_inputs)
     words = {w[4] for w in out.load_page(1).get_text("words")}
     assert {"1", "2", "3"} <= words
+    assert "Page 1 of 1" in out.load_page(1).get_text()
     out.close()
 
 
@@ -204,4 +209,74 @@ def test_legend_page_lists_categories(export_inputs):
     text = doc.load_page(0).get_text()
     assert "Chain Link" in text and "Wood Fence" in text
     assert "Line #" in text
+    # Note text wraps in extraction, so match fragments that fit one line.
+    assert "original page" in text
+    assert "no measured lines" in text
+    doc.close()
+
+
+# ------------------------------------------------- page stamps & bookmarks
+
+def test_page_stamp_uses_original_page_number(tmp_path, export_inputs):
+    """Fence page 2 of a 3-page doc must be stamped 'Page 2 of 3' even
+    though it lands at physical position 2 (after the legend page)."""
+    doc = fitz.open()
+    for _ in range(3):
+        doc.new_page(width=612, height=792)
+    pdf_path = tmp_path / "three.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    export_inputs["pdf_path"] = str(pdf_path)
+    export_inputs["fence_pages"][0]["page_idx"] = 1
+    export_inputs["fence_pages"][0]["page_num"] = 2
+
+    out = _render_pdf(export_inputs)
+    assert out.page_count == 2  # legend + the one fence page
+    assert "Page 2 of 3" in out.load_page(1).get_text()
+    out.close()
+
+
+def test_bookmarks_list_original_page_numbers(tmp_path, export_inputs):
+    doc = fitz.open()
+    for _ in range(3):
+        doc.new_page(width=612, height=792)
+    pdf_path = tmp_path / "three.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    export_inputs["pdf_path"] = str(pdf_path)
+    export_inputs["fence_pages"][0]["page_idx"] = 1
+    export_inputs["fence_pages"][0]["page_num"] = 2
+
+    out = _render_pdf(export_inputs)
+    toc = out.get_toc()
+    assert toc == [[1, "Legend", 1], [1, "Page 2", 2]]
+    out.close()
+
+
+# ------------------------------------------------- zero-line page notes
+
+def test_no_lines_note_on_page_without_measurements(export_inputs):
+    export_inputs["line_assignments"] = {}
+    export_inputs["user_drawn_lines"] = {}
+    doc = _render_pdf(export_inputs)
+    text = doc.load_page(1).get_text()
+    assert "No measured lines on this page" in text
+    doc.close()
+
+
+@pytest.mark.parametrize("shape", ["top_level", "nested"])
+def test_skipped_page_note(export_inputs, shape):
+    fp = export_inputs["fence_pages"][0]
+    fp["auto_lines"] = []
+    if shape == "top_level":
+        fp["measurement_skipped"] = True
+        fp["skip_reason"] = "Page has 24000 fence-layer lines (limit: 5000)"
+    else:
+        fp["measurements"] = {"measurement_method": "skipped",
+                              "skip_reason": "too dense"}
+    export_inputs["line_assignments"] = {}
+    export_inputs["user_drawn_lines"] = {}
+    doc = _render_pdf(export_inputs)
+    text = doc.load_page(1).get_text()
+    assert "Automatic measurement was skipped" in text
     doc.close()

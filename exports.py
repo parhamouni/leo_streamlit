@@ -227,11 +227,15 @@ def generate_measurement_pdf(
         # ops/highlight_pdf_worker.py). select() keeps pages in place sharing
         # their resources.
         doc = fitz.open(pdf_path)
+        # Read before select() strips the non-fence pages: the stamp says
+        # "Page N of M" in the ORIGINAL document's numbering.
+        total_pages = doc.page_count
 
         sorted_pages = sorted(fence_pages, key=lambda x: x.get("page_idx", x.get("page_index_in_original_doc", 0)))
 
         kept_indices: list[int] = []
         rendered_page_keys: list[str] = []
+        rendered_page_nums: list[int] = []
         for res_data in sorted_pages:
             page_idx = res_data.get("page_idx", res_data.get("page_index_in_original_doc"))
             page_num = res_data.get("page_num", res_data.get("page_number"))
@@ -241,11 +245,13 @@ def generate_measurement_pdf(
                 continue
 
             page_key = f"page_{page_num}"
+            stamp_num = page_num if page_num is not None else page_idx + 1
             try:
                 page_out = doc.load_page(page_idx)
                 # Keep the page even if an individual draw below fails.
                 kept_indices.append(page_idx)
                 rendered_page_keys.append(page_key)
+                rendered_page_nums.append(stamp_num)
 
                 rotation = page_out.rotation
                 mw = page_out.mediabox.width
@@ -383,6 +389,46 @@ def generate_measurement_pdf(
                     shape.finish(color=None, fill=(1, 1, 1), fill_opacity=0.85)
                     shape.insert_text((nx, ny), note, fontsize=fs,
                                       color=(0.8, 0, 0), rotate=rotation)
+                else:
+                    # Zero measured lines. Say why, so the page doesn't read
+                    # as a silent failure: either the dense-page skip guard
+                    # fired, or nothing >= min_line_pts was assigned.
+                    skipped = bool(res_data.get("measurement_skipped")) or (
+                        (res_data.get("measurements") or {}).get(
+                            "measurement_method") == "skipped")
+                    if skipped:
+                        note = ("Automatic measurement was skipped on this "
+                                "page (too many vector lines) — open it in "
+                                "the canvas to measure manually.")
+                        note_color = (0.8, 0, 0)
+                    else:
+                        note = (f"No measured lines on this page — fence "
+                                f"content was detected but no lines of at "
+                                f"least {min_line_pts:g} pt were assigned.")
+                        note_color = (0.25, 0.25, 0.25)
+                    tw = fitz.get_text_length(note, fontname="helv", fontsize=fs)
+                    nx, ny = 12, fs * 1.6
+                    shape.draw_rect(fitz.Rect(nx - 4, ny - fs * 1.1,
+                                              nx + tw + 4, ny + fs * 0.45))
+                    shape.finish(color=None, fill=(1, 1, 1), fill_opacity=0.85)
+                    shape.insert_text((nx, ny), note, fontsize=fs,
+                                      color=note_color, rotate=rotation)
+
+                # Original-document page number, top-right: the Excel "Page"
+                # column and the canvas use this number, while this PDF's
+                # physical order doesn't (legend page + fence pages only).
+                stamp = f"Page {stamp_num} of {total_pages}"
+                disp_w = mh if rotation in (90, 270) else mw
+                tw = fitz.get_text_length(stamp, fontname="helv", fontsize=fs)
+                sx, sy = disp_w - tw - 12, fs * 1.6
+                r0 = _rot_pt(sx - 4, sy - fs * 1.1)
+                r1 = _rot_pt(sx + tw + 4, sy + fs * 0.45)
+                halo = fitz.Rect(min(r0[0], r1[0]), min(r0[1], r1[1]),
+                                 max(r0[0], r1[0]), max(r0[1], r1[1]))
+                shape.draw_rect(halo)
+                shape.finish(color=None, fill=(1, 1, 1), fill_opacity=0.85)
+                shape.insert_text(_rot_pt(sx, sy), stamp, fontsize=fs,
+                                  color=(0, 0, 0), rotate=rotation)
 
                 shape.commit(overlay=True)
 
@@ -393,6 +439,7 @@ def generate_measurement_pdf(
 
         # Legend page up front so the color coding and Line # cross-reference
         # are explained inside the document itself.
+        legend_added = False
         try:
             seen: set[tuple] = set()
             line_swatches: list[tuple[str, tuple[float, float, float]]] = []
@@ -422,10 +469,26 @@ def generate_measurement_pdf(
                     "omit per-line labels for readability; their Excel rows "
                     "follow the same order.",
                     "User-drawn lines are marked with endpoint dots.",
+                    "Only pages with detected fence content are included; each "
+                    "page is stamped top-right with its original page number, "
+                    "matching the Excel 'Page' column and the canvas.",
+                    "Pages with no measured lines carry a note saying why.",
                 ],
             )
+            legend_added = True
         except Exception as e:
             log.warning(f"Measurement PDF legend page failed: {e}")
+
+        # Bookmarks: one entry per page under its original page number, so
+        # jumping to the page an Excel row names is one click in the sidebar.
+        try:
+            off = 2 if legend_added else 1
+            toc = [[1, "Legend", 1]] if legend_added else []
+            toc += [[1, f"Page {pn}", i + off]
+                    for i, pn in enumerate(rendered_page_nums)]
+            doc.set_toc(toc)
+        except Exception as e:
+            log.warning(f"Measurement PDF bookmarks failed: {e}")
 
         base, ext = os.path.splitext(uploaded_pdf_name or "document.pdf")
         fname = f"{base}_measurements{ext}"

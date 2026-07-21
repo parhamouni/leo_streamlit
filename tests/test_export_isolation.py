@@ -397,6 +397,33 @@ def test_export_state_with_umt_edits_uses_vector_worker(
     assert state[5]["page_1"][0]["length_pts"] == 720
 
 
+def test_export_state_surfaces_skip_fields(api_server_module, skipped_export_job):
+    import job_registry
+
+    job = job_registry.get_job(skipped_export_job)
+    results = job_registry.load_results(skipped_export_job)
+    fence_pages_out = api_server_module._build_export_state(
+        skipped_export_job, results, job["pdf_path"]
+    )[0]
+
+    assert fence_pages_out[0]["measurement_skipped"] is True
+    assert "no fence layers" in fence_pages_out[0]["skip_reason"]
+
+
+def test_export_state_no_skip_fields_on_measured_pages(
+    api_server_module, completed_export_job
+):
+    import job_registry
+
+    job = job_registry.get_job(completed_export_job)
+    results = job_registry.load_results(completed_export_job)
+    fence_pages_out = api_server_module._build_export_state(
+        completed_export_job, results, job["pdf_path"]
+    )[0]
+
+    assert "measurement_skipped" not in fence_pages_out[0]
+
+
 def test_vector_worker_timeout_maps_to_excel_504(
     api_server_module, app_client, completed_export_job, monkeypatch
 ):
