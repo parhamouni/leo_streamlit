@@ -49,6 +49,7 @@ _FENCE_KEYWORDS = [
     'bollards', 'handrails', 'wall', 'cmu',
     'operator', 'davis', 'bacon', 'davis-bacon', 'davis – bacon',
     'buy america', 'american', 'dug out',
+    'door schedule',  # customer request 2026-07-24 (Vistancia)
 ]
 
 # Electrical keyword set — the schedules / drawing types that mark a page as
