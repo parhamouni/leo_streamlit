@@ -417,18 +417,23 @@ def generate_measurement_pdf(
                 # Original-document page number, top-right: the Excel "Page"
                 # column and the canvas use this number, while this PDF's
                 # physical order doesn't (legend page + fence pages only).
+                # Bold, oversized, and boxed — customers reach for their PDF
+                # reader's page counter first, so this has to out-shout it.
                 stamp = f"Page {stamp_num} of {total_pages}"
+                sfs = min(30, max(11, fs * 1.7))
                 disp_w = mh if rotation in (90, 270) else mw
-                tw = fitz.get_text_length(stamp, fontname="helv", fontsize=fs)
-                sx, sy = disp_w - tw - 12, fs * 1.6
-                r0 = _rot_pt(sx - 4, sy - fs * 1.1)
-                r1 = _rot_pt(sx + tw + 4, sy + fs * 0.45)
+                tw = fitz.get_text_length(stamp, fontname="hebo", fontsize=sfs)
+                sx, sy = disp_w - tw - 16, sfs * 1.5
+                r0 = _rot_pt(sx - 8, sy - sfs * 1.15)
+                r1 = _rot_pt(sx + tw + 8, sy + sfs * 0.5)
                 halo = fitz.Rect(min(r0[0], r1[0]), min(r0[1], r1[1]),
                                  max(r0[0], r1[0]), max(r0[1], r1[1]))
                 shape.draw_rect(halo)
-                shape.finish(color=None, fill=(1, 1, 1), fill_opacity=0.85)
-                shape.insert_text(_rot_pt(sx, sy), stamp, fontsize=fs,
-                                  color=(0, 0, 0), rotate=rotation)
+                shape.finish(color=(0, 0, 0), width=1.2,
+                             fill=(1, 1, 1), fill_opacity=0.9)
+                shape.insert_text(_rot_pt(sx, sy), stamp, fontname="hebo",
+                                  fontsize=sfs, color=(0, 0, 0),
+                                  rotate=rotation)
 
                 shape.commit(overlay=True)
 
@@ -471,7 +476,9 @@ def generate_measurement_pdf(
                     "User-drawn lines are marked with endpoint dots.",
                     "Only pages with detected fence content are included; each "
                     "page is stamped top-right with its original page number, "
-                    "matching the Excel 'Page' column and the canvas.",
+                    "matching the Excel 'Page' column and the canvas. Your PDF "
+                    "reader's own page counter matches the Excel 'PDF Page' "
+                    "column instead.",
                     "Pages with no measured lines carry a note saying why.",
                 ],
             )
@@ -550,6 +557,23 @@ def generate_measurement_spreadsheet(
     DETAIL_COLS = ["Height", "Post Type", "Post Spacing", "Material",
                    "Gauge", "Mesh Size", "Detail Page", "Full Details"]
 
+    # Physical position of each source page inside the measurement PDF, as a
+    # PDF reader's page counter shows it: legend = 1, fence pages follow in
+    # original-index order. Mirrors the page selection in
+    # generate_measurement_pdf so "PDF Page" matches that file exactly.
+    pdf_pos_by_page_num: dict = {}
+    seen_idx: set = set()
+    pos = 2
+    for fp in sorted(fence_pages, key=lambda x: x.get(
+            "page_idx", x.get("page_index_in_original_doc", 0)) or 0):
+        idx = fp.get("page_idx", fp.get("page_index_in_original_doc"))
+        if idx is None or idx < 0 or idx in seen_idx:
+            continue
+        seen_idx.add(idx)
+        pn = fp.get("page_num", fp.get("page_number"))
+        pdf_pos_by_page_num[pn] = pos
+        pos += 1
+
     rows = []
     for page_data in fence_pages:
         page_num = page_data.get("page_num", page_data.get("page_number"))
@@ -567,7 +591,8 @@ def generate_measurement_spreadsheet(
             length_ft = nl.length_pts / page_scale
             row = _build_row(page_num, nl.number, nl.category, nl.source,
                              length_ft, nl.length_pts, page_scale,
-                             nl.start, nl.end, element_details)
+                             nl.start, nl.end, element_details,
+                             pdf_page=pdf_pos_by_page_num.get(page_num))
             rows.append(row)
 
     if not rows:
@@ -608,12 +633,16 @@ def generate_measurement_spreadsheet(
 
 
 def _build_row(page_num, line_no, category, row_type, length_ft, length_pts,
-               page_scale, start, end, element_details):
+               page_scale, start, end, element_details, pdf_page=None):
     # "Line #" matches the numbered label drawn next to the line on the
     # measurement PDF; the midpoint locates the line even without labels
-    # (dense pages omit them for readability).
+    # (dense pages omit them for readability). "Page" is the drawing set's
+    # sheet number (matches the stamp and the canvas); "PDF Page" is the
+    # same page's position in the measurement PDF file, as a PDF reader's
+    # page counter shows it.
     row = {
         "Page": page_num,
+        "PDF Page": pdf_page if pdf_page is not None else "",
         "Line #": line_no,
         "Category": category,
         "Type": row_type,

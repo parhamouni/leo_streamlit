@@ -2233,7 +2233,7 @@ _measurement_builds_lock = threading.Lock()
 
 # Bump when generate_measurement_pdf's output changes (stamps, notes, …):
 # the artifact path is the cache key, so old builds must miss, not serve.
-_MEASUREMENT_PDF_VERSION = 2
+_MEASUREMENT_PDF_VERSION = 3
 
 
 def _measurement_pdf_artifact(job: dict) -> Path | None:

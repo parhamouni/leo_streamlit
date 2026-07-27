@@ -145,6 +145,43 @@ def test_excel_line_numbers(export_inputs):
     assert list(df["Line #"]) == [1, 2, 3]
     assert list(df["Type"]) == ["auto", "auto", "user"]
     assert "Midpoint X (pts)" in df.columns and "Midpoint Y (pts)" in df.columns
+    # Single fence page: legend is PDF page 1, so the content page is 2.
+    assert list(df["PDF Page"]) == [2, 2, 2]
+
+
+def test_excel_pdf_page_matches_measurement_pdf_position(tmp_path, export_inputs):
+    """Two fence pages out of a 5-page doc: 'PDF Page' must equal each
+    page's physical position in the measurement PDF (legend = 1)."""
+    doc = fitz.open()
+    for _ in range(5):
+        doc.new_page(width=612, height=792)
+    pdf_path = tmp_path / "five.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    export_inputs["pdf_path"] = str(pdf_path)
+
+    second = dict(export_inputs["fence_pages"][0])
+    second.update({"page_idx": 3, "page_num": 4})
+    export_inputs["fence_pages"][0].update({"page_idx": 1, "page_num": 2})
+    export_inputs["fence_pages"].append(second)
+    export_inputs["line_assignments"] = {
+        "page_2": {"0": "Chain Link"}, "page_4": {"2": "Wood Fence"}}
+    export_inputs["user_drawn_lines"] = {}
+    export_inputs["page_categories"]["page_2"] = export_inputs["page_categories"].pop("page_1")
+    export_inputs["page_categories"]["page_4"] = dict(export_inputs["page_categories"]["page_2"])
+    export_inputs["lines_by_page"] = {
+        "page_2": export_inputs["fence_pages"][0]["auto_lines"],
+        "page_4": second["auto_lines"]}
+
+    df = _read_excel(export_inputs)
+    assert list(df["Page"]) == [2, 4]
+    assert list(df["PDF Page"]) == [2, 3]
+
+    out = _render_pdf(export_inputs)
+    for _, r in df.iterrows():
+        text = out.load_page(int(r["PDF Page"]) - 1).get_text()
+        assert f"Page {r['Page']} of 5" in text
+    out.close()
 
 
 # ------------------------------------------------------------------- PDF
