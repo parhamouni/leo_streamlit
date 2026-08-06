@@ -680,6 +680,48 @@ def llm_classify_pages_batch(llm, pages, fence_keywords, batch_size=10, profile=
     return out
 
 
+def _parse_json_payload(text: str, opener: str = "{"):
+    """Extract the first complete JSON value opening with `opener` from an
+    LLM response. Tolerates prose around it and ```json fences. Replaces the
+    old non-greedy regex `r'\\{.*?\\}'`, which stopped at the FIRST closing
+    brace and silently truncated any nested or multi-line object."""
+    closer = "]" if opener == "[" else "}"
+    text = text.strip()
+    # Fenced block first — most models emit ```json ... ```
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    candidates = [fence.group(1).strip()] if fence else []
+    candidates.append(text)
+    for cand in candidates:
+        start = cand.find(opener)
+        if start < 0:
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(cand)):
+            c = cand[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == opener:
+                depth += 1
+            elif c == closer:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(cand[start:i + 1])
+                    except Exception:
+                        break
+    return None
+
+
 def llm_identify_fence_layers(llm, layer_names: List[str], fence_definitions: List[Dict]) -> List[str]:
     """
     Use LLM to intelligently identify which layers contain fence-related elements.
@@ -720,46 +762,58 @@ LAYER NAMES FROM PDF:
 DETECTED FENCE INDICATORS:
 {indicators_text}
 
-Based on typical CAD/PDF layer naming conventions, identify layers that might contain:
-- Fence lines (chain link, wood, metal, etc.)
+Based on typical CAD/PDF layer naming conventions, identify layers whose GEOMETRY is
+fence-scope linework:
+- Fence lines (chain link, wood, metal, wire, wrought iron)
 - Gate elements
-- Barriers, guardrails, handrails
-- Property boundaries
+- Screen walls and freestanding site walls
+- Barriers, guardrails (site barriers — not stair handrails)
 - Perimeter/enclosure elements
 
-Return ONLY a JSON array of matching layer names. If unsure, include layers with related terms.
+Do NOT include layers that merely contain a related word but hold other content.
+Common false positives to EXCLUDE:
+- wall FINISH/pattern layers (e.g. *WALL-TILE*, *WALL-PATT*, *WALL-FIXT* — tile
+  hatch and wall-mounted fixtures, not fence runs)
+- building walls/outlines (*BLDG*), stairs (*STRS*), sidewalks/ramps (*SWLK*)
+- signage (*SIGN*), symbols (*SYMB*), curbs (*CURB*, *PVMT*), drainage/easements,
+  dimension/annotation/text layers, title-block layers
+A page often has NO fence layers — returning [] is a correct and common answer.
+Only include a layer when its NAME gives positive evidence of fence-scope content;
+when unsure, LEAVE IT OUT (a human reviews unassigned lines later).
+
+Return ONLY a JSON array of matching layer names.
 Example response: ["V-SITE-FENCE", "A-BARRIER", "SITE-PERIMETER"]
 
-If no layers seem fence-related, return: []
+If no layers are fence-related, return: []
 """
 
     try:
         raw_response = llm.invoke(prompt) if hasattr(llm, "invoke") else llm(prompt)
         response_text = getattr(raw_response, "content", str(raw_response))
-        
-        # Parse JSON array from response
-        json_match = re.search(r'\[.*?\]', response_text, re.DOTALL)
-        if json_match:
-            result = json.loads(json_match.group(0))
-            if isinstance(result, list):
-                # Validate that returned layers exist in the actual layer names
-                valid_layers = []
-                for res_layer in result:
-                    if res_layer in layer_names:
-                        valid_layers.append(res_layer)
-                    else:
-                        # Try to find partial match (e.g. LLM returns "V-SITE-FENCE" for "SITE BASE|V-SITE-FENC")
-                        matches = [l for l in layer_names if res_layer in l]
-                        if matches:
-                            valid_layers.extend(matches)
-                
-                # Deduplicate
-                valid_layers = list(set(valid_layers))
-                print(f"[DEBUG] LLM identified fence layers: {valid_layers}")
-                return valid_layers
+
+        result = _parse_json_payload(response_text, opener="[")
+        if isinstance(result, list):
+            # Validate that returned layers exist in the actual layer names
+            valid_layers = []
+            for res_layer in result:
+                if not isinstance(res_layer, str):
+                    continue
+                if res_layer in layer_names:
+                    valid_layers.append(res_layer)
+                elif len(res_layer) >= 4:
+                    # Partial match (e.g. LLM returns "V-SITE-FENCE" for
+                    # "SITE BASE|V-SITE-FENC"). Guarded by a minimum length
+                    # so a short fragment can't expand to half the layer list.
+                    matches = [l for l in layer_names if res_layer in l]
+                    valid_layers.extend(matches)
+
+            # Deduplicate
+            valid_layers = list(set(valid_layers))
+            print(f"[DEBUG] LLM identified fence layers: {valid_layers}")
+            return valid_layers
     except Exception as e:
         print(f"[DEBUG] LLM layer identification failed: {e}")
-    
+
     return []
 
 
@@ -806,53 +860,55 @@ FENCE CATEGORIES FROM LEGEND:
 
 Common CAD layer naming patterns:
 - "FENC-CL" or "FENC-CHNLK" → chain link fence
-- "FENC-WOOD" or "FENC-WD" → wood fence  
+- "FENC-WOOD" or "FENC-WD" → wood fence
 - "FENC-VINYL" or "FENC-VNL" → vinyl fence
 - "FENC-IRON" or "FENC-WI" → wrought iron fence
 - "FENC-METAL" → metal fence
-- "WALL" → wall/barrier
 - Generic "FENC" → match to the most common/default fence type
 
-Return a JSON object mapping each layer name to the best matching category name.
+Return a JSON object mapping each layer name to the best matching category name,
+or to null when no category genuinely fits.
 Use EXACT category names from the list above.
-If a layer doesn't clearly match any category, map it to the most likely one.
+Map a layer ONLY when the layer name and the category semantics genuinely agree.
+Do NOT guess: a wrong colour-coding on a takeoff drawing is worse than an
+unassigned layer (unassigned layers are surfaced for human review). It is normal
+for some — even all — layers to map to null.
 
-Example: {{"V-SITE-FENC-CL": "3: 6' CHAIN LINK FENCE", "V-SITE-FENC-WOOD": "5: 6' WOOD FENCE"}}
+Example: {{"V-SITE-FENC-CL": "3: 6' CHAIN LINK FENCE", "A-WALL-PATT": null}}
 """
 
     try:
         raw_response = llm.invoke(prompt) if hasattr(llm, "invoke") else llm(prompt)
         response_text = getattr(raw_response, "content", str(raw_response))
-        
-        # Parse JSON object from response
-        json_match = re.search(r'\{.*?\}', response_text, re.DOTALL)
-        if json_match:
-            result = json.loads(json_match.group(0))
-            if isinstance(result, dict):
-                # Validate: only keep mappings where layer exists and category exists
-                valid_mapping = {}
-                for layer, cat in result.items():
-                    if layer in fence_layers and cat in cat_names:
-                        valid_mapping[layer] = cat
-                    elif layer in fence_layers:
-                        # LLM returned a category name that doesn't exactly match - find closest
-                        for real_cat in cat_names:
-                            if cat.lower() in real_cat.lower() or real_cat.lower() in cat.lower():
-                                valid_mapping[layer] = real_cat
-                                break
-                
-                # For any unmatched layers, assign to first category as fallback
-                for layer in fence_layers:
-                    if layer not in valid_mapping and cat_names:
-                        valid_mapping[layer] = cat_names[0]
-                
-                print(f"[DEBUG] LLM layer→category mapping: {valid_mapping}")
-                return valid_mapping
+
+        result = _parse_json_payload(response_text, opener="{")
+        if isinstance(result, dict):
+            # Validate: only keep mappings where layer exists and category exists
+            valid_mapping = {}
+            for layer, cat in result.items():
+                if layer not in fence_layers or not isinstance(cat, str) or not cat:
+                    continue
+                if cat in cat_names:
+                    valid_mapping[layer] = cat
+                else:
+                    # LLM returned a category name that doesn't exactly match - find closest
+                    for real_cat in cat_names:
+                        if cat.lower() in real_cat.lower() or real_cat.lower() in cat.lower():
+                            valid_mapping[layer] = real_cat
+                            break
+
+            # Deliberately NO fallback for unmatched layers. Until 2026-08-06
+            # this function force-mapped every unmatched layer (and, on any
+            # exception, every layer) to cat_names[0] — one junk layer pick
+            # upstream then painted thousands of lines with a legend category
+            # they had nothing to do with. Unmatched layers stay unmapped and
+            # are surfaced via measurements["unmatched_layers"] for review.
+            print(f"[DEBUG] LLM layer→category mapping: {valid_mapping}")
+            return valid_mapping
     except Exception as e:
         print(f"[DEBUG] LLM layer→category matching failed: {e}")
-    
-    # Fallback: map all layers to first category
-    return {layer: cat_names[0] for layer in fence_layers} if cat_names else {}
+
+    return {}
 
 
 def llm_suggest_filter_params(llm, line_stats: dict, page_context: str = "") -> dict:

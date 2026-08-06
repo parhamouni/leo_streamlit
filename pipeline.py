@@ -82,6 +82,19 @@ class PipelineConfig:
     highlight_fence_text: bool = True
     enable_unified_measurement: bool = True
     enable_nonlayer_suggestions: bool = False
+    # Stage-2 agentic plan: after phase 3, consolidate all pages' legend
+    # entries into a document-wide registry and re-match still-unmatched
+    # fence layers against it (legends usually live on a different sheet
+    # than the fence linework). Adds mappings only — never overrides a
+    # same-page match. Env kill-switch: FENCE_LEGEND_REGISTRY=0.
+    enable_legend_registry: bool = field(
+        default_factory=lambda: os.environ.get("FENCE_LEGEND_REGISTRY", "1") != "0")
+    # Stage-3 agentic plan: one vision call per fence page judging, per
+    # candidate layer, whether the highlighted linework is genuinely
+    # fence-scope (kills the name-sounds-right-but-holds-hatch class).
+    # Off by default — adds ~1 analysis-model vision call per fence page.
+    enable_vision_verify: bool = field(
+        default_factory=lambda: os.environ.get("FENCE_VISION_VERIFY", "0") == "1")
     display_image_dpi: int = 150
     debug_mode: bool = False
     cache_scope: str = ""
@@ -119,6 +132,11 @@ class PipelineResult:
     # None for jobs built before this field existed (or if the builder
     # payload was unparseable) — consumers must fall back to derivation.
     highlight_pdf_info: dict | None = None
+    # Document-wide legend registry (Stage 2): consolidated legend/keynote
+    # entries from all sheets, used for cross-sheet layer→category matching
+    # and shown by the UI / agentic resolver as provenance. None when the
+    # registry pass is disabled or found nothing.
+    legend_registry: dict | None = None
     per_page_scale_info: dict = field(default_factory=dict)
     unified_measurements: dict = field(default_factory=dict)
     page_categories: dict = field(default_factory=dict)
@@ -1002,8 +1020,17 @@ def run_analysis(
                     log.warning(f"Phase 3 scale page {pi}: {e}")
                     page_result["scale_info"] = {}
 
-            # Measurement
-            cached_measure = fence_cache.get("phase3_measure", pdf_hash, params,
+            # Measurement.
+            # measure_rev history: 2 = fence_definitions/fence_instances are
+            # now the PROCESSED legend_entries/figure_instances. Until
+            # 2026-08-06 this call passed raw ADE chunks positionally; raw
+            # chunks carry no indicator/keyword keys, so
+            # llm_match_layers_to_definitions bailed to {} on every page and
+            # layer_to_category was never populated in the live pipeline
+            # (the workers always passed the processed objects — this call
+            # site was the odd one out).
+            params_measure = fence_cache.params_hash(base=params, measure_rev=2)
+            cached_measure = fence_cache.get("phase3_measure", pdf_hash, params_measure,
                                             page_idx=pi, user_scope=cache_scope)
             if cached_measure is not None:
                 page_result["measurements"] = _normalize_measurements(cached_measure)
@@ -1013,7 +1040,7 @@ def run_analysis(
                     scale_val = (page_result.get("scale_info") or {}).get("verified_scale") or \
                                 (page_result.get("scale_info") or {}).get("text_scale")
                     measurements = ade.measure_fence_elements(
-                        page_obj, legend_chunks, figure_chunks,
+                        page_obj, legend_entries, figure_instances,
                         figure_chunks=figure_chunks,
                         llm=llm_analysis,
                         scale_factor=scale_val,
@@ -1023,7 +1050,7 @@ def run_analysis(
                     )
                     measurements = _normalize_measurements(measurements or {})
                     page_result["measurements"] = measurements
-                    fence_cache.put("phase3_measure", pdf_hash, params,
+                    fence_cache.put("phase3_measure", pdf_hash, params_measure,
                                    measurements, page_idx=pi,
                                    user_scope=cache_scope)
                 except Exception as e:
@@ -1073,6 +1100,81 @@ def run_analysis(
         timings["phase3"] = time.perf_counter() - t3
         progress("phase3", 93, f"Phase 3 done ({timings['phase3']:.1f}s)")
 
+        # ---- Phase 3b: document-level legend registry (Stage 2) ----
+        # Legends usually live on a cover/legend sheet while the fence
+        # linework is on other sheets, so per-page matching leaves those
+        # pages' layers unmatched. Build one registry from every page's
+        # legend_entries and give unmatched layers a second chance against
+        # it. Additive only; geometry untouched.
+        legend_registry_out: dict | None = None
+        if config.enable_legend_registry and fence_results:
+            t3b = time.perf_counter()
+            try:
+                from utils_ade.legend_registry import (
+                    build_registry, registry_match_pages)
+                params_registry = fence_cache.params_hash(
+                    base=params, registry_rev=1)
+                legend_registry_out = fence_cache.get(
+                    "legend_registry", pdf_hash, params_registry,
+                    user_scope=cache_scope)
+                if legend_registry_out is None:
+                    legend_registry_out = build_registry(
+                        fence_results, llm=llm_analysis)
+                    fence_cache.put(
+                        "legend_registry", pdf_hash, params_registry,
+                        legend_registry_out, user_scope=cache_scope)
+                n_changed = registry_match_pages(
+                    fence_results, legend_registry_out, light_llm=llm_classifier)
+                timings["phase3b_registry"] = time.perf_counter() - t3b
+                log.info(
+                    "Legend registry: %d entries (consolidated=%s), "
+                    "%d pages gained mappings",
+                    len((legend_registry_out or {}).get("entries") or []),
+                    (legend_registry_out or {}).get("consolidated"),
+                    n_changed,
+                )
+            except Exception as e:
+                log.warning(f"Legend registry pass failed: {e}")
+
+        # ---- Phase 3c: vision verification of layer candidates (Stage 3) ----
+        # Advisory per-(page, layer) verdicts; consumers (canvas auto-assign,
+        # measurement summary) skip "not_fence" layers. Geometry untouched.
+        if config.enable_vision_verify and fence_results:
+            t3c = time.perf_counter()
+            n_verified = 0
+            try:
+                from openai import OpenAI as _OpenAI
+                from utils_ade.vision_verify import verify_page_layers
+                vclient = (_OpenAI(api_key=config.openai_api_key)
+                           if config.openai_api_key else None)
+                params_vision = fence_cache.params_hash(base=params, vision_rev=1)
+                for r in fence_results:
+                    m = r.get("measurements") or {}
+                    if not (m.get("fence_layers") and m.get("all_fence_lines")):
+                        continue
+                    pi_v = r.get("page_idx")
+                    if pi_v is None or pi_v < 0 or pi_v >= doc.page_count:
+                        continue
+                    cached_vv = fence_cache.get(
+                        "phase3_vision", pdf_hash, params_vision,
+                        page_idx=pi_v, user_scope=cache_scope)
+                    if cached_vv is not None:
+                        vv = cached_vv or None
+                    else:
+                        vv = verify_page_layers(
+                            doc[pi_v], m, vclient, model=config.analysis_model)
+                        fence_cache.put(
+                            "phase3_vision", pdf_hash, params_vision,
+                            vv or {}, page_idx=pi_v, user_scope=cache_scope)
+                    if vv:
+                        m["vision_verdicts"] = vv
+                        r["measurements"] = m
+                        n_verified += 1
+                timings["phase3c_vision"] = time.perf_counter() - t3c
+                log.info("Vision verify: verdicts on %d pages", n_verified)
+            except Exception as e:
+                log.warning(f"Vision verify pass failed: {e}")
+
         # ---- Highlighted PDF generation ----
         progress("highlight", 95, "Generating highlighted PDF...")
         highlighted_pdf_bytes = None
@@ -1118,6 +1220,7 @@ def run_analysis(
         result.element_details = element_details or {}
         result.highlighted_pdf_bytes = highlighted_pdf_bytes
         result.highlight_pdf_info = highlight_pdf_info
+        result.legend_registry = legend_registry_out
         result.per_page_scale_info = per_page_scale
         result.unified_measurements = per_page_measurements
         result.page_categories = per_page_categories

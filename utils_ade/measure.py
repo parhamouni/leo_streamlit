@@ -618,6 +618,11 @@ def measure_fence_elements(
         'measurement_method': measurement_method,
         'fence_layers': fence_layers,
         'layer_to_category': layer_to_category,
+        # Layers the matcher declined to map (no genuine category fit) —
+        # surfaced so the UI / agentic resolver can review them instead of
+        # the old behaviour of force-mapping them to the first category.
+        'unmatched_layers': [l for l in fence_layers
+                             if l not in (layer_to_category or {})],
         'all_fence_lines': final_fence_lines,
         'layer_measurements': layer_measurements,
         'indicator_measurements': indicator_measurements,

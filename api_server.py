@@ -355,6 +355,9 @@ def _run_job(job: dict, keys: dict):
             # original page numbers through this (None on old jobs → the
             # endpoint derives the mapping instead).
             "highlight_pdf_info": result.highlight_pdf_info,
+            # Document-wide legend registry (cross-sheet layer→category
+            # provenance; consumed by the UI and the agentic resolver).
+            "legend_registry": result.legend_registry,
             "timings": result.timings,
             "error": result.error,
         }
@@ -1418,6 +1421,7 @@ async def get_page_vector_lines(
 
     import fitz
     from exports import MIN_LINE_PTS
+    from utils_ade.vision_verify import layer_rejected
     from utils_vector import extract_vector_lines
 
     doc = None
@@ -1521,6 +1525,11 @@ async def get_page_vector_lines(
         if length < MIN_LINE_PTS:
             continue
         layer = fl.get("layer") or ""
+        # Vision verification (Stage 3) judged this layer's linework
+        # not-fence — don't auto-colour it (lines stay drawable/assignable
+        # manually; absent verdicts never reject).
+        if layer_rejected(measurements, layer):
+            continue
         category = layer_to_cat.get(layer)
         if not category and layer and any_layer_mapped:
             for k, v in layer_to_cat.items():
@@ -2763,6 +2772,7 @@ def _summary_for_page(
         # Auto-only: mirror `_build_auto_export_state` per-line bucketing
         # so the summary matches exports.
         from exports import MIN_LINE_PTS
+        from utils_ade.vision_verify import layer_rejected
         measurements = (fp or {}).get("measurements") or {}
         all_fence_lines = measurements.get("all_fence_lines") or []
         layer_to_cat = measurements.get("layer_to_category") or {}
@@ -2787,6 +2797,8 @@ def _summary_for_page(
             if length_pts < MIN_LINE_PTS:
                 continue
             layer = fl.get("layer") or ""
+            if layer_rejected(measurements, layer):
+                continue
             cat = layer_to_cat.get(layer)
             if not cat and layer and any_layer_mapped:
                 for k, v in layer_to_cat.items():
