@@ -111,6 +111,14 @@ class PipelineResult:
     non_fence_pages: list[dict] = field(default_factory=list)
     element_details: dict = field(default_factory=dict)
     highlighted_pdf_bytes: bytes | None = None
+    # Page accounting for the highlighted PDF: {"kept_page_indices": [0-based
+    # original indices in output order], "legend_inserted": bool,
+    # "skipped_blank": int, "builder": "worker"|"inline"}. Persisted so the
+    # API can map an original page number to its position in the highlighted
+    # PDF without re-deriving which pages the builder kept/skipped.
+    # None for jobs built before this field existed (or if the builder
+    # payload was unparseable) — consumers must fall back to derivation.
+    highlight_pdf_info: dict | None = None
     per_page_scale_info: dict = field(default_factory=dict)
     unified_measurements: dict = field(default_factory=dict)
     page_categories: dict = field(default_factory=dict)
@@ -1068,8 +1076,9 @@ def run_analysis(
         # ---- Highlighted PDF generation ----
         progress("highlight", 95, "Generating highlighted PDF...")
         highlighted_pdf_bytes = None
+        highlight_pdf_info = None
         try:
-            highlighted_pdf_bytes = _generate_highlighted_pdf(
+            highlighted_pdf_bytes, highlight_pdf_info = _generate_highlighted_pdf(
                 pdf_path_str, fence_results, config)
         except Exception as e:
             log.warning(f"Highlighted PDF generation failed: {e}")
@@ -1108,6 +1117,7 @@ def run_analysis(
         ]
         result.element_details = element_details or {}
         result.highlighted_pdf_bytes = highlighted_pdf_bytes
+        result.highlight_pdf_info = highlight_pdf_info
         result.per_page_scale_info = per_page_scale
         result.unified_measurements = per_page_measurements
         result.page_categories = per_page_categories
@@ -1132,8 +1142,14 @@ def _generate_highlighted_pdf(
     pdf_path: str,
     fence_results: list[dict],
     config: PipelineConfig,
-) -> bytes | None:
-    """Generate a highlighted PDF with fence annotations overlaid."""
+) -> tuple[bytes | None, dict | None]:
+    """Generate a highlighted PDF with fence annotations overlaid.
+
+    Returns (pdf_bytes, highlight_pdf_info). The info dict records which
+    original pages the builder actually kept and whether a legend page was
+    prepended (see PipelineResult.highlight_pdf_info); it is None when that
+    accounting isn't reliable (worker payload unparseable / total failure).
+    """
     try:
         worker_script = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
@@ -1205,6 +1221,7 @@ def _generate_highlighted_pdf(
                 # blank-skipped pages were invisible in the logs and
                 # "why is page X missing from the fence PDF?" tickets were
                 # undiagnosable after the fact.
+                hl_info = None
                 try:
                     payload = None
                     for line in (proc.stdout or b"").decode(
@@ -1222,11 +1239,21 @@ def _generate_highlighted_pdf(
                             payload.get("size_bytes"),
                             payload.get("wall_s"),
                         )
+                        kept = payload.get("kept_page_indices")
+                        if isinstance(kept, list) and all(
+                                isinstance(i, int) for i in kept):
+                            hl_info = {
+                                "kept_page_indices": kept,
+                                "legend_inserted": bool(
+                                    payload.get("legend_inserted")),
+                                "skipped_blank": payload.get("skipped_blank"),
+                                "builder": "worker",
+                            }
                 except Exception:
                     pass
                 try:
                     with open(out_path, "rb") as f:
-                        return f.read()
+                        return f.read(), hl_info
                 finally:
                     try:
                         os.unlink(out_path)
@@ -1265,9 +1292,10 @@ def _generate_highlighted_pdf(
                 len(fence_results),
                 cfg.HIGHLIGHT_INLINE_MAX_PAGES,
             )
-            return None
+            return None, None
         src = fitz.open(pdf_path)
         out_doc = fitz.open()
+        inline_kept: list[int] = []
         try:
             for page_result in sorted(
                 fence_results, key=lambda r: r.get("page_idx", 0)
@@ -1275,7 +1303,10 @@ def _generate_highlighted_pdf(
                 pi = page_result.get("page_idx")
                 if pi is None or pi < 0 or pi >= src.page_count:
                     continue
+                if pi in inline_kept:
+                    continue
                 out_doc.insert_pdf(src, from_page=pi, to_page=pi)
+                inline_kept.append(pi)
                 page = out_doc.load_page(len(out_doc) - 1)
 
                 for defn in page_result.get("definitions", []):
@@ -1297,15 +1328,23 @@ def _generate_highlighted_pdf(
                         annot.update()
 
             if len(out_doc) == 0:
-                return None
-            return out_doc.tobytes(garbage=4, deflate=True)
+                return None, None
+            return out_doc.tobytes(garbage=4, deflate=True), {
+                # The inline fallback keeps every fence page (no blank-skip)
+                # and prepends no legend — different arithmetic from the
+                # worker; record it so the page-image mapping stays exact.
+                "kept_page_indices": inline_kept,
+                "legend_inserted": False,
+                "skipped_blank": 0,
+                "builder": "inline",
+            }
         finally:
             src.close()
             out_doc.close()
 
     except Exception as e:
         log.warning(f"Highlighted PDF generation failed: {e}")
-        return None
+        return None, None
 
 
 # ---------------------------------------------------------------------------

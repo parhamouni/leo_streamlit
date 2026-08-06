@@ -43,6 +43,10 @@ from backend.app.auth import get_current_user, require_supabase_jwt
 import config as cfg_mod
 from config import cfg
 from pipeline import PipelineConfig, PipelineResult, run_analysis
+# The worker's own blank-page predicate: page-image mapping re-derives which
+# fence pages the highlighted-PDF builder kept, and using the same function
+# keeps the two from drifting (module top-level is stdlib-only).
+from ops.highlight_pdf_worker import _has_drawable as _hl_has_drawable
 from secrets_loader import load_api_keys as _load_api_keys
 
 
@@ -346,6 +350,11 @@ def _run_job(job: dict, keys: dict):
             # can't tell which trade ran (defaults to fence).
             "trade": result.trade,
             "broken_pages": result.broken_pages,
+            # Which original pages the highlighted-PDF builder kept and
+            # whether it prepended a legend page — page-image serving maps
+            # original page numbers through this (None on old jobs → the
+            # endpoint derives the mapping instead).
+            "highlight_pdf_info": result.highlight_pdf_info,
             "timings": result.timings,
             "error": result.error,
         }
@@ -1061,6 +1070,116 @@ async def get_document_modes(
     return {"modes": modes}
 
 
+# --- Highlighted-PDF page mapping -----------------------------------------
+#
+# The highlighted PDF is NOT a positional subset of the fence pages: since
+# 0ecd24c the builder drops fence pages with nothing drawable, and since
+# 9a43ea6 it prepends a legend page. Assuming `position in fence_pages + 1`
+# therefore served the WRONG SHEET (the legend for the first fence page, the
+# previous fence sheet for the rest) as the canvas/thumbnail background —
+# the 2026-08-05 "measurement canvas is drawing lines randomly" report.
+
+_HL_LEGEND_TITLE_PREFIX = "Fence Detection Overview"
+# job_id → (highlighted.pdf mtime, mapping). One map per open canvas is
+# requested once per page; re-analysis rewrites the PDF and bumps the mtime.
+_hl_page_map_cache: dict[str, tuple[float, dict[int, int] | None]] = {}
+
+
+def _hl_page_drawable(fp: dict) -> bool:
+    """Feed a persisted fence_pages row to the worker's `_has_drawable`,
+    shaped exactly like pipeline._generate_highlighted_pdf's worker_pages
+    (including the recomputed `has_measured_lines`)."""
+    measurements = fp.get("measurements") or {}
+    return _hl_has_drawable({
+        "definitions": fp.get("definitions") or [],
+        "instances": fp.get("instances") or [],
+        "keyword_matches": fp.get("keyword_matches") or [],
+        "has_measured_lines": bool(
+            measurements.get("all_fence_lines")
+            and measurements.get("measurement_method") != "skipped"
+        ),
+    })
+
+
+def _compute_highlighted_page_map(
+    results: dict, hl_path: str | Path,
+) -> dict[int, int] | None:
+    """Original 1-based page number → 1-based page in the highlighted PDF.
+
+    Prefers the builder's persisted accounting (`highlight_pdf_info`, jobs
+    analysed after this fix). For older jobs it re-derives the kept list
+    from the persisted fence_pages — exact, because the pipeline persisted
+    the same rows it fed the worker — trying both builder shapes (worker:
+    blank-skip; inline fallback / pre-0ecd24c: keep everything). Whatever
+    hypothesis reconciles with the PDF's actual page count wins; if none
+    does, returns None and the caller serves the original PDF instead — an
+    un-annotated correct sheet beats an annotated wrong one.
+    """
+    import fitz
+    try:
+        with fitz.open(str(hl_path)) as doc:
+            page_count = doc.page_count
+            if page_count == 0:
+                return None
+            first_text = (doc.load_page(0).get_text() or "").lstrip()
+    except Exception:
+        log.warning("highlighted-page map: could not open %s", hl_path)
+        return None
+
+    info = (results.get("highlight_pdf_info") or {})
+    kept = info.get("kept_page_indices")
+    if isinstance(kept, list) and kept and all(isinstance(i, int) for i in kept):
+        legend = 1 if info.get("legend_inserted") else 0
+        candidates = [kept]
+    else:
+        legend = 1 if first_text.startswith(_HL_LEGEND_TITLE_PREFIX) else 0
+        ordered: list[tuple[int, dict]] = []
+        seen: set[int] = set()
+        for fp in sorted(
+            (results.get("fence_pages") or []),
+            key=lambda fp: fp.get("page_idx",
+                                  fp.get("page_index_in_original_doc", 0)),
+        ):
+            pi = fp.get("page_idx", fp.get("page_index_in_original_doc"))
+            if pi is None or int(pi) in seen:
+                continue
+            seen.add(int(pi))
+            ordered.append((int(pi), fp))
+        drawable = [pi for pi, fp in ordered if _hl_page_drawable(fp)]
+        everything = [pi for pi, _ in ordered]
+        candidates = [drawable]
+        if everything != drawable:
+            candidates.append(everything)
+
+    for cand in candidates:
+        if cand and len(cand) + legend == page_count:
+            return {pi + 1: pos + 1 + legend for pos, pi in enumerate(cand)}
+    log.warning(
+        "highlighted-page map: no hypothesis matches page_count=%d "
+        "(legend=%d, candidates=%s) — serving originals",
+        page_count, legend, [len(c) for c in candidates],
+    )
+    return None
+
+
+def _highlighted_page_map(
+    job_id: str, results: dict, hl_path: str | Path,
+) -> dict[int, int] | None:
+    """Cached wrapper around _compute_highlighted_page_map."""
+    try:
+        mtime = Path(hl_path).stat().st_mtime
+    except OSError:
+        return None
+    cached = _hl_page_map_cache.get(job_id)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    mapping = _compute_highlighted_page_map(results, hl_path)
+    if len(_hl_page_map_cache) > 512:
+        _hl_page_map_cache.clear()
+    _hl_page_map_cache[job_id] = (mtime, mapping)
+    return mapping
+
+
 # Subprocess worker for safe PDF page rasterization. Some PDFs (especially
 # those with very dense vector content) can crash MuPDF at the C level,
 # which would take down the entire API server if rendered in-process.
@@ -1119,29 +1238,27 @@ async def get_page_image(
     hl_path = job_registry.get_highlighted_pdf_path(job_id)
     orig_path = job.get("pdf_path")
 
-    # The highlighted PDF only contains FENCE pages (renumbered sequentially).
-    # Build an original-page-num → highlighted-page-index map so we can
-    # render the correct page when serving from the highlighted PDF; without
-    # this, requesting page 7 of the highlighted PDF would return the 7th
-    # fence page in order, not the user's original page 7. For non-fence
-    # pages there's nothing in the highlighted PDF — fall back to original.
-    fence_page_pos: dict[int, int] = {}
+    # The highlighted PDF only contains FENCE pages (renumbered, possibly
+    # blank-skipped, with a legend page up front). Resolve the original page
+    # number through _highlighted_page_map so we render the RIGHT page of it;
+    # for pages it can't resolve (non-fence, blank-skipped, or the whole map
+    # is unavailable) fall back to the original PDF.
+    hl_map: dict[int, int] | None = None
     if hl_path is not None:
         results = job_registry.load_results(job_id)
         if results:
-            fence_pages = sorted(
-                (results.get("fence_pages") or []),
-                key=lambda fp: fp.get("page_idx", fp.get("page_index_in_original_doc", 0)),
-            )
-            for i, fp in enumerate(fence_pages):
-                pn = fp.get("page_num") or fp.get("page_number")
-                if pn is not None:
-                    fence_page_pos[int(pn)] = i
+            hl_map = _highlighted_page_map(job_id, results, hl_path)
 
     if source == "highlighted":
-        if hl_path is not None and page_num in fence_page_pos:
+        if hl_path is not None and hl_map and page_num in hl_map:
             src_pdf = hl_path
-            page_in_pdf = fence_page_pos[page_num] + 1  # 1-indexed for renderer
+            page_in_pdf = hl_map[page_num]  # 1-indexed for renderer
+        elif hl_path is not None and hl_map is None:
+            raise HTTPException(
+                404,
+                "Highlighted-PDF page mapping unavailable for this job; "
+                "request the page with source=original instead.",
+            )
         else:
             raise HTTPException(
                 404,
@@ -1152,9 +1269,9 @@ async def get_page_image(
         src_pdf = orig_path
         page_in_pdf = page_num
     else:  # "auto"
-        if hl_path is not None and page_num in fence_page_pos:
+        if hl_path is not None and hl_map and page_num in hl_map:
             src_pdf = hl_path
-            page_in_pdf = fence_page_pos[page_num] + 1
+            page_in_pdf = hl_map[page_num]
         else:
             src_pdf = orig_path
             page_in_pdf = page_num
@@ -1300,6 +1417,7 @@ async def get_page_vector_lines(
         page_idx = page_num - 1
 
     import fitz
+    from exports import MIN_LINE_PTS
     from utils_vector import extract_vector_lines
 
     doc = None
@@ -1392,6 +1510,16 @@ async def get_page_vector_lines(
             ex, ey = float(e[0]), float(e[1])
         except (TypeError, ValueError):
             continue
+        # Same noise floor the Excel/measurement-PDF exports use
+        # (exports.MIN_LINE_PTS via enumerate_page_lines): sub-10pt segments
+        # on fence layers are hatch/pattern fill, not fence runs — on real
+        # CAD sheets they were the bulk of the "random lines" colouring.
+        try:
+            length = float(fl.get("length_pts"))
+        except (TypeError, ValueError):
+            length = ((ex - sx) ** 2 + (ey - sy) ** 2) ** 0.5
+        if length < MIN_LINE_PTS:
+            continue
         layer = fl.get("layer") or ""
         category = layer_to_cat.get(layer)
         if not category and layer and any_layer_mapped:
@@ -1417,6 +1545,28 @@ async def get_page_vector_lines(
             continue
         auto_assignments[str(vidx)] = category
 
+    # With no layer→category mapping persisted (the common case today — the
+    # legend usually lives on a different sheet than the fence layers, so
+    # `layer_to_category` comes back empty), every line on the pipeline's
+    # selected layers lands in the "Auto-detected" bucket. Where layer
+    # selection over-matched (e.g. 'WALL' → wall-tile hatch, signage, curb
+    # layers) that painted thousands of stray fragments across the canvas.
+    # Above the cap the bucket is far more likely noise than fence runs:
+    # suppress it and tell the frontend why. Saved umt_state assignments,
+    # legend-mapped categories, Smart Assign and manual drawing are all
+    # unaffected.
+    auto_assignments_suppressed = False
+    suppressed_reason = None
+    if not any_layer_mapped and len(auto_assignments) > AUTO_ASSIGN_FALLBACK_CAP:
+        auto_assignments_suppressed = True
+        suppressed_reason = (
+            f"{len(auto_assignments)} auto-detected lines with no layer-to-"
+            f"category mapping exceeds the {AUTO_ASSIGN_FALLBACK_CAP} cap; "
+            "suppressed as probable non-fence linework (hatch/pattern fill)."
+        )
+        auto_assignments = {}
+        auto_categories.pop(FALLBACK_CAT, None)
+
     # When the source PDF is gone we read from the highlighted PDF, which
     # contains the cyan fence-overlay strokes. Auto-assignments computed
     # from coord-matching against `all_fence_lines` would be unreliable —
@@ -1438,6 +1588,8 @@ async def get_page_vector_lines(
         "source_missing": source_missing,
         "measurement_skipped": measurement_skipped,
         "skip_reason": measurements.get("skip_reason") if measurement_skipped else None,
+        "auto_assignments_suppressed": auto_assignments_suppressed,
+        "suppressed_reason": suppressed_reason,
     }
 
 
@@ -1509,9 +1661,14 @@ async def smart_assign_page(
         if page_idx < 0 or page_idx >= len(doc):
             raise HTTPException(404, "Page out of range")
         page = doc[page_idx]
-        rmat = page.rotation_matrix  # native -> display
         vlines = extract_vector_lines(page, apply_rotation=True)
-        # Transform instance bboxes from native to display space.
+        # Instance bboxes are ALREADY display-space: ops/analysis_worker
+        # transforms get_text("words") through the rotation matrix before
+        # building them (analysis_worker._xform), and the highlight worker
+        # *reverse*-rotates them to draw. Multiplying by page.rotation_matrix
+        # here (as this code did until 2026-08) double-rotated them off-page
+        # on every rotated sheet, so proximity voting never fired and Smart
+        # Assign silently fell back to layer-token bulk assignment.
         instances_disp: list[dict] = []
         for inst in (target or {}).get("instances") or []:
             ind = (inst.get("indicator") or "").strip()
@@ -1521,7 +1678,7 @@ async def smart_assign_page(
                 rect = fitz.Rect(
                     float(inst["x0"]), float(inst["y0"]),
                     float(inst["x1"]), float(inst["y1"]),
-                ) * rmat
+                )
                 rect.normalize()
             except (KeyError, TypeError, ValueError):
                 continue
@@ -1722,6 +1879,16 @@ _CATEGORY_PALETTE = [
 # Ceiling on lines exported from one page via saved UMT state — matches
 # MAX_FENCE_LINES in utils_ade/measure.py. See _umt_export_for_page.
 MAX_EXPORT_LINES_PER_PAGE = 5000
+
+# Cap on the unmapped "Auto-detected" fallback bucket for canvas
+# auto-assignments and summary totals. When `layer_to_category` is empty
+# (legend on a different sheet — the common case) and this many ≥10pt lines
+# would land in the bucket, the selected layers are overwhelmingly likely
+# non-fence linework (hatch fill, signage, curbs via the 'WALL' keyword) and
+# auto-colouring them is what customers see as "drawing lines randomly".
+# Suppressed pages still serve `lines` for Smart Assign / manual drawing.
+AUTO_ASSIGN_FALLBACK_CAP = int(
+    os.environ.get("FENCE_UMT_AUTO_ASSIGN_FALLBACK_CAP", "1500"))
 
 
 def _scale_inches_to_points_per_foot(scale_inches: Any) -> float:
@@ -2595,6 +2762,7 @@ def _summary_for_page(
     else:
         # Auto-only: mirror `_build_auto_export_state` per-line bucketing
         # so the summary matches exports.
+        from exports import MIN_LINE_PTS
         measurements = (fp or {}).get("measurements") or {}
         all_fence_lines = measurements.get("all_fence_lines") or []
         layer_to_cat = measurements.get("layer_to_category") or {}
@@ -2608,6 +2776,16 @@ def _summary_for_page(
                 ex, ey = float(fl["end"][0]), float(fl["end"][1])
             except (KeyError, TypeError, ValueError, IndexError):
                 continue
+            length_pts = (
+                float(fl["length_pts"])
+                if isinstance(fl.get("length_pts"), (int, float))
+                else ((ex - sx) ** 2 + (ey - sy) ** 2) ** 0.5
+            )
+            # Exports drop sub-10pt segments (exports.enumerate_page_lines);
+            # counting them here inflated totals with hatch fragments the
+            # Excel/PDF never list.
+            if length_pts < MIN_LINE_PTS:
+                continue
             layer = fl.get("layer") or ""
             cat = layer_to_cat.get(layer)
             if not cat and layer and any_layer_mapped:
@@ -2619,16 +2797,20 @@ def _summary_for_page(
                 if any_layer_mapped:
                     continue
                 cat = FALLBACK
-            length_pts = (
-                float(fl["length_pts"])
-                if isinstance(fl.get("length_pts"), (int, float))
-                else ((ex - sx) ** 2 + (ey - sy) ** 2) ** 0.5
-            )
             entry = per_cat.setdefault(
                 cat, {"pts": 0.0, "auto": 0, "manual": 0}
             )
             entry["pts"] += length_pts
             entry["auto"] += 1
+
+        # Same guard as /page-vector-lines: a huge unmapped Auto-detected
+        # bucket is almost certainly non-fence linework — reporting it as
+        # footage would put phantom totals in front of a bidder even though
+        # the canvas no longer draws those lines.
+        fb = per_cat.get(FALLBACK)
+        if (not any_layer_mapped and fb
+                and fb.get("auto", 0) > AUTO_ASSIGN_FALLBACK_CAP):
+            per_cat.pop(FALLBACK, None)
 
     for cat, entry in per_cat.items():
         entry["ft"] = round(entry["pts"] / page_scale, 2)

@@ -22,8 +22,14 @@ IPC
 ---
 Input  : one JSON object on stdin describing the task.
 Output : one JSON object on stdout {"ok": bool, "out_path": str,
-         "size_bytes": int, "error": str|null}. The actual PDF lives
-         on disk at out_path; the parent reads + unlinks it.
+         "size_bytes": int, "kept_pages": int, "skipped_blank": int,
+         "kept_page_indices": [int, ...], "legend_inserted": bool,
+         "error": str|null}. kept_page_indices are the 0-based
+         original-document indices that made it into the output, in
+         page order — the parent persists them so the API can map an
+         original page to its position in the highlighted PDF. The
+         actual PDF lives on disk at out_path; the parent reads +
+         unlinks it.
 Exit   : 0 on success, non-zero on fatal error.
 
 Task schema
@@ -277,6 +283,7 @@ def main() -> int:
 
         # Legend page up front explaining what this artifact is (a detection
         # overview, not the measurement drawing) and its color coding.
+        legend_inserted = False
         if task.get("legend", True):
             try:
                 from exports import insert_legend_page
@@ -299,6 +306,7 @@ def main() -> int:
                         "cross-referenced by the 'Line #' column.",
                     ],
                 )
+                legend_inserted = True
             except Exception as lg_e:
                 print(f"[highlight_pdf_worker] legend page failed: {lg_e}",
                       file=sys.stderr)
@@ -327,6 +335,8 @@ def main() -> int:
             "size_bytes": size_bytes,
             "kept_pages": len(kept_indices),
             "skipped_blank": skipped_blank,
+            "kept_page_indices": kept_indices,
+            "legend_inserted": legend_inserted,
             "wall_s": round(time.perf_counter() - t0, 3),
             "error": None,
         })

@@ -61,6 +61,9 @@ def test_keeps_only_drawable_fence_pages(src_pdf, tmp_path):
     assert rc == 0 and out["ok"] is True
     assert out["kept_pages"] == 1
     assert out["skipped_blank"] == 1
+    # Page accounting the API's page-image mapping persists and relies on.
+    assert out["kept_page_indices"] == [2]
+    assert out["legend_inserted"] is True
 
     doc = fitz.open(str(out_path))
     # Page 0 is the legend page; the kept fence page follows it.
@@ -113,6 +116,8 @@ def test_legend_can_be_disabled(src_pdf, tmp_path):
     }
     rc, out = _run_worker(task)
     assert rc == 0 and out["ok"] is True
+    assert out["kept_page_indices"] == [0]
+    assert out["legend_inserted"] is False
     doc = fitz.open(str(out_path))
     assert doc.page_count == 1
     doc.close()
