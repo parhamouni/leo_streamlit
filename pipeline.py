@@ -95,6 +95,12 @@ class PipelineConfig:
     # Off by default — adds ~1 analysis-model vision call per fence page.
     enable_vision_verify: bool = field(
         default_factory=lambda: os.environ.get("FENCE_VISION_VERIFY", "0") == "1")
+    # Stage-4 agentic plan: one bounded tool-using agent per DOCUMENT that
+    # resolves layers the deterministic passes left unmatched (render-crop /
+    # search-text / registry tools; hard budgets; fill-only assignments with
+    # provenance; never touches geometry). Off by default.
+    enable_agentic_resolver: bool = field(
+        default_factory=lambda: os.environ.get("FENCE_AGENTIC_RESOLVER", "0") == "1")
     display_image_dpi: int = 150
     debug_mode: bool = False
     cache_scope: str = ""
@@ -137,6 +143,9 @@ class PipelineResult:
     # and shown by the UI / agentic resolver as provenance. None when the
     # registry pass is disabled or found nothing.
     legend_registry: dict | None = None
+    # Stage-4 resolver output (assignments + evidence + budget accounting),
+    # persisted for provenance display. None when disabled / no disputes.
+    agentic_resolution: dict | None = None
     per_page_scale_info: dict = field(default_factory=dict)
     unified_measurements: dict = field(default_factory=dict)
     page_categories: dict = field(default_factory=dict)
@@ -1175,6 +1184,40 @@ def run_analysis(
             except Exception as e:
                 log.warning(f"Vision verify pass failed: {e}")
 
+        # ---- Phase 3d: bounded agentic resolver (Stage 4) ----
+        # One tool-using agent per document, only when disputes remain after
+        # the registry pass. Fill-only layer→category assignments with
+        # provenance; budgets enforced inside run_resolver; any failure
+        # degrades to the phase-3b output.
+        agentic_resolution_out: dict | None = None
+        if config.enable_agentic_resolver and fence_results:
+            t3d = time.perf_counter()
+            try:
+                from agentic.resolver import (
+                    apply_resolutions, find_disputes, run_resolver)
+                interim = {"fence_pages": fence_results,
+                           "legend_registry": legend_registry_out}
+                if find_disputes(interim):
+                    from openai import OpenAI as _OpenAI
+                    rclient = (_OpenAI(api_key=config.openai_api_key)
+                               if config.openai_api_key else None)
+                    agentic_resolution_out = run_resolver(
+                        interim, pdf_path_str, client=rclient,
+                        model=config.analysis_model)
+                    n_applied = apply_resolutions(
+                        fence_results, agentic_resolution_out)
+                    timings["phase3d_resolver"] = time.perf_counter() - t3d
+                    log.info(
+                        "Agentic resolver: %d assignments, %d applied, "
+                        "%d tool calls, exhausted=%s",
+                        len(agentic_resolution_out.get("assignments") or []),
+                        n_applied,
+                        agentic_resolution_out.get("tool_calls_used"),
+                        agentic_resolution_out.get("budget_exhausted"),
+                    )
+            except Exception as e:
+                log.warning(f"Agentic resolver pass failed: {e}")
+
         # ---- Highlighted PDF generation ----
         progress("highlight", 95, "Generating highlighted PDF...")
         highlighted_pdf_bytes = None
@@ -1221,6 +1264,7 @@ def run_analysis(
         result.highlighted_pdf_bytes = highlighted_pdf_bytes
         result.highlight_pdf_info = highlight_pdf_info
         result.legend_registry = legend_registry_out
+        result.agentic_resolution = agentic_resolution_out
         result.per_page_scale_info = per_page_scale
         result.unified_measurements = per_page_measurements
         result.page_categories = per_page_categories

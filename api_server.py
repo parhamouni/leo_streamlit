@@ -358,6 +358,8 @@ def _run_job(job: dict, keys: dict):
             # Document-wide legend registry (cross-sheet layer→category
             # provenance; consumed by the UI and the agentic resolver).
             "legend_registry": result.legend_registry,
+            # Stage-4 resolver assignments + evidence (provenance display).
+            "agentic_resolution": result.agentic_resolution,
             "timings": result.timings,
             "error": result.error,
         }
