@@ -289,7 +289,10 @@ export default function UMTCanvasInner({
     setError(null);
     try {
       const [imgResp, vecData, stateData] = await Promise.all([
-        apiFetch(`/api/jobs/${jobId}/page-image/${pageNum}?dpi=110`),
+        // v=2: cache-buster — v1 responses could be the WRONG SHEET (legend/
+        // neighbouring page) due to the pre-fix highlighted-PDF page mapping,
+        // and they're browser-cached for up to an hour (max-age=3600).
+        apiFetch(`/api/jobs/${jobId}/page-image/${pageNum}?dpi=110&v=2`),
         apiJson<VectorLinesResponse>(
           `/api/jobs/${jobId}/page-vector-lines/${pageNum}`,
         ),
