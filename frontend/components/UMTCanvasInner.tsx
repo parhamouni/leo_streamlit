@@ -1262,7 +1262,9 @@ export default function UMTCanvasInner({
                   layer: {ln?.layer || "(no layer)"}
                 </div>
                 <div>
-                  length: {ln?.length_pts.toFixed(1) ?? "?"} pts · current:{" "}
+                  length:{" "}
+                  {ln ? (ln.length_pts / measurementScale).toFixed(1) : "?"} ft
+                  · current:{" "}
                   {current ?? "— unassigned —"}
                 </div>
               </>
@@ -1299,7 +1301,8 @@ export default function UMTCanvasInner({
                   Drawn line #{linePopover.idx + 1}
                 </div>
                 <div>
-                  length: {lenPts.toFixed(1)} pts · current: {dl.category}
+                  length: {(lenPts / measurementScale).toFixed(1)} ft ·
+                  current: {dl.category}
                 </div>
               </>
             }
